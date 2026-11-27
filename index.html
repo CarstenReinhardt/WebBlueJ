@@ -154,6 +154,16 @@ table.insp tr.from td { color: var(--muted); font-family: var(--ui); font-size: 
 .refbtn { font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--obj-edge); background: color-mix(in srgb, var(--obj) 30%, var(--card)); border-radius: 10px; padding: 1px 10px; }
 .trace { font-family: var(--mono); font-size: 12.5px; color: var(--muted); white-space: pre-wrap; }
 .toast { position: fixed; z-index: 70; left: 50%; bottom: max(24px, env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--panel); padding: 8px 14px; border-radius: 8px; font-size: 13.5px; box-shadow: var(--shadow); max-width: calc(100vw - 32px); }
+.gfx-layer { position: fixed; inset: 0; z-index: 45; pointer-events: none; }
+.gfx-win { position: absolute; pointer-events: auto; width: min(var(--gw), calc(100vw - 24px)); background: var(--card); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 18px 44px -16px rgba(0,0,0,.5); overflow: hidden; }
+.gfx-head { display: flex; align-items: center; gap: 4px; padding: 4px 4px 4px 10px; background: var(--head); color: var(--head-ink); cursor: grab; touch-action: none; user-select: none; }
+.gfx-head:active { cursor: grabbing; }
+.gfx-title { margin-right: auto; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gfx-btn { border: 0; background: transparent; color: inherit; font: inherit; font-size: 14px; line-height: 1; width: 30px; height: 28px; border-radius: 5px; cursor: pointer; }
+.gfx-btn:hover, .gfx-btn:focus-visible { background: rgba(255,255,255,.18); }
+.gfx-stage { position: relative; width: 100%; background: #fff; }
+.gfx-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.gfx-status { padding: 4px 10px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); font-family: var(--mono); }
 .toast.err { background: var(--err); color: #fff; }
 textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px; box-sizing: border-box; white-space: pre; }
 .plist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -263,6 +273,8 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 
 <script src="lib/jszip.min.js"></script>
 <script src="interp.js"></script>
+<script src="aplu.js"></script>
+<script src="gfx.js"></script>
 <script src="examples.js"></script>
 <script src="app.js"></script>
 </body>

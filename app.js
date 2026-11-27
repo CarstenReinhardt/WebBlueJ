@@ -9,7 +9,12 @@ const BOX_W = 156, BOX_H = 70;
 
 // ------------------------------------------------------------ Zustand
 const outBuf = [];
-const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }) });
+const gfx = window.WBGfx.create({
+  echo: (s) => outBuf.push({ s, err: false }),
+  note: (s) => outBuf.push({ s, err: false }),
+  lastLine: () => { const t = outBuf.filter(o => !o.err).map(o => o.s).join(''); return t.slice(t.lastIndexOf('\n') + 1).trim(); },
+});
+const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx });
 const S = {
   project: null,        // { name, classes: [{ id, name, code, x, y }] }
   status: {},           // id -> { dirty, error: {line, message} }
@@ -438,6 +443,7 @@ function compileAll(opts = {}) {
     return false;
   }
   S.compiledOnce = true;
+  gfx.closeAll();
   clearBench(); S.padEnv = new Env(S.benchEnv);
   renderDiagram();
   if (S.editing) setStatus('Übersetzt – keine Fehler.', 'ok');
@@ -798,7 +804,8 @@ function helpDialog() {
   <p><b>Übersetzen:</b> Nach jeder Änderung neu übersetzen (Knopf oder <code>Strg+S</code> im Editor). Schraffierte Klassen sind noch nicht übersetzt. Fehler werden mit Zeile im Editor markiert.</p>
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
-  <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Nicht unterstützt: Tastatureingabe mit <code>Scanner</code>, Lambdas, innere Klassen, Grafik.</p>
+  <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Eingaben mit <code>Scanner</code> erscheinen als Eingabedialog. Nicht unterstützt: Lambdas, innere Klassen.</p>
+  <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. Maus-, Tastatur-Ereignisse und Sound gibt es in der Web-Version nicht.</p>
   <p><b>Speichern:</b> Alle Projekte werden automatisch in diesem Browser gespeichert („Projekt ▾ → Meine Projekte“). Zum Sichern, Weitergeben oder für BlueJ: „Projekt ▾ → Als ZIP herunterladen“. ZIP-Dateien (auch BlueJ-Projektordner) öffnest du mit „ZIP- oder .java-Dateien importieren“.</p>`;
   openModal({ title: 'So funktioniert die Java-Werkbank', body: d, wide: true, actions: [{ label: 'Alles klar', primary: true }] });
 }

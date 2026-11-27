@@ -333,5 +333,65 @@ public class Statistik {
   bench: [{ name: 'wuerfel1', expr: 'new Wuerfel(6)' }],
 };
 
-global.WB_EXAMPLES = [bank, formen, wuerfel];
+const turtle = {
+  name: 'Turtle-Grafik',
+  classes: [
+    { name: 'Zeichnerin', x: 80, y: 60, code: `import ch.aplu.turtle.*;
+import java.awt.Color;
+
+/**
+ * Eine Turtle, die Figuren zeichnen kann.
+ */
+public class Zeichnerin extends Turtle {
+
+    /** Zeichnet ein Quadrat mit der Seitenlänge s. */
+    public void quadrat(double s) {
+        for (int i = 0; i < 4; i++) {
+            forward(s);
+            right(90);
+        }
+    }
+
+    /** Zeichnet ein regelmäßiges Vieleck mit n Ecken. */
+    public void vieleck(int n, double s) {
+        for (int i = 0; i < n; i++) {
+            forward(s);
+            right(360.0 / n);
+        }
+    }
+
+    /** Zeichnet einen Stern mit 5 Zacken. */
+    public void stern(double s) {
+        for (int i = 0; i < 5; i++) {
+            forward(s);
+            right(144);
+        }
+    }
+}` },
+    { name: 'Blume', x: 380, y: 60, code: `import ch.aplu.turtle.*;
+import java.awt.Color;
+
+public class Blume {
+
+    public static void main(String[] args) {
+        Zeichnerin z = new Zeichnerin();
+        z.speed(600);
+        Color[] farben = { Color.red, Color.orange, Color.magenta, Color.blue };
+        for (int i = 0; i < 12; i++) {
+            z.setPenColor(farben[i % farben.length]);
+            z.quadrat(80);
+            z.right(30);
+        }
+        z.penUp();
+        z.setPos(-150, -150);
+        z.penDown();
+        z.setPenColor(Color.green);
+        z.stern(60);
+    }
+}` },
+  ],
+  bench: [{ name: 'zeichnerin1', expr: 'new Zeichnerin()' }],
+};
+
+global.WB_EXAMPLES = [bank, formen, wuerfel, turtle];
 })(typeof window !== 'undefined' ? window : globalThis);

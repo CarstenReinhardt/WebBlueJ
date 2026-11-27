@@ -682,6 +682,7 @@ class Runtime {
     this.steps = 0; this.depth = 0; this.line = 0; this.callStack = [];
     this.classes = new Map();
     this.installNatives();
+    for (const ext of Runtime.extensions) ext(this);
     const decls = new Parser(PRELUDE).parseUnit();
     this.buildClasses(decls, true);
     this.builtinClasses = new Map(this.classes);
@@ -719,6 +720,8 @@ class Runtime {
     const made = [];
     const fail = (d, line, msg) => { const e = new JavaError(msg, line); e.fileId = d.fileId; throw e; };
     for (const d of decls) {
+      const prev = this.classes.get(d.name);
+      if (prev && !builtin && prev.native && prev.native.lib) this.classes.delete(d.name);
       if (this.classes.has(d.name)) fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : `Klasse '${d.name}' gibt es doppelt`);
       const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (UTIL_EXC.has(d.name) ? 'java.util' : 'java.lang') : null });
       c.fileId = d.fileId;
@@ -901,7 +904,8 @@ class Runtime {
     return obj;
   }
   runCtor(cls, obj, args, line) {
-    if (!cls || cls.native || !cls.decl) return;
+    if (cls && cls.native) { if (cls.native.initInstance) cls.native.initInstance(this, obj, args, line); return; }
+    if (!cls || !cls.decl) return;
     let ctor = null;
     if (!cls.ctors.length) { if (args.length) this.rtError(`Klasse ${cls.name} hat keinen Konstruktor mit ${args.length} Parameter(n)`, line); }
     else ctor = this.selectOverload(cls.ctors, args, cls.name, line);
@@ -1576,6 +1580,8 @@ class Runtime {
     const line = e.line;
     if (e.obj === null) {
       const ms = this.lookupMethods(ctx.cls, e.name);
+      if (ctx.self && (!ms.length || !ms.some(m => m.params.length === e.args.length))) { const nf = this.nativeMethod(ctx.cls, e.name); if (nf) { const a = e.args.map(x => this.eval(x, ctx)); this.line = line; return nf(this, ctx.self, a, line); } }
+      if (!ctx.self && !ms.length) { const nsf = (() => { for (let c = ctx.cls; c; c = c.superClass) { const f = c.native && c.native.statics && c.native.statics[e.name]; if (f) return f; } return null; })(); if (nsf) return nsf(this, e.args.map(x => this.eval(x, ctx)), line); }
       if (!ms.length && ctx.self && ['toString', 'equals', 'hashCode', 'getClass', 'name', 'ordinal', 'compareTo'].includes(e.name)) return this.objectMethod(ctx.self, e.name, e.args.map(a => this.eval(a, ctx)), line);
       if (!ms.length) this.rtError(`Methode '${e.name}' nicht gefunden`, line);
       const args = e.args.map(a => this.eval(a, ctx));
@@ -1592,6 +1598,7 @@ class Runtime {
       const ms = this.lookupMethods(sc, e.name).filter(m => !m.abstract);
       const args = e.args.map(a => this.eval(a, ctx));
       this.line = line;
+      if (!ms.length) { const nf = this.nativeMethod(sc, e.name); if (nf) return nf(this, ctx.self, args, line); }
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) return this.objectMethod(ctx.self, e.name, args, line, true);
         this.rtError(`Die Oberklasse hat keine (nicht-abstrakte) Methode '${e.name}'`, line);
@@ -1639,6 +1646,7 @@ class Runtime {
         this.rtError(`Methode '${name}' gibt es für ${o.cls.name} nicht (oder sie wird nicht unterstützt)`, line);
       }
       const ms = this.lookupMethods(o.cls, name);
+      if (!ms.length || !ms.some(m => m.params.length === args.length)) { const nf = this.nativeMethod(o.cls, name); if (nf) return nf(this, o, args, line); }
       if (!ms.length) {
         if (['equals', 'hashCode', 'toString', 'getClass', 'name', 'ordinal', 'compareTo'].includes(name)) return this.objectMethod(o, name, args, line);
         this.rtError(`Klasse ${o.cls.name} hat keine Methode '${name}'`, line);
@@ -1650,6 +1658,12 @@ class Runtime {
     }
     this.rtError(`Auf einem Wert vom Typ ${this.typeNameOf(o)} kann keine Methode aufgerufen werden`, line);
   }
+  nativeMethod(cls, name) {
+    for (let c = cls; c; c = c.superClass) { const f = c.native && c.native.methods && c.native.methods[name]; if (f) return f; }
+    return null;
+  }
+  nativeOwner(cls) { for (let c = cls; c; c = c.superClass) if (c.native && c.native.initInstance) return c.name; return null; }
+  nativeSpec(cls) { for (let c = cls; c; c = c.superClass) if (c.native && c.native.initInstance) return c.native; return null; }
   objectMethod(o, name, args, line, nonVirtual) {
     switch (name) {
       case 'toString': if (!args.length) { if (nonVirtual || o instanceof JArray) return (o instanceof JArray) ? this.str(o) : (o.enumName !== undefined ? o.enumName : o.cls.fullName + '@' + idHash(o.id)); return this.str(o); } break;
@@ -1824,6 +1838,11 @@ class Runtime {
       }
       if (ms.length) groups.push({ from: c.name, methods: ms, inherited: c !== o.cls });
     }
+    for (let c = o.cls; c; c = c.superClass) if (c.native && c.native.ui) {
+      const ms = c.native.ui.filter(u => !seen.has(u.name + '(' + u.params.map(p => typeStr(p.type)).join(',') + ')')).map(u => ({ m: { name: u.name, params: u.params, ret: u.ret, native: true, cls: c }, label: `${typeStr(u.ret)} ${u.name}(${u.params.map(p => typeStr(p.type) + ' ' + p.name).join(', ')})` }));
+      if (ms.length) groups.push({ from: c.name, methods: ms, inherited: true });
+      break;
+    }
     const ifaceDefaults = [];
     const visit = (c) => { for (const i of c.interfaces) { for (const m of i.methodList) { const k = m.name + '(' + m.params.map(p => typeStr(p.type)).join(',') + ')'; if (!m.abstract && !m.static && !seen.has(k) && !i.builtin) { seen.add(k); ifaceDefaults.push({ m, label: this.sig(m), doc: m.doc }); } } visit(i); } };
     for (let c = o.cls; c; c = c.superClass) visit(c);
@@ -1843,6 +1862,13 @@ class Runtime {
       return { title: `${typeStr(v.elemType)}[${v.data.length}]`, rows };
     }
     if (!(v instanceof JObject)) return { title: this.typeNameOf(v), rows };
+    const ns = this.nativeSpec(v.cls);
+    if (ns && ns.inspectRows) {
+      const chain = []; for (let c = v.cls; c && c.decl; c = c.superClass) chain.unshift(c);
+      for (const r of ns.inspectRows(this, v)) rows.push({ ...r, from: chain.length ? this.nativeOwner(v.cls) : undefined });
+      for (const c of chain) for (const f of c.fieldList) if (!f.static) rows.push({ name: f.name, type: typeStr(f.type), vis: f.vis, value: v.fields[f.name], from: c.name });
+      return { title: v.cls.name, rows };
+    }
     if (v.native) {
       if (v.native.list) v.native.list.forEach((x, i) => rows.push({ name: `[${i}]`, type: v.native.elemType ? typeStr(v.native.elemType) : 'Object', value: x }));
       else if (v.native.keys) v.native.keys.forEach((k, i) => rows.push({ name: this.displayValue(k), type: '→', value: v.native.vals[i] }));
@@ -1879,6 +1905,7 @@ class Runtime {
       return c;
     };
     const objOf = (name, nat) => { const o = new JObject(this.classes.get(name)); o.native = nat; return o; };
+    this._def = def; this._objOf = objOf;
     const ex = (n, m) => rt.throwJava(n, m);
     const intArg = (v, line) => rt.toInt(v, line);
     def('Object', { extendable: true, ctor(rt) { return new JObject(rt.classes.get('Object')); } });
@@ -2095,7 +2122,7 @@ class Runtime {
     } });
     def('Thread', { statics: { sleep() { } } });
     def('Objects', { pkg: 'java.util', statics: { equals(rt, a) { return rt.javaEquals(a[0], a[1]); }, hash(rt, a) { let h = 1; for (const x of a) h = (Math.imul(31, h) + rt.hashOf(x)) | 0; return h; }, isNull(rt, a) { return a[0] === null; }, requireNonNull(rt, a) { if (a[0] === null) rt.npe(a[1] || null); return a[0]; } } });
-    def('Scanner', { pkg: 'java.util', ctor(rt, a, line) { rt.rtError('Tastatureingabe mit Scanner wird hier nicht unterstützt. Übergib die Werte als Parameter (beim Methodenaufruf wird danach gefragt).', line); } });
+
   }
   printArg(v) { if (v instanceof JArray && v.elemType.name === 'char' && !v.elemType.dims) return v.data.map(c => String.fromCharCode(c.c)).join(''); return this.str(v); }
 }
@@ -2422,7 +2449,6 @@ class Checker {
         if (c.isInterface) this.err(e.line, `${n} ist ein Interface – davon können keine Objekte erzeugt werden`);
         if (c.isAbstract) this.err(e.line, `${n} ist abstrakt – davon können keine Objekte erzeugt werden`);
         if (c.isEnum) this.err(e.line, 'Von einem enum können keine Objekte mit new erzeugt werden');
-        if (n === 'Scanner') this.err(e.line, 'Tastatureingabe mit Scanner wird hier nicht unterstützt – übergib die Werte als Parameter');
         if (c.decl) this.ctorArgsCheck(c, at, e.line);
         return e.type;
       }
@@ -2543,6 +2569,8 @@ class Checker {
     const label = (c) => `Methode ${e.name}`;
     if (e.obj === null) {
       const ms = this.rt.lookupMethods(this.cls, e.name);
+      if ((!ms.length || !ms.some(m => m.params.length === at.length)) && this.rt.nativeMethod(this.cls, e.name)) { if (this.ctx.isStatic) this.err(e.line, `Die Methode ${e.name}() ist nicht statisch und kann nicht aus einer statischen Methode aufgerufen werden – erzeuge zuerst ein Objekt`); return nativeRet(this.rt, this.cls, e.name); }
+      if (!ms.length) { for (let c = this.cls; c; c = c.superClass) if (c.native && c.native.statics && c.native.statics[e.name]) return null; }
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name) && !this.ctx.isStatic) return e.name === 'toString' ? STRING : e.name === 'equals' ? BOOL : e.name === 'hashCode' ? INT : null;
         if (this.cls.isEnum && ['values', 'ordinal', 'name'].includes(e.name)) return e.name === 'values' ? T(this.cls.name, 1) : e.name === 'ordinal' ? INT : STRING;
@@ -2556,6 +2584,7 @@ class Checker {
     if (e.obj.k === 'Super') {
       if (this.ctx.isStatic) this.err(e.line, "'super' gibt es nicht in einer statischen Methode");
       const ms = this.rt.lookupMethods(this.cls.superClass, e.name).filter(m => !m.abstract);
+      if (!ms.length && this.rt.nativeMethod(this.cls.superClass, e.name)) return nativeRet(this.rt, this.cls.superClass, e.name);
       if (!ms.length) { if (['toString', 'equals', 'hashCode'].includes(e.name)) return e.name === 'toString' ? STRING : e.name === 'equals' ? BOOL : INT; this.err(e.line, `Die Oberklasse hat keine (nicht-abstrakte) Methode '${e.name}'`); }
       return this.retType(this.pick(ms, at, e.line, label(), this.cls), null);
     }
@@ -2568,6 +2597,7 @@ class Checker {
           if (c.name === 'System' && e.name === 'println') this.err(e.line, "Es heißt System.out.println(…)");
           this.err(e.line, `Methode '${e.name}' gibt es in ${c.name} nicht (oder sie wird nicht unterstützt)` + suggest(e.name, Object.keys(c.native.statics || {})));
         }
+        if (c.native.staticRet && c.native.staticRet[e.name] !== undefined) return c.native.staticRet[e.name];
         return NATIVE_RET[c.name + '.' + e.name] || (c.name === 'Math' && ['abs', 'max', 'min'].includes(e.name) ? (at.length === 1 ? this.unbox(at[0]) : this.promote(at[0], at[1])) : null);
       }
       if (c.isEnum && e.name === 'values') return T(c.name, 1);
@@ -2593,6 +2623,7 @@ class Checker {
     const c = this.userClass(t);
     if (c && c.decl && !c.builtin) {
       const ms = this.rt.lookupMethods(c, e.name);
+      if ((!ms.length || !ms.some(m => m.params.length === at.length)) && this.rt.nativeMethod(c, e.name)) return nativeRet(this.rt, c, e.name);
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) return e.name === 'toString' ? STRING : e.name === 'equals' ? BOOL : e.name === 'hashCode' ? INT : null;
         if (c.isEnum && ['name', 'ordinal', 'compareTo'].includes(e.name)) return e.name === 'name' ? STRING : INT;
@@ -2603,6 +2634,8 @@ class Checker {
     if (c && c.native && !c.isInterface) {
       let found = false;
       for (let k = c; k; k = k.superClass) if (k.native && k.native.methods && k.native.methods[e.name]) found = true;
+      if (!found && c.native.lib && c.native.unsupported && c.native.unsupported.test(e.name)) this.err(e.line, `${c.name}.${e.name}() wird in der Web-Version nicht unterstützt (Maus-/Tastatur-Ereignisse, Sound und Drucken fehlen)`);
+      if (found && c.native.retTypes) return c.native.retTypes[e.name] || null;
       if (!found && !['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) this.err(e.line, `Methode '${e.name}' gibt es für ${c.name} nicht (oder sie wird nicht unterstützt)` + suggest(e.name, Object.keys(c.native.methods || {})) + (e.name === 'length' && c.native.list ? ' – bei Listen heißt es size()' : ''));
       return listRet(c, e.name, t);
     }
@@ -2610,6 +2643,7 @@ class Checker {
     return null;
   }
 }
+function nativeRet(rt, cls, name) { for (let c = cls; c; c = c.superClass) if (c.native && c.native.retTypes && c.native.retTypes[name] !== undefined) return c.native.retTypes[name]; return null; }
 function listRet(c, name, t) {
   const el = t.args && t.args[0] ? t.args[0] : null;
   if (['size', 'indexOf', 'lastIndexOf', 'length'].includes(name)) return INT;
@@ -2653,5 +2687,6 @@ function quickInfo(code) {
   return { ok: false, name: m[3], kind: m[2], abstract: !!m[1], superName: m[2] === 'class' ? m[4] || null : null, interfaces: (m[5] || (m[2] === 'interface' ? m[4] || '' : '')).split(',').map(s => s.trim().replace(/<.*$/, '')).filter(Boolean), ids };
 }
 
+Runtime.extensions = [];
 global.JavaRT = { Runtime, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
 })(typeof window !== 'undefined' ? window : globalThis);
