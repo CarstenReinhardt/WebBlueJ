@@ -156,6 +156,14 @@ table.insp tr.from td { color: var(--muted); font-family: var(--ui); font-size: 
 .toast { position: fixed; z-index: 70; left: 50%; bottom: max(24px, env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--panel); padding: 8px 14px; border-radius: 8px; font-size: 13.5px; box-shadow: var(--shadow); max-width: calc(100vw - 32px); }
 .toast.err { background: var(--err); color: #fff; }
 textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px; box-sizing: border-box; white-space: pre; }
+.plist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.prow { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.prow:last-child { border-bottom: 0; }
+.prow.current { background: var(--accent-soft); }
+.pinfo { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pinfo b { font-family: var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pinfo span { color: var(--muted); font-size: 12.5px; }
+.btn:disabled { opacity: .5; cursor: default; }
 .helpgrid { display: grid; gap: 8px; line-height: 1.5; }
 .helpgrid p { margin: 0; }
 .helpgrid code { font-family: var(--mono); background: var(--panel-2); padding: 0 4px; border-radius: 4px; }
@@ -251,8 +259,9 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 </div>
 <div id="menu" class="menu" role="menu" hidden></div>
 <div id="modalRoot"></div>
-<input type="file" id="fileInput" accept=".java,text/x-java,text/plain" multiple hidden>
+<input type="file" id="fileInput" accept=".zip,.java,application/zip,text/x-java,text/plain" multiple hidden>
 
+<script src="lib/jszip.min.js"></script>
 <script src="interp.js"></script>
 <script src="examples.js"></script>
 <script src="app.js"></script>

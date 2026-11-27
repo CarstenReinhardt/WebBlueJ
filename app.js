@@ -24,8 +24,14 @@ const S = {
 S.padEnv = new Env(S.benchEnv);
 let uid = 1; const newId = () => 'c' + Date.now().toString(36) + (uid++);
 
+const LIB = 'javawerkbank.library.v1';
+function projectData() { return { id: S.project.id, name: S.project.name, savedAt: Date.now(), classes: S.project.classes.map(c => ({ id: c.id, name: c.name, code: c.code, x: c.x, y: c.y })) }; }
+function readLib() { try { const l = JSON.parse(localStorage.getItem(LIB) || 'null'); if (l && l.projects) return l; } catch (e) { } return { projects: {} }; }
+function writeLib(l) { try { localStorage.setItem(LIB, JSON.stringify(l)); return true; } catch (e) { return false; } }
 function save() {
-  try { localStorage.setItem(STORE, JSON.stringify({ name: S.project.name, classes: S.project.classes.map(c => ({ id: c.id, name: c.name, code: c.code, x: c.x, y: c.y })) })); } catch (e) { }
+  const d = projectData();
+  try { localStorage.setItem(STORE, JSON.stringify(d)); } catch (e) { }
+  const l = readLib(); l.projects[d.id] = d; l.current = d.id; writeLib(l);
 }
 function loadSaved() {
   try { const p = JSON.parse(localStorage.getItem(STORE) || 'null'); if (p && Array.isArray(p.classes)) return p; } catch (e) { }
@@ -602,7 +608,7 @@ function removeClass(id) {
 
 // ------------------------------------------------------------ Projekte
 function loadProject(p, { benchFrom } = {}) {
-  S.project = { name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, code: c.code, x: c.x ?? 40, y: c.y ?? 40 })) };
+  S.project = { id: p.id || ('p' + newId()), name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, code: c.code, x: c.x ?? 40, y: c.y ?? 40 })) };
   S.status = {}; S.info = {}; S.editing = null; $('editorPane').hidden = true;
   for (const c of S.project.classes) { refreshInfo(c); S.status[c.id] = { dirty: true }; }
   clearBench();
@@ -617,14 +623,17 @@ function loadProject(p, { benchFrom } = {}) {
 }
 function projectMenu() {
   const r = $('btnProject').getBoundingClientRect();
-  const items = [{ header: 'Beispiel öffnen' }];
-  for (const ex of window.WB_EXAMPLES) items.push({ label: ex.name, plain: true, action: () => confirmModal(`Beispiel „${ex.name}“ öffnen?`, 'Das aktuelle Projekt wird ersetzt. Exportiere es vorher, wenn du es behalten möchtest.', 'Öffnen', () => loadProject(ex, { benchFrom: ex.bench })) });
-  items.push({ sep: true });
-  items.push({ label: 'Neues leeres Projekt', plain: true, action: () => confirmModal('Neues leeres Projekt?', 'Das aktuelle Projekt wird ersetzt. Exportiere es vorher, wenn du es behalten möchtest.', 'Neu anlegen', () => loadProject({ name: 'Neues Projekt', classes: [] })) });
+  const items = [{ header: 'Projekte' }];
+  items.push({ label: 'Meine Projekte öffnen …', plain: true, action: libraryDialog });
+  items.push({ label: 'Neues leeres Projekt', plain: true, action: () => { syncEditor(); save(); newProjectDialog(); } });
   items.push({ label: 'Projekt umbenennen', plain: true, action: renameProjectDialog });
-  items.push({ sep: true });
-  items.push({ label: 'Quelltext exportieren (kopieren)', plain: true, action: exportDialog });
-  items.push({ label: '.java-Dateien importieren', plain: true, action: () => $('fileInput').click() });
+  items.push({ label: 'Kopie speichern unter …', plain: true, action: saveAsDialog });
+  items.push({ header: 'Datei' });
+  items.push({ label: 'Als ZIP herunterladen', plain: true, action: exportZip });
+  items.push({ label: 'ZIP- oder .java-Dateien importieren …', plain: true, action: () => $('fileInput').click() });
+  items.push({ label: 'Quelltext anzeigen (kopieren)', plain: true, action: exportDialog });
+  items.push({ header: 'Beispiel öffnen' });
+  for (const ex of window.WB_EXAMPLES) items.push({ label: ex.name, plain: true, action: () => { syncEditor(); save(); loadProject({ ...ex, name: uniqueProjectName(ex.name), classes: ex.classes.map(c => ({ ...c })) }, { benchFrom: ex.bench }); toast(`Beispiel „${ex.name}“ geöffnet. Dein vorheriges Projekt liegt unter „Meine Projekte“.`); } });
   showMenu(r.left, r.bottom + 4, items);
 }
 function renameProjectDialog() {
@@ -647,8 +656,130 @@ function exportDialog() {
     return true;
   } }] });
 }
+// ---- Mehrere Projekte im Browser
+function uniqueProjectName(base) {
+  const names = new Set(Object.values(readLib().projects).map(p => p.name));
+  if (!names.has(base)) return base;
+  let i = 2; while (names.has(`${base} (${i})`)) i++; return `${base} (${i})`;
+}
+function newProjectDialog() {
+  const form = document.createElement('form'); form.className = 'field';
+  form.innerHTML = '<label for="npName">Projektname</label><input id="npName" autocomplete="off">';
+  form.querySelector('input').value = uniqueProjectName('Neues Projekt');
+  const ok = () => { const v = form.querySelector('input').value.trim() || 'Neues Projekt'; loadProject({ name: uniqueProjectName(v), classes: [] }); toast('Neues Projekt angelegt. Das vorherige liegt unter „Meine Projekte“.'); };
+  form.addEventListener('submit', (e) => { e.preventDefault(); ok(); modals[modals.length - 1].close(); });
+  openModal({ title: 'Neues Projekt', body: form, actions: [{ label: 'Abbrechen' }, { label: 'Anlegen', primary: true, action: ok }] });
+}
+function saveAsDialog() {
+  syncEditor(); save();
+  const form = document.createElement('form'); form.className = 'field';
+  form.innerHTML = '<label for="saName">Name der Kopie</label><input id="saName" autocomplete="off">';
+  form.querySelector('input').value = uniqueProjectName(S.project.name + ' Kopie');
+  const ok = () => { const v = form.querySelector('input').value.trim(); if (!v) return true; const d = projectData(); loadProject({ name: uniqueProjectName(v), classes: d.classes.map(c => ({ ...c, id: undefined })) }); toast(`Kopie „${S.project.name}“ gespeichert und geöffnet.`); };
+  form.addEventListener('submit', (e) => { e.preventDefault(); if (ok() !== true) modals[modals.length - 1].close(); });
+  openModal({ title: 'Kopie speichern unter', body: form, actions: [{ label: 'Abbrechen' }, { label: 'Speichern', primary: true, action: ok }] });
+}
+function libraryDialog() {
+  syncEditor(); save();
+  const wrap = document.createElement('div'); wrap.style.display = 'contents';
+  const p = document.createElement('p'); p.className = 'doc'; p.style.margin = '0';
+  p.textContent = 'Projekte werden automatisch in diesem Browser gespeichert. Zum Sichern oder Weitergeben „Als ZIP herunterladen“ verwenden.';
+  const list = document.createElement('div'); list.className = 'plist';
+  wrap.append(p, list);
+  let ctl;
+  const render = () => {
+    const projects = Object.values(readLib().projects).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+    list.innerHTML = '';
+    for (const pr of projects) {
+      const row = document.createElement('div'); row.className = 'prow' + (pr.id === S.project.id ? ' current' : '');
+      const when = pr.savedAt ? new Date(pr.savedAt).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' }) : '';
+      row.innerHTML = `<div class="pinfo"><b>${esc(pr.name)}</b><span>${pr.classes.length} Klasse${pr.classes.length === 1 ? '' : 'n'} · ${esc(when)}${pr.id === S.project.id ? ' · geöffnet' : ''}</span></div>`;
+      const open = document.createElement('button'); open.type = 'button'; open.className = 'btn small' + (pr.id === S.project.id ? '' : ' primary'); open.textContent = 'Öffnen';
+      open.disabled = pr.id === S.project.id;
+      open.addEventListener('click', () => { ctl.close(); loadProject(pr); toast(`Projekt „${pr.name}“ geöffnet.`); });
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'btn small ghost'; del.textContent = 'Löschen';
+      del.addEventListener('click', () => {
+        if (del.dataset.confirm !== '1') { del.dataset.confirm = '1'; del.textContent = 'Wirklich löschen?'; del.style.color = 'var(--err)'; return; }
+        const l = readLib(); delete l.projects[pr.id]; writeLib(l);
+        if (pr.id === S.project.id) { const rest = Object.values(l.projects).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)); if (rest.length) loadProject(rest[0]); else loadProject({ name: 'Neues Projekt', classes: [] }); }
+        render();
+      });
+      row.append(open, del); list.appendChild(row);
+    }
+  };
+  render();
+  ctl = openModal({ title: 'Meine Projekte', body: wrap, wide: true, actions: [{ label: 'Neues Projekt', action: () => { newProjectDialog(); } }, { label: 'Schließen', primary: true }] });
+}
+
+// ---- ZIP (BlueJ-kompatibel: .java-Dateien + package.bluej)
+function zipLib() { if (!window.JSZip) { toast('ZIP-Funktion konnte nicht geladen werden (Internetverbindung?).', true); return null; } return window.JSZip; }
+function safeFileName(s) { return (s || 'Projekt').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'Projekt'; }
+function packageBluej() {
+  const typeOf = (c) => { const i = S.info[c.id] || {}; return i.kind === 'interface' ? 'InterfaceTarget' : i.kind === 'enum' ? 'EnumTarget' : i.abstract ? 'AbstractTarget' : 'ClassTarget'; };
+  const lines = ['#BlueJ package file', '#Erstellt mit der Java-Werkbank', 'package.editor.height=600', 'package.editor.width=900', 'package.numDependencies=0', `package.numTargets=${S.project.classes.length}`, 'package.showExtends=true', 'package.showUses=true'];
+  S.project.classes.forEach((c, i) => {
+    const n = i + 1;
+    lines.push(`target${n}.height=${BOX_H}`, `target${n}.name=${c.name}`, `target${n}.showInterface=false`, `target${n}.type=${typeOf(c)}`, `target${n}.width=${BOX_W}`, `target${n}.x=${Math.round(c.x)}`, `target${n}.y=${Math.round(c.y)}`);
+  });
+  return lines.join('\n') + '\n';
+}
+async function exportZip() {
+  syncEditor(); save();
+  const Z = zipLib(); if (!Z) return;
+  const zip = new Z(); const dir = safeFileName(S.project.name);
+  const folder = zip.folder(dir);
+  for (const c of S.project.classes) folder.file(`${c.name}.java`, c.code);
+  folder.file('package.bluej', packageBluej());
+  folder.file('README.TXT', `Projekt: ${S.project.name}\nErstellt mit der Java-Werkbank (WebBlueJ).\nDiese ZIP-Datei kann in der Java-Werkbank über „Projekt ▾ → ZIP- oder .java-Dateien importieren“ wieder geöffnet werden.\nDer Ordner lässt sich nach dem Entpacken auch in BlueJ öffnen.\n`);
+  try {
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = dir + '.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast(`„${dir}.zip“ wird heruntergeladen.`);
+  } catch (e) { toast('ZIP konnte nicht erstellt werden: ' + e.message, true); }
+}
+function parseBluej(text) {
+  const props = {}; for (const line of text.split(/\r?\n/)) { const m = /^([^#=][^=]*)=(.*)$/.exec(line.trim()); if (m) props[m[1].trim()] = m[2].trim(); }
+  const pos = {};
+  for (const k of Object.keys(props)) { const m = /^target(\d+)\.name$/.exec(k); if (m) { const x = parseInt(props[`target${m[1]}.x`]), y = parseInt(props[`target${m[1]}.y`]); if (!isNaN(x) && !isNaN(y)) pos[props[k]] = { x, y }; } }
+  return pos;
+}
+async function importZip(file) {
+  const Z = zipLib(); if (!Z) return;
+  let zip;
+  try { zip = await Z.loadAsync(file); } catch (e) { toast(`„${file.name}“ ist keine gültige ZIP-Datei.`, true); return; }
+  const entries = Object.values(zip.files).filter(f => !f.dir && !/(^|\/)__MACOSX\//.test(f.name) && !/(^|\/)\./.test(f.name.split('/').pop()));
+  const javas = entries.filter(f => /\.java$/i.test(f.name));
+  if (!javas.length) { toast(`In „${file.name}“ wurden keine .java-Dateien gefunden.`, true); return; }
+  const dirOf = (n) => n.includes('/') ? n.slice(0, n.lastIndexOf('/') + 1) : '';
+  const bluejs = entries.filter(f => /(^|\/)package\.bluej$/i.test(f.name)).sort((a, b) => a.name.length - b.name.length);
+  let root = bluejs.length ? dirOf(bluejs[0].name) : null;
+  if (root === null) { const counts = {}; for (const j of javas) counts[dirOf(j.name)] = (counts[dirOf(j.name)] || 0) + 1; root = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.length - b.length)[0]; }
+  const pos = bluejs.length ? parseBluej(await bluejs[0].async('string')) : {};
+  const chosen = javas.filter(j => j.name.startsWith(root));
+  const skipped = javas.length - chosen.length;
+  const classes = [];
+  let i = 0;
+  for (const j of chosen) {
+    const code = (await j.async('string')).replace(/^\uFEFF/, '');
+    const info = quickInfo(code); const name = info.name || j.name.split('/').pop().replace(/\.java$/i, '');
+    if (classes.some(c => c.name === name)) continue;
+    const p = pos[name] || { x: 40 + (i % 4) * 200, y: 40 + Math.floor(i / 4) * 140 };
+    classes.push({ name, code, x: Math.max(0, p.x), y: Math.max(0, p.y) }); i++;
+  }
+  const folderName = root.replace(/\/$/, '').split('/').pop();
+  const name = uniqueProjectName(folderName || file.name.replace(/\.zip$/i, ''));
+  syncEditor(); save();
+  loadProject({ name, classes });
+  toast(`Projekt „${name}“ mit ${classes.length} Klasse${classes.length === 1 ? '' : 'n'} importiert.` + (skipped ? ` ${skipped} Datei(en) aus Unterordnern wurden übersprungen.` : ''));
+  if (!S.compiledOnce && classes.length) toast('Hinweis: Das Projekt enthält Fehler oder nicht unterstützte Java-Teile. Klicke auf „Übersetzen“, um sie zu sehen.', true);
+}
+
 $('fileInput').addEventListener('change', async (ev) => {
-  const files = [...ev.target.files]; ev.target.value = '';
+  const all = [...ev.target.files]; ev.target.value = '';
+  for (const z of all.filter(f => /\.zip$/i.test(f.name))) await importZip(z);
+  const files = all.filter(f => !/\.zip$/i.test(f.name));
   let added = 0;
   for (const f of files) {
     const code = await f.text();
@@ -668,7 +799,7 @@ function helpDialog() {
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
   <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Nicht unterstützt: Tastatureingabe mit <code>Scanner</code>, Lambdas, innere Klassen, Grafik.</p>
-  <p><b>Speichern:</b> Das Projekt wird automatisch in diesem Browser gespeichert. Zum Weitergeben „Projekt ▾ → Quelltext exportieren“.</p>`;
+  <p><b>Speichern:</b> Alle Projekte werden automatisch in diesem Browser gespeichert („Projekt ▾ → Meine Projekte“). Zum Sichern, Weitergeben oder für BlueJ: „Projekt ▾ → Als ZIP herunterladen“. ZIP-Dateien (auch BlueJ-Projektordner) öffnest du mit „ZIP- oder .java-Dateien importieren“.</p>`;
   openModal({ title: 'So funktioniert die Java-Werkbank', body: d, wide: true, actions: [{ label: 'Alles klar', primary: true }] });
 }
 
@@ -716,7 +847,8 @@ $('diagram').addEventListener('pointerdown', (ev) => { if (ev.target.closest('.c
 window.addEventListener('resize', hideMenu);
 
 // ------------------------------------------------------------ Start
-const saved = loadSaved();
+let saved = loadSaved();
+{ const l = readLib(); if (l.current && l.projects[l.current]) saved = l.projects[l.current]; }
 if (saved && saved.classes.length) loadProject(saved);
 else { const ex = window.WB_EXAMPLES[0]; loadProject(ex, { benchFrom: ex.bench }); }
 writeConsole('Willkommen! Klicke im Diagramm auf eine Klasse, um Objekte zu erzeugen oder Methoden aufzurufen.\n', 'note');

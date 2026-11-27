@@ -10,7 +10,8 @@ Eine Lernumgebung für Java, die komplett im Browser läuft. Keine Installation,
 - **Objektleiste**: Methoden an Objekten aufrufen und Objekte inspizieren.
 - **Konsole und Direkteingabe**: Ausgaben von `System.out` ansehen und Java-Ausdrücke direkt ausprobieren.
 - **Beispielprojekte**: Bankkonto, Formen (abstrakte Klasse und Interface) und Würfelspiel.
-- **Export/Import** von `.java`-Dateien. Das aktuelle Projekt wird automatisch im Browser gespeichert.
+- **Projekte speichern**: Alle Projekte werden automatisch im Browser gespeichert und lassen sich unter „Projekt ▾ → Meine Projekte“ öffnen, kopieren oder löschen.
+- **ZIP-Export und -Import**: „Als ZIP herunterladen“ erzeugt einen Projektordner mit den `.java`-Dateien und einer `package.bluej` (Klassenpositionen), der sich auch in BlueJ öffnen lässt. Beim Import werden ZIP-Dateien und einzelne `.java`-Dateien angenommen, auch echte BlueJ-Projektordner; die Positionen aus `package.bluej` werden übernommen.
 
 ## Unterstützte Java-Teilmenge
 
@@ -31,5 +32,6 @@ Nicht unterstützt: Tastatureingabe mit `Scanner`, Lambdas, innere Klassen, Graf
 | `app.js` | Logik der Oberfläche (Diagramm, Editor, Dialoge) |
 | `interp.js` | Java-Interpreter: Lexer, Parser, Fehlerprüfung, Laufzeit |
 | `examples.js` | Beispielprojekte |
+| `lib/jszip.min.js` | [JSZip](https://stuk.github.io/jszip/) 3.10.1 für ZIP-Dateien (MIT-Lizenz) |
 
 Inspiriert von den didaktischen Ideen von BlueJ. Unabhängiges Projekt, nicht mit BlueJ verbunden.
