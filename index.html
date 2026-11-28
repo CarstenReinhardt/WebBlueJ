@@ -15,18 +15,25 @@
   --obj: #e2a63a; --obj-ink: #2b1f08; --obj-edge: #b47d1c; --err: #b3261e; --err-soft: #f8dcd8; --ok: #2f7a3b;
   --kw: #8a2f6b; --str: #2f7a3b; --num: #a1561a; --com: #7a877f; --typ: #245f8f;
   --shadow: 0 1px 0 rgba(29,40,35,.06), 0 6px 18px -8px rgba(29,40,35,.25);
+  --ed-fs: 13px; --ed-lh: 20px;
+  --sc-class: #e9f5e2; --sc-class-b: #a9d39b; --sc-method: #fcf7dc; --sc-method-b: #e0cf7c; --sc-loop: #e5eef9; --sc-loop-b: #9fbde3; --sc-cond: #f8e7ee; --sc-cond-b: #dfa9bf; --sc-block: #eff1ee; --sc-block-b: #c3cdc0;
+  --mark: #ffe08a; --mark-cur: #f5b83d; --brk: #bfe3da; --brk-b: #2c5b55;
   --ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
   --ground: #151a18; --grid: #202825; --panel: #1b2220; --panel-2: #212a27; --ink: #e2eae4; --muted: #94a39b; --line: #34413b;
   --card: #1f2826; --head: #3e8a80; --head-ink: #f3faf6; --accent: #4fa397; --accent-ink: #0d1513; --accent-soft: #23423d;
   --obj: #d9a140; --obj-ink: #241806; --obj-edge: #f0c36b; --err: #f08b80; --err-soft: #3f2220; --ok: #79c487;
-  --kw: #e08ac4; --str: #8fd19a; --num: #f0a868; --com: #7d8a83; --typ: #7fb8e6; --shadow: 0 1px 0 rgba(0,0,0,.3), 0 8px 20px -8px rgba(0,0,0,.6); color-scheme: dark; } }
+  --kw: #e08ac4; --str: #8fd19a; --num: #f0a868; --com: #7d8a83; --typ: #7fb8e6; --shadow: 0 1px 0 rgba(0,0,0,.3), 0 8px 20px -8px rgba(0,0,0,.6); color-scheme: dark;
+  --sc-class: #1c2a1f; --sc-class-b: #3b6a44; --sc-method: #2a2817; --sc-method-b: #6a6033; --sc-loop: #1a2533; --sc-loop-b: #3b5d82; --sc-cond: #2d1d25; --sc-cond-b: #6e4558; --sc-block: #222a27; --sc-block-b: #3a4842;
+  --mark: #5b4a17; --mark-cur: #8a6a14; --brk: #23514a; --brk-b: #79c4b8; } }
 :root[data-theme="dark"] {
   --ground: #151a18; --grid: #202825; --panel: #1b2220; --panel-2: #212a27; --ink: #e2eae4; --muted: #94a39b; --line: #34413b;
   --card: #1f2826; --head: #3e8a80; --head-ink: #f3faf6; --accent: #4fa397; --accent-ink: #0d1513; --accent-soft: #23423d;
   --obj: #d9a140; --obj-ink: #241806; --obj-edge: #f0c36b; --err: #f08b80; --err-soft: #3f2220; --ok: #79c487;
-  --kw: #e08ac4; --str: #8fd19a; --num: #f0a868; --com: #7d8a83; --typ: #7fb8e6; --shadow: 0 1px 0 rgba(0,0,0,.3), 0 8px 20px -8px rgba(0,0,0,.6); color-scheme: dark; }
+  --kw: #e08ac4; --str: #8fd19a; --num: #f0a868; --com: #7d8a83; --typ: #7fb8e6; --shadow: 0 1px 0 rgba(0,0,0,.3), 0 8px 20px -8px rgba(0,0,0,.6); color-scheme: dark;
+  --sc-class: #1c2a1f; --sc-class-b: #3b6a44; --sc-method: #2a2817; --sc-method-b: #6a6033; --sc-loop: #1a2533; --sc-loop-b: #3b5d82; --sc-cond: #2d1d25; --sc-cond-b: #6e4558; --sc-block: #222a27; --sc-block-b: #3a4842;
+  --mark: #5b4a17; --mark-cur: #8a6a14; --brk: #23514a; --brk-b: #79c4b8; }
 
 [hidden] { display: none !important; }
 html, body { height: 100%; }
@@ -81,12 +88,34 @@ button { cursor: pointer; }
 .ed-title { font-family: var(--mono); font-weight: 600; margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ed-title small { font-family: var(--ui); font-weight: 400; color: var(--muted); margin-left: 6px; }
 .ed-body { position: relative; flex: 1; display: flex; min-height: 0; }
-.gutter { flex: none; width: 44px; overflow: hidden; background: var(--panel-2); border-right: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 13px; line-height: 20px; text-align: right; padding: 8px 8px 8px 0; box-sizing: border-box; user-select: none; }
+.gutter { flex: none; width: calc(var(--ed-fs) * 2.4 + 14px); overflow: hidden; background: var(--panel-2); border-right: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: var(--ed-fs); line-height: var(--ed-lh); text-align: right; padding: 8px 8px 8px 0; box-sizing: border-box; user-select: none; }
 .gutter div.err { color: var(--err); font-weight: 600; }
 .ed-scroll { position: relative; flex: 1; min-width: 0; }
-.ed-scroll pre, .ed-scroll textarea { position: absolute; inset: 0; margin: 0; padding: 8px 12px; box-sizing: border-box; font-family: var(--mono); font-size: 13px; line-height: 20px; tab-size: 4; white-space: pre; border: 0; overflow: hidden; }
+.ed-scroll pre, .ed-scroll textarea { position: absolute; inset: 0; margin: 0; padding: 8px 12px; box-sizing: border-box; font-family: var(--mono); font-size: var(--ed-fs); line-height: var(--ed-lh); tab-size: 4; white-space: pre; border: 0; overflow: hidden; }
 .ed-scroll pre { pointer-events: none; color: var(--ink); }
-.ed-scroll pre .l { min-height: 20px; }
+.ed-scroll pre .l { min-height: var(--ed-lh); position: relative; z-index: 1; }
+.ed-deco { position: absolute; left: 0; top: 0; width: 0; height: 0; z-index: 0; }
+.ed-deco > div { position: absolute; box-sizing: border-box; }
+.ed-deco .sc { border: 1px solid var(--sc-block-b); border-left-width: 3px; border-radius: 5px 0 0 5px; background: var(--sc-block); }
+.ed-deco .sc.class { background: var(--sc-class); border-color: var(--sc-class-b); }
+.ed-deco .sc.method { background: var(--sc-method); border-color: var(--sc-method-b); }
+.ed-deco .sc.loop { background: var(--sc-loop); border-color: var(--sc-loop-b); }
+.ed-deco .sc.cond { background: var(--sc-cond); border-color: var(--sc-cond-b); }
+.ed-deco .mk { background: var(--mark); border-radius: 2px; }
+.ed-deco .mk.cur { background: var(--mark-cur); box-shadow: 0 0 0 1px var(--mark-cur); }
+.ed-deco .br { background: var(--brk); box-shadow: inset 0 0 0 1px var(--brk-b); border-radius: 2px; }
+.ed-deco .br.bad { background: var(--err-soft); box-shadow: inset 0 0 0 1px var(--err); }
+.ed-find { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel-2); font-size: 13px; }
+.ed-find .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ed-find input[type="text"] { flex: 1 1 160px; min-width: 0; border: 1px solid var(--line); border-radius: 5px; background: var(--card); padding: 3px 8px; font-family: var(--mono); font-size: 13px; }
+.ed-find input.none { border-color: var(--err); background: var(--err-soft); }
+.ed-find .cnt { color: var(--muted); min-width: 7ch; font-size: 12.5px; }
+.ed-find label.chk { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12.5px; }
+.settings { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px 14px; align-items: center; }
+.settings label { font-weight: 500; }
+.settings select { border: 1px solid var(--line); border-radius: 5px; background: var(--card); padding: 4px 8px; }
+.settings .chk { display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; font-weight: 400; }
+.settings .hint { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; margin: 0; }
 .ed-scroll pre .l.err { background: var(--err-soft); box-shadow: inset 3px 0 0 var(--err); margin-inline: -12px; padding-inline: 12px; }
 .ed-scroll textarea { background: transparent; color: transparent; caret-color: var(--ink); resize: none; outline: none; overflow: auto; }
 .ed-scroll textarea::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); color: transparent; }
@@ -111,7 +140,7 @@ button { cursor: pointer; }
 .tabs { display: flex; gap: 2px; margin-right: auto; }
 .tab { border: 0; background: transparent; padding: 3px 10px; border-radius: 5px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; }
 .tab[aria-selected="true"] { background: var(--card); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
-.console { flex: 1; overflow: auto; margin: 0; padding: 8px 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.console { flex: 1; overflow: auto; margin: 0; padding: 8px 12px; font-family: var(--mono); font-size: calc(var(--ed-fs) - .5px); line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .console .err { color: var(--err); } .console .note { color: var(--muted); font-style: italic; } .console .in { color: var(--accent); }
 .console .val { color: var(--typ); }
 .pad { flex: 1; display: flex; flex-direction: column; min-height: 0; }
@@ -205,6 +234,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
       <button class="btn" id="btnNewClass" type="button">+ Neue Klasse</button>
       <button class="btn primary" id="btnCompile" type="button">Übersetzen</button>
       <button class="btn" id="btnProject" type="button" aria-haspopup="menu">Projekt ▾</button>
+      <button class="btn ghost" id="btnSettings" type="button" aria-label="Einstellungen" title="Einstellungen">⚙</button>
       <button class="btn ghost" id="btnHelp" type="button" aria-label="Hilfe">?</button>
     </div>
   </header>
@@ -232,13 +262,30 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
     <section class="editor" id="editorPane" hidden aria-label="Quelltext-Editor">
       <div class="ed-head">
         <span class="ed-title" id="edTitle"></span>
+        <button class="btn small" id="edMenu" type="button" aria-haspopup="menu">Bearbeiten ▾</button>
         <button class="btn small primary" id="edCompile" type="button">Übersetzen <span class="kbd">Strg+S</span></button>
         <button class="btn small ghost" id="edClose" type="button" aria-label="Editor schließen">✕</button>
+      </div>
+      <div class="ed-find" id="edFind" hidden>
+        <div class="row">
+          <input type="text" id="fdText" placeholder="Suchen" aria-label="Suchen" spellcheck="false" autocomplete="off">
+          <span class="cnt" id="fdCount" aria-live="polite"></span>
+          <button class="btn small" id="fdPrev" type="button" aria-label="Vorheriger Treffer" title="Vorheriger Treffer (Umschalt+Enter)">↑</button>
+          <button class="btn small" id="fdNext" type="button" aria-label="Nächster Treffer" title="Nächster Treffer (Enter)">↓</button>
+          <label class="chk"><input type="checkbox" id="fdCase"> Groß/klein</label>
+          <button class="btn small ghost" id="fdToggle" type="button" title="Ersetzen ein-/ausblenden (Strg+H)">Ersetzen …</button>
+          <button class="btn small ghost" id="fdClose" type="button" aria-label="Suche schließen">✕</button>
+        </div>
+        <div class="row" id="fdRepRow" hidden>
+          <input type="text" id="fdRep" placeholder="Ersetzen durch" aria-label="Ersetzen durch" spellcheck="false" autocomplete="off">
+          <button class="btn small" id="fdRepOne" type="button">Ersetzen</button>
+          <button class="btn small" id="fdRepAll" type="button">Alle ersetzen</button>
+        </div>
       </div>
       <div class="ed-body">
         <div class="gutter" id="edGutter" aria-hidden="true"></div>
         <div class="ed-scroll">
-          <pre id="edHl" aria-hidden="true"></pre>
+          <pre id="edHl" aria-hidden="true"><div class="ed-deco" id="edDeco"></div><div id="edLines"></div></pre>
           <textarea id="edText" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-label="Java-Quelltext"></textarea>
         </div>
       </div>
@@ -276,6 +323,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 <script src="aplu.js"></script>
 <script src="gfx.js"></script>
 <script src="examples.js"></script>
+<script src="edtools.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

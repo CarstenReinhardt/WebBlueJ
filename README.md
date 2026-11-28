@@ -5,7 +5,8 @@ Eine Lernumgebung für Java, die komplett im Browser läuft. Keine Installation,
 ## Funktionen
 
 - **Klassendiagramm**: Klassen anlegen und verschieben. Pfeile für Vererbung, Interfaces und Benutzung werden automatisch gezeichnet.
-- **Editor**: Syntaxhervorhebung, automatisches Einrücken, Übersetzen mit `Strg+S`. Fehler werden mit Zeile und deutschem Hinweis markiert.
+- **Editor**: Syntaxhervorhebung, farbige Bereiche wie in BlueJ (Klasse, Methode, Schleife, Verzweigung), Markierung der passenden Klammer, Klammern automatisch schließen, Suchen und Ersetzen (`Strg+F`, `Strg+H`), Gehe zu Zeile (`Strg+G`), ganzen Quelltext neu einrücken (`Strg+Umschalt+F`), Ein-/Auskommentieren (`Strg+#`), Übersetzen mit `Strg+S`. Fehler werden mit Zeile und deutschem Hinweis markiert.
+- **Einstellungen** (⚙): Schriftgröße für Editor und Konsole (auch für den Beamer, im Editor mit `Strg` + `+`/`−`), helles oder dunkles Design, Einrückweite, Bereichsfärbung und automatisches Klammerschließen an/aus.
 - **Objekte interaktiv**: Klick auf eine Klasse erzeugt Objekte (`new …`) oder ruft statische Methoden wie `main` auf.
 - **Objektleiste**: Methoden an Objekten aufrufen und Objekte inspizieren.
 - **Konsole und Direkteingabe**: Ausgaben von `System.out` ansehen und Java-Ausdrücke direkt ausprobieren.
@@ -36,6 +37,7 @@ Nicht unterstützt: Lambdas, innere Klassen. Bei der Grafik fehlen Maus- und Tas
 | `aplu.js` | Nachbildung von `ch.aplu.turtle`, `ch.aplu.util`, `java.awt.Color`/`Font` und `Scanner` |
 | `gfx.js` | Grafikfenster: spielt die Zeichenbefehle mit Animation ab |
 | `examples.js` | Beispielprojekte |
+| `edtools.js` | Editor-Hilfen: Bereiche, Klammerpaare, automatisches Einrücken, Kommentieren |
 | `lib/jszip.min.js` | [JSZip](https://stuk.github.io/jszip/) 3.10.1 für ZIP-Dateien (MIT-Lizenz) |
 
 Inspiriert von den didaktischen Ideen von BlueJ. Unabhängiges Projekt, nicht mit BlueJ verbunden.
