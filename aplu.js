@@ -549,8 +549,29 @@ R.Runtime.extensions.push(function (rt) {
     kbhit() { return false; },
   };
   const conStatics = { init(rt) { return new JObject(rt.cls('Console')); }, clear() { }, end() { }, terminate() { }, delay(rt, a) { return rt.sleep(num(a[0])); } };
+  // Im Terminal: Eingabe direkt dort tippen (bei ungültiger Eingabe wird erneut gefragt)
+  const CON_TERM = {
+    readInt: [(s) => /^[+-]?\d+$/.test(s) && Math.abs(+s) <= 2147483647 ? +s : undefined, 'Bitte eine ganze Zahl eingeben.'],
+    readLong: [(s) => /^[+-]?\d+$/.test(s) ? BigInt(s) : undefined, 'Bitte eine ganze Zahl eingeben.'],
+    readDouble: [(s) => { s = s.replace(',', '.'); return /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s) ? D(parseFloat(s)) : undefined; }, 'Bitte eine Zahl eingeben (z. B. 3.5).'],
+    readBoolean: [(s) => { s = s.toLowerCase(); return ['true', 'ja', 'j', 'yes', 'y'].includes(s) ? true : ['false', 'nein', 'n', 'no'].includes(s) ? false : undefined; }, 'Bitte true oder false eingeben.'],
+    readLine: [(s) => s, '', true], readString: [(s) => s, '', true],
+    readChar: [(s) => new JChar(s.length ? s.charCodeAt(0) : 10), '', true],
+  };
+  const termLine = () => Promise.resolve(rt.io.readLine()).then((s) => { if (s === null || s === undefined) rt.rtError('Eingabe abgebrochen'); return String(s); });
   // Eingaben warten, bis die Grafik fertig abgespielt ist (das Programm pausiert so lange)
-  for (const k of Object.keys(conRead)) { if (k === 'kbhit') continue; const f = conRead[k]; conRead[k] = () => rt.afterGfx(f); }
+  for (const k of Object.keys(conRead)) {
+    if (k === 'kbhit') continue;
+    const f = conRead[k];
+    const t = CON_TERM[k];
+    conRead[k] = () => {
+      if (rt.io.readKey && (k === 'getKey' || k === 'getKeyWait')) return new R.Suspend(() => rt.whenGfxIdle().then(() => rt.io.readKey()).then((c) => { if (c === null || c === undefined) rt.rtError('Eingabe abgebrochen'); return new JChar(c); }), f);
+      if (!rt.io.readLine || !t) return rt.afterGfx(f);
+      return new R.Suspend(() => rt.whenGfxIdle().then(async () => {
+        for (;;) { const s = await termLine(); const v = t[0](t[2] ? s : s.trim()); if (v !== undefined) return v; rt.print(t[1] + '\n', true); }
+      }), f);
+    };
+  }
   for (const [k, f] of Object.entries(conRead)) conStatics[k] = (rt, a) => f();
   const conMethods = { ...conPrint, clear() { }, end() { }, terminate() { }, showCursor() { }, hideCursor() { }, setTitle() { }, setPos() { } };
   for (const [k, f] of Object.entries(conRead)) conMethods[k] = (rt, o, a) => f();
@@ -614,13 +635,14 @@ R.Runtime.extensions.push(function (rt) {
   def('Scanner', { pkg: 'java.util', lib: false,
     ctor(rt, a) { const o = new JObject(rt.cls('Scanner')); o.native = { buf: [], src: typeof a[0] === 'string' ? a[0] : null }; if (o.native.src !== null) o.native.buf = o.native.src.split('\n'); return o; },
     methods: (() => {
-      const line = (o, what) => { if (o.native.src !== null) { if (!o.native.buf.length) rt.throwJava('NoSuchElementException', 'No line found'); return o.native.buf.shift(); } return ask(gfx().lastLine() || what, 'Scanner'); };
+      const line = (o, what) => { if (o.native.src !== null) { if (!o.native.buf.length) rt.throwJava('NoSuchElementException', 'No line found'); return o.native.buf.shift(); } if (o.native.pending && o.native.pending.length) return o.native.pending.shift(); return ask(gfx().lastLine() || what, 'Scanner'); };
       const token = (o, what) => {
         if (!o.native.tokens || !o.native.tokens.length) { let l; do { l = line(o, what); } while (!l.trim() && o.native.src === null && false); o.native.tokens = l.trim().split(/\s+/).filter(Boolean); if (!o.native.tokens.length) o.native.tokens = ['']; }
+        o.native.midLine = true;   // wie in Java: der Rest der Zeile bleibt für nextLine() übrig
         return o.native.tokens.shift();
       };
       return {
-        nextLine(rt, o) { if (o.native.tokens && o.native.tokens.length) { const r = o.native.tokens.join(' '); o.native.tokens = []; return r; } return line(o, 'Text eingeben:'); },
+        nextLine(rt, o) { if (o.native.midLine) { const r = (o.native.tokens || []).join(' '); o.native.tokens = []; o.native.midLine = false; return r; } return line(o, 'Text eingeben:'); },
         next(rt, o) { return token(o, 'Wort eingeben:'); },
         nextInt(rt, o) { const s = token(o, 'Ganze Zahl eingeben:'); if (!/^[+-]?\d+$/.test(s)) rt.throwJava('InputMismatchException', `For input string: "${s}"`); return +s; },
         nextLong(rt, o) { const s = token(o, 'Ganze Zahl eingeben:'); if (!/^[+-]?\d+$/.test(s)) rt.throwJava('InputMismatchException', `For input string: "${s}"`); return BigInt(s); },
@@ -631,13 +653,32 @@ R.Runtime.extensions.push(function (rt) {
         close() { },
       };
     })(),
-    retTypes: { nextLine: STRING, next: STRING, nextInt: INT, nextLong: T('long'), nextDouble: DOUBLE, nextBoolean: BOOL, hasNext: BOOL, hasNextLine: BOOL, hasNextInt: BOOL, hasNextDouble: BOOL, close: VOID },
+    retTypes: { nextLine: STRING, next: STRING, nextInt: INT, nextLong: T('long'), nextDouble: DOUBLE, nextBoolean: BOOL, hasNext: BOOL, hasNextLine: BOOL, hasNextInt: BOOL, hasNextLong: BOOL, hasNextDouble: BOOL, hasNextBoolean: BOOL, close: VOID },
   });
-  { // Scanner über System.in: Eingabe erst, wenn die Grafik fertig ist (Programm pausiert)
+  { // Scanner über System.in: Eingabe erst, wenn die Grafik fertig ist (Programm pausiert).
+    // Mit Terminal wird die Zeile dort gelesen und vorab in den Puffer des Scanners gelegt.
     const sm = rt.cls('Scanner').native.methods;
+    const fill = async (o, k) => {
+      const n = o.native;
+      if (k === 'nextLine') { if (!n.midLine && !(n.pending && n.pending.length)) (n.pending || (n.pending = [])).push(await termLine()); return; }
+      if (k === 'hasNextLine') return;
+      while (!(n.tokens && n.tokens.length)) { const l = n.pending && n.pending.length ? n.pending.shift() : await termLine(); n.tokens = l.trim().split(/\s+/).filter(Boolean); n.midLine = true; }
+    };
+    const hasTok = { hasNext: () => true, hasNextLine: () => true, hasNextInt: (t) => /^[+-]?\d+$/.test(t), hasNextLong: (t) => /^[+-]?\d+$/.test(t), hasNextDouble: (t) => /^[+-]?(\d+[.,]?\d*|[.,]\d+)([eE][+-]?\d+)?$/.test(t), hasNextBoolean: (t) => /^(true|false)$/i.test(t) };
+    for (const [k, test] of Object.entries(hasTok)) {
+      const f = sm[k] || (() => true);
+      sm[k] = function (rt, o, a, line) {
+        if (o.native.src !== null || !rt.io.readLine) return f.call(this, rt, o, a, line);
+        return new R.Suspend(() => rt.whenGfxIdle().then(() => fill(o, k)).then(() => test((o.native.tokens || [])[0] || '')), () => f.call(this, rt, o, a, line));
+      };
+    }
     for (const k of ['nextLine', 'next', 'nextInt', 'nextLong', 'nextDouble', 'nextBoolean']) {
       const f = sm[k];
-      sm[k] = function (rt, o, a, line) { return o.native.src !== null ? f.call(this, rt, o, a, line) : rt.afterGfx(() => f.call(this, rt, o, a, line)); };
+      sm[k] = function (rt, o, a, line) {
+        if (o.native.src !== null) return f.call(this, rt, o, a, line);
+        if (!rt.io.readLine) return rt.afterGfx(() => f.call(this, rt, o, a, line));
+        return new R.Suspend(() => rt.whenGfxIdle().then(() => fill(o, k)).then(() => f.call(this, rt, o, a, line)), () => f.call(this, rt, o, a, line));
+      };
     }
   }
   def('InputStream', { pkg: 'java.io', lib: false });

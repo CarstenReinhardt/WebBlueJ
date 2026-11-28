@@ -18,6 +18,9 @@ const gfx = window.WBGfx.create({
 let liveOut = null;
 const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx, onSlice: () => { if (liveOut) liveOut(); else flushOutput(); },
   assets: (name) => findAsset(name),
+  readLine: () => termAsk(false),
+  readKey: () => termAsk(true),
+  onStop: () => { if (termWait) termDone(null); },
   // Maus-/Tastaturereignis, während kein Programm läuft: als eigener Lauf
   runEvent: (makeGen, label) => {
     setRunning(true);
@@ -91,11 +94,102 @@ function flushOutput() {
   showTab('console');
   return true;
 }
-function showTab(which) {
+// Terminal: angedockt (unten im Reiter) oder wie in BlueJ als eigenes, verschiebbares Fenster,
+// das bei einer Ausgabe oder Eingabe von selbst erscheint.
+function termFloating() { return !!SET.termWindow; }
+function showTab(which, opts = {}) {
   const isPad = which === 'pad';
+  if (!isPad && termFloating()) { showTermWindow(); if (!opts.tab) return; }
   $('tabConsole').setAttribute('aria-selected', String(!isPad)); $('tabPad').setAttribute('aria-selected', String(isPad));
-  consoleEl.hidden = isPad; $('pad').hidden = !isPad;
+  $('termDock').hidden = isPad; $('pad').hidden = !isPad;
+  $('btnTermOpts').hidden = isPad;
+  $('btnClearConsole').hidden = !isPad && termFloating();
   if (isPad) $('padInput').focus({ preventScroll: true });
+}
+let termPlaced = false;
+function showTermWindow() {
+  const w = $('termWin');
+  if (!w.hidden) return;
+  w.hidden = false;
+  if (!termPlaced) {
+    termPlaced = true;
+    const r = w.getBoundingClientRect();
+    // unten links über dem Diagramm, damit Objektleiste und Grafikfenster frei bleiben
+    const d = $('diagram').getBoundingClientRect();
+    w.style.left = Math.max(12, Math.min(d.left + 16, window.innerWidth - r.width - 12)) + 'px';
+    w.style.top = Math.max(12, Math.min(d.bottom - r.height - 16, window.innerHeight - r.height - 12)) + 'px';
+  }
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+function placeTerminal() {
+  const floating = termFloating();
+  if (floating) { $('termSlot').appendChild($('term')); $('termAway').hidden = false; }
+  else { $('termDock').insertBefore($('term'), $('termAway')); $('termAway').hidden = true; $('termWin').hidden = true; }
+  $('btnClearConsole').hidden = floating && !$('termDock').hidden;
+}
+function setTermWindow(on) {
+  SET.termWindow = !!on; applySettings(true); placeTerminal();
+  if (on) { showTermWindow(); showTab('pad'); } else showTab('console');
+}
+function termMenu(x, y) {
+  showMenu(x, y, [
+    { header: 'Terminal' },
+    { label: 'Als eigenes Fenster', plain: true, check: termFloating(), action: () => setTermWindow(!termFloating()) },
+    { label: 'Bei jedem Methodenaufruf leeren', plain: true, check: !!SET.termClear, action: () => { SET.termClear = !SET.termClear; applySettings(true); } },
+    { label: 'Methodenaufrufe protokollieren', plain: true, check: !!SET.termLog, action: () => { SET.termLog = !SET.termLog; applySettings(true); } },
+    { sep: true },
+    { label: 'Leeren', plain: true, action: () => { consoleEl.innerHTML = ''; } },
+    { label: 'Alles kopieren', plain: true, action: () => { navigator.clipboard.writeText(consoleEl.innerText).then(() => toast('Terminal-Inhalt kopiert.'), () => toast('Kopieren hat nicht geklappt – markiere den Text und drücke Strg+C.', true)); } },
+    { label: 'Als Textdatei speichern', plain: true, action: saveTerminal },
+  ]);
+}
+function saveTerminal() {
+  const blob = new Blob([consoleEl.innerText.replace(/\r?\n/g, '\r\n')], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = safeFileName(S.project.name) + '-Terminal.txt';
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+// Eingabe für Scanner/Console im Terminal (statt Eingabedialog)
+let termWait = null;   // { resolve, key }
+function termAsk(key) {
+  if (termWait) termWait.resolve(null);
+  return new Promise((resolve) => {
+    if (liveOut) liveOut(); else flushOutput();
+    termWait = { resolve, key };
+    const f = $('termForm'), inp = $('termInput');
+    $('termLabel').textContent = key ? 'Taste drücken' : 'Eingabe';
+    inp.placeholder = key ? 'eine Taste drücken …' : 'Text eingeben und Enter drücken';
+    inp.value = ''; f.hidden = false;
+    if (termFloating()) showTermWindow(); else showTab('console');
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+    setTimeout(() => inp.focus({ preventScroll: true }), 0);
+  });
+}
+function termDone(value) {
+  const w = termWait; termWait = null; $('termForm').hidden = true;
+  if (w) w.resolve(value);
+}
+$('termForm').addEventListener('submit', (ev) => {
+  ev.preventDefault(); if (!termWait || termWait.key) return;
+  const v = $('termInput').value; writeConsole(v + '\n', 'in'); termDone(v);
+});
+$('termInput').addEventListener('keydown', (ev) => {
+  if (!termWait || !termWait.key) return;
+  if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(ev.key)) return;
+  ev.preventDefault();
+  const c = ev.key.length === 1 ? ev.key.charCodeAt(0) : ev.key === 'Enter' ? 10 : ev.key === 'Backspace' ? 8 : ev.key === 'Tab' ? 9 : ev.key === 'Escape' ? 27 : 65535;
+  termDone(c);
+});
+{ // Terminalfenster verschieben
+  const el = $('termWin'), h = $('termHead');
+  let sx = 0, sy = 0, ox = 0, oy = 0, on = false;
+  h.addEventListener('pointerdown', (ev) => { if (ev.target.closest('button')) return; on = true; sx = ev.clientX; sy = ev.clientY; ox = el.offsetLeft; oy = el.offsetTop; h.setPointerCapture(ev.pointerId); ev.preventDefault(); });
+  h.addEventListener('pointermove', (ev) => { if (!on) return; el.style.left = Math.min(window.innerWidth - 60, Math.max(-el.offsetWidth + 80, ox + ev.clientX - sx)) + 'px'; el.style.top = Math.min(window.innerHeight - 40, Math.max(0, oy + ev.clientY - sy)) + 'px'; });
+  const end = () => { on = false; }; h.addEventListener('pointerup', end); h.addEventListener('pointercancel', end);
+  $('termWinClose').addEventListener('click', () => { el.hidden = true; });
+  $('termWinOpts').addEventListener('click', (ev) => { const r = ev.currentTarget.getBoundingClientRect(); termMenu(r.left - 180, r.bottom + 4); });
+  $('btnTermOpts').addEventListener('click', (ev) => { const r = ev.currentTarget.getBoundingClientRect(); termMenu(r.left, r.bottom + 4); });
+  $('btnTermShow').addEventListener('click', showTermWindow);
+  $('btnTermDock').addEventListener('click', () => setTermWindow(false));
 }
 
 // ------------------------------------------------------------ Diagramm
@@ -200,7 +294,8 @@ function showMenu(x, y, items) {
     if (it.header) { const h = document.createElement('div'); h.className = 'mh'; h.textContent = it.header; menuEl.appendChild(h); continue; }
     const b = document.createElement('button'); b.type = 'button'; b.setAttribute('role', 'menuitem');
     b.textContent = it.label; if (it.title) b.title = it.title;
-    b.className = (it.plain ? 'plain ' : '') + (it.danger ? 'danger' : '');
+    b.className = (it.plain ? 'plain ' : '') + (it.danger ? 'danger' : '') + (it.check !== undefined ? ' chk' + (it.check ? ' on' : '') : '');
+    if (it.check !== undefined) { b.setAttribute('role', 'menuitemcheckbox'); b.setAttribute('aria-checked', String(!!it.check)); }
     b.addEventListener('click', () => { hideMenu(); it.action(); });
     menuEl.appendChild(b);
   }
@@ -332,6 +427,8 @@ function callDialog({ kind, cls, obj, entry }) {
     }
     ctl.close();
     const callText = (kind === 'method' ? obj.name + '.' : kind === 'static' ? cls + '.' : 'new ' + cls) + (kind === 'ctor' ? '' : m.name) + '(' + inputs.map(x => x.value.trim()).join(', ') + ')';
+    if (SET.termClear) consoleEl.innerHTML = '';
+    if (SET.termLog) writeConsole(callText + (kind === 'method' || kind === 'static' ? ';' : '') + '\n', 'call');
     runProgram(() => rt.callMethodG(kind === 'method' ? obj.value : null, m, args)).then((r) => {
       if (!r) return;
       flushOutput();
@@ -413,7 +510,7 @@ function eventResult(r, label) {
   if (!r || r.ok || r.stopped || r.busy) return;
   if (r.exited !== undefined) { writeConsole(`[Programm mit System.exit(${r.exited}) beendet]\n`, 'note'); gfx.closeAll(); return; }
   showRuntimeError(r, `Fehler beim Ereignis ${label}()`, { quiet: true });
-  if (Date.now() - lastEventErr > 4000) toast(`Fehler beim Ereignis ${label}() – siehe Konsole`, true);
+  if (Date.now() - lastEventErr > 4000) toast(`Fehler beim Ereignis ${label}() – siehe Terminal`, true);
   lastEventErr = Date.now();
 }
 function showRuntimeError(r, callText, opts = {}) {
@@ -514,7 +611,7 @@ function markDirty(id) {
 
 // ------------------------------------------------------------ Einstellungen
 const SETTINGS = 'javawerkbank.settings.v1';
-const SET_DEFAULT = { fontSize: 13, theme: 'auto', scopes: true, autoClose: true, indent: 4 };
+const SET_DEFAULT = { fontSize: 13, theme: 'auto', scopes: true, autoClose: true, indent: 4, termWindow: true, termClear: false, termLog: false };
 const SET = (() => { try { return { ...SET_DEFAULT, ...(JSON.parse(localStorage.getItem(SETTINGS) || 'null') || {}) }; } catch (e) { return { ...SET_DEFAULT }; } })();
 const FONT_SIZES = [11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32];
 const LH = () => Math.round(SET.fontSize * 1.54);
@@ -547,7 +644,7 @@ function settingsDialog() {
   <label for="stInd">Einrückung</label><select id="stInd"><option value="2">2 Leerzeichen</option><option value="4">4 Leerzeichen</option></select>
   <label class="chk"><input type="checkbox" id="stScopes"> Bereiche farbig hinterlegen (Klasse grün, Methode gelb, Schleife blau, Verzweigung rosa)</label>
   <label class="chk"><input type="checkbox" id="stClose"> Klammern automatisch schließen</label>
-  <p class="hint">Im Editor ändert <code>Strg</code> + <code>+</code> / <code>−</code> die Schriftgröße. Schriftgröße gilt für Editor und Konsole.</p>`;
+  <p class="hint">Im Editor ändert <code>Strg</code> + <code>+</code> / <code>−</code> die Schriftgröße. Schriftgröße gilt für Editor und Terminal.</p>`;
   const q = (id) => f.querySelector('#' + id);
   q('stTheme').value = SET.theme; q('stInd').value = String(SET.indent); q('stScopes').checked = SET.scopes; q('stClose').checked = SET.autoClose;
   f.addEventListener('change', () => {
@@ -1195,7 +1292,8 @@ function helpDialog() {
   <p><b>Editor:</b> Farbige Bereiche zeigen die Struktur (Klasse grün, Methode gelb, Schleife blau, Verzweigung rosa). Steht der Cursor an einer Klammer, wird die passende Klammer markiert. Über „Bearbeiten ▾“ oder Tastenkürzel: <code>Strg+F</code> Suchen, <code>Strg+H</code> Ersetzen, <code>Strg+G</code> Gehe zu Zeile, <code>Strg+Umschalt+F</code> automatisch einrücken, <code>Strg+#</code> ein-/auskommentieren, <code>Strg</code> + <code>+</code>/<code>−</code> Schriftgröße. Weitere Einstellungen (Beamer-Schrift, dunkles Design) unter ⚙.</p>
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
-  <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Eingaben mit <code>Scanner</code> erscheinen als Eingabedialog. Nicht unterstützt: Lambdas, innere Klassen.</p>
+  <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Nicht unterstützt: Lambdas, innere Klassen.</p>
+  <p><b>Terminal:</b> Ausgaben von <code>System.out</code> (und <code>System.err</code> in Rot) erscheinen wie in BlueJ in einem eigenen, verschiebbaren Fenster, das von selbst aufgeht. Eingaben für <code>Scanner</code> oder <code>Console.readInt()</code> tippst du direkt im Terminal ein. Über ☰ bzw. „Optionen ▾“: als Fenster oder unten angedockt, bei jedem Methodenaufruf leeren, Methodenaufrufe protokollieren, Inhalt kopieren oder als Textdatei speichern.</p>
   <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. <code>Thread.sleep</code>, <code>delay</code> und Endlos-Animationen laufen live.</p>
   <p><b>Maus und Tastatur:</b> Klicke in ein Grafikfenster, damit es die Tasten bekommt. Abfragen ohne Listener: <code>p.kbhit()</code>, <code>p.getKey()</code>, <code>p.getKeyCode()</code>, <code>p.getKeyCodeWait()</code> (bei Turtles über <code>TurtleFrame</code>). Listener wie in Java: eine Klasse schreibt <code>implements MouseListener</code> (oder <code>KeyListener</code>, <code>MouseMotionListener</code>, <code>MouseHitListener</code>) bzw. <code>extends MouseAdapter</code> und meldet sich mit <code>p.addMouseListener(this)</code> an. <code>Monitor.putSleep()</code> wartet, bis ein Ereignis <code>Monitor.wakeUp()</code> aufruft.</p>
   <p><b>Bilder und Klänge:</b> Über „Projekt ▾ → Bilder und Klänge …“ kommen Dateien ins Projekt (auch im ZIP). Dann z. B. <code>p.image("ball.png", x, y)</code>, <code>new Turtle("hase.gif")</code>, <code>t.drawImage("stern.png")</code>, Töne mit <code>t.sound(440, 500)</code> oder <code>SoundPlayer.playSine(440, 500)</code>, Klangdateien mit <code>new SoundPlayer("ton.wav").play()</code>.</p>
@@ -1252,7 +1350,8 @@ $('btnHelp').addEventListener('click', helpDialog);
 $('btnSettings').addEventListener('click', settingsDialog);
 $('btnClearBench').addEventListener('click', clearBench);
 $('btnClearConsole').addEventListener('click', () => { if ($('pad').hidden) consoleEl.innerHTML = ''; else padLog.innerHTML = ''; });
-$('tabConsole').addEventListener('click', () => showTab('console'));
+placeTerminal();
+$('tabConsole').addEventListener('click', () => showTab('console', { tab: true }));
 $('tabPad').addEventListener('click', () => showTab('pad'));
 $('diagram').addEventListener('pointerdown', (ev) => { if (ev.target.closest('.cbox')) return; selectClass(null); });
 window.addEventListener('resize', hideMenu);
