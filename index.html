@@ -57,6 +57,13 @@ button { cursor: pointer; }
 .btn.small { padding: 3px 8px; font-size: 12.5px; }
 .btn.ghost { background: transparent; border-color: transparent; }
 .btn.ghost:hover { border-color: var(--line); }
+.runbar { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.runbar[hidden] { display: none; }
+.runbar .stripes { width: 46px; height: 12px; border-radius: 3px; border: 1px solid var(--err); background: repeating-linear-gradient(-45deg, var(--err) 0 5px, transparent 5px 10px); background-size: 14.14px 14.14px; animation: runstripes .6s linear infinite; }
+@keyframes runstripes { to { background-position: 14.14px 0; } }
+@media (prefers-reduced-motion: reduce) { .runbar .stripes { animation: none; } }
+.btn.stop { color: var(--err); border-color: var(--err); font-weight: 500; }
+.btn.stop:hover { background: var(--err-soft); }
 .btn .kbd { font-family: var(--mono); font-size: 11px; opacity: .7; }
 
 /* Arbeitsbereich */
@@ -231,6 +238,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
       <span class="proj" id="projName"></span>
     </div>
     <div class="actions">
+      <div class="runbar" id="runBar" role="status" hidden><span class="stripes" aria-hidden="true"></span><span>Programm läuft …</span><button class="btn small stop" id="btnStop" type="button" title="Laufendes Programm beenden">■ Beenden</button></div>
       <button class="btn" id="btnNewClass" type="button">+ Neue Klasse</button>
       <button class="btn primary" id="btnCompile" type="button">Übersetzen</button>
       <button class="btn" id="btnProject" type="button" aria-haspopup="menu">Projekt ▾</button>

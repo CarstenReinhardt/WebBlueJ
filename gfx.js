@@ -1,6 +1,8 @@
 /* Java-Werkbank – Grafikfenster für Turtle und GPanel.
-   Der Interpreter läuft synchron und zeichnet nicht selbst: Er legt Zeichenbefehle
-   in eine Warteschlange, die hier Bild für Bild (mit Turtle-Animation) abgespielt wird. */
+   Der Interpreter zeichnet nicht selbst: Er legt Zeichenbefehle in eine Warteschlange,
+   die hier Bild für Bild (mit Turtle-Animation) abgespielt wird. Während das Programm
+   läuft, fragt der Interpreter mit busy() nach, ob er warten soll, bis die Grafik
+   aufgeholt hat (whenIdle). So laufen auch endlose Animationen live. */
 (function (global) {
 'use strict';
 
@@ -8,6 +10,9 @@ function create(hooks) {
   const wins = new Map();
   const queue = [];
   let qi = 0, cur = null, raf = 0, lastT = 0, nextId = 1, z = 1, blocked = false;
+  let fast = false;         // ⏩ gedrückt: bis zum nächsten Programmstart ohne Animation zeichnen
+  let timed = 0;            // Befehle in der Warteschlange, die Zeit brauchen (Bewegung, Pause)
+  const idleCbs = [];
   let layer = null;
 
   function ensureLayer() {
@@ -35,7 +40,7 @@ function create(hooks) {
     w.g.fillStyle = w.bg; w.g.fillRect(0, 0, o.w, o.h);
     w.g.lineCap = 'round'; w.g.lineJoin = 'round';
     el.querySelector('.gfx-close').addEventListener('click', () => closeWin(w));
-    el.querySelector('.gfx-fast').addEventListener('click', () => finish());
+    el.querySelector('.gfx-fast').addEventListener('click', () => { fast = true; finish(); });
     el.addEventListener('pointerdown', () => { el.style.zIndex = ++z; });
     dragHandle(el, el.querySelector('.gfx-head'));
     ensureLayer().appendChild(el);
@@ -64,7 +69,9 @@ function create(hooks) {
     handle.addEventListener('pointerup', end); handle.addEventListener('pointercancel', end);
   }
   function closeWin(w) { if (w.closed) return; w.closed = true; w.el.remove(); }
-  function closeAll() { for (const w of wins.values()) closeWin(w); wins.clear(); queue.length = 0; qi = 0; cur = null; if (raf) cancelAnimationFrame(raf); raf = 0; }
+  function closeAll() { for (const w of wins.values()) closeWin(w); wins.clear(); cancel(); }
+  // Noch nicht abgespielte Befehle verwerfen (Programm beendet)
+  function cancel() { queue.length = 0; qi = 0; cur = null; timed = 0; if (raf) cancelAnimationFrame(raf); raf = 0; lastT = 0; idle(); }
 
   // ---------------------------------------------------------------- Turtle-Figur (eigene Zeichnung)
   function drawTurtle(ctx, x, y, h, color, s = 1) {
@@ -155,9 +162,16 @@ function create(hooks) {
   }
 
   // ---------------------------------------------------------------- Abspielen
-  function op(winId, o) { queue.push([winId, o]); if (!raf) { lastT = 0; raf = requestAnimationFrame(tick); } }
+  const isTimed = (o) => o.t === 'sleep' || ((o.t === 'move' || o.t === 'turn') && isFinite(o.speed));
+  function op(winId, o) { if (isTimed(o)) timed++; queue.push([winId, o]); if (!raf) { lastT = 0; raf = requestAnimationFrame(tick); } }
+  // true, wenn das Programm warten sollte, bis die Grafik aufgeholt hat
+  function busy() { return timed > 40 || queue.length - qi > 4000; }
+  function isIdle() { return !cur && qi >= queue.length; }
+  function whenIdle(cb) { if (isIdle()) cb(); else idleCbs.push(cb); }
+  function idle() { const cbs = idleCbs.splice(0); for (const cb of cbs) { try { cb(); } catch (e) { setTimeout(() => { throw e; }); } } }
   // Liefert true, wenn der Befehl Zeit braucht (dann wird cur gesetzt)
   function start(winId, o) {
+    if (fast && isTimed(o)) { if (o.t === 'sleep') return false; o = { ...o, speed: Infinity }; }
     if (o.t === 'sleep') { cur = { kind: 'sleep', left: Math.max(0, o.ms) }; return true; }
     const w = wins.get(winId); if (!w || w.closed) return false;
     if (o.t === 'move') {
@@ -200,22 +214,23 @@ function create(hooks) {
     while (true) {
       if (cur) { const rest = advance(cur, dt); if (rest < 0) break; dt = rest; cur = null; }
       if (qi >= queue.length) break;
-      const [id, o] = queue[qi++]; start(id, o);
+      const [id, o] = queue[qi++]; if (isTimed(o)) timed--; start(id, o);
       if (++ops % 500 === 0 && performance.now() - t0 > 12) break;
     }
     if (qi > 5000 && qi >= queue.length / 2) { queue.splice(0, qi); qi = 0; }
     redraw();
     if (cur || qi < queue.length) raf = requestAnimationFrame(tick);
-    else { queue.length = 0; qi = 0; lastT = 0; }
+    else { queue.length = 0; qi = 0; lastT = 0; timed = 0; idle(); }
   }
   function redraw() { for (const w of wins.values()) if (w.dirty && !w.closed) { drawTurtles(w); w.dirty = false; } }
   // Alles sofort zeichnen (Knopf ⏩ und vor Eingabedialogen)
   function finish() {
     if (cur) { if (cur.kind !== 'sleep') advance(cur, Infinity); cur = null; }
     while (qi < queue.length) { const [id, o] = queue[qi++]; if (o.t === 'sleep') continue; if (start(id, o)) { advance(cur, Infinity); cur = null; } }
-    queue.length = 0; qi = 0;
+    queue.length = 0; qi = 0; timed = 0;
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     redraw();
+    idle();
   }
 
   // ---------------------------------------------------------------- Ein- und Ausgabe
@@ -235,7 +250,8 @@ function create(hooks) {
     if (Date.now() - t0 < 40 && hooks.note) hooks.note(`[${title || 'Meldung'}] ${text}\n`);
   }
   return {
-    newWindow, op, input, message, closeAll, finish,
+    newWindow, op, input, message, closeAll, finish, cancel, busy, whenIdle,
+    skipping: () => fast, resetFast: () => { fast = false; },
     inputBlocked: () => blocked,
     lastLine: () => (hooks.lastLine ? hooks.lastLine() : ''),
     windowCount: () => [...wins.values()].filter(w => !w.closed).length,

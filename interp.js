@@ -11,6 +11,42 @@ class ExitSig { constructor(code) { this.code = code; } }
 const BREAK = { sig: 'break' }, CONTINUE = { sig: 'continue' };
 class ReturnSig { constructor(v) { this.value = v; } }
 
+// ---------------------------------------------------------------- Unterbrechbare Ausführung
+// Anweisungen und Ausdrücke mit Methodenaufrufen laufen als Generator-Funktionen.
+// Sie geben mit `yield TICK` regelmäßig die Kontrolle ab (Zeitscheiben) und mit
+// `yield new Suspend(…)` warten sie auf etwas Äußeres (Eingabe, Thread.sleep).
+// Ausdrücke ohne Aufrufe werden weiterhin direkt (synchron) und damit schnell berechnet.
+const TICK = { tick: true }, NOFAST = { nofast: true };
+class Suspend {
+  // start(rt) → Promise mit dem Ergebnis (normaler Lauf);
+  // sync(rt) → Ergebnis sofort (verschachtelter Lauf, z. B. toString() in einer Ausgabe)
+  constructor(start, sync) { this.start = start; this.sync = sync; }
+}
+// Enthält ein Ausdruck keinen Aufruf von eigenem Java-Code, ist er „rein“ und wird
+// ohne Generator ausgewertet. Aufrufstellen, die bisher immer bei einer eingebauten
+// Methode landeten (z. B. s.length(), Math.random()), gelten als rein (e.$n === true).
+// Das Ergebnis wird am Knoten gemerkt; lernt eine Aufrufstelle dazu, wird pureEpoch
+// erhöht und alle Merker werden beim nächsten Zugriff neu berechnet.
+let pureEpoch = 1;
+function isPure(e) {
+  if (e.$pe === pureEpoch) return e.$p;
+  e.$pe = pureEpoch;
+  return (e.$p = computePure(e));
+}
+function computePure(e) {
+  if (e.k === 'New' || e.k === 'CtorCall') return false;
+  if (e.k === 'Call' && e.$n !== true) return false;
+  for (const key in e) {
+    if (key === 'type' || key === 'elem' || key === 'line' || key[0] === '$') continue;
+    const v = e[key];
+    if (!v || typeof v !== 'object') continue;
+    if (Array.isArray(v)) { for (const x of v) if (x && typeof x === 'object' && x.k && !isPure(x)) return false; }
+    else if (v.k && !isPure(v)) return false;
+  }
+  return true;
+}
+const allPure = (list) => { for (const x of list) if (!isPure(x)) return false; return true; };
+
 class JDouble { constructor(v) { this.v = v; } }
 class JChar { constructor(c) { this.c = c; } }
 let nextId = 1;
@@ -680,6 +716,8 @@ class Runtime {
     this.io = io || {};
     this.maxSteps = 20000000; this.maxDepth = 1800;
     this.steps = 0; this.depth = 0; this.line = 0; this.callStack = [];
+    this.nextYield = 0;      // bei diesem Schrittstand gibt der Generator die Kontrolle ab (yield TICK)
+    this.task = null;        // laufendes (unterbrechbares) Programm, siehe runAsync
     this.classes = new Map();
     this.installNatives();
     for (const ext of Runtime.extensions) ext(this);
@@ -837,11 +875,123 @@ class Runtime {
   npe(what) { this.throwJava('NullPointerException', what); }
 
   // ------------------------------------------------ Ausführung von außen
+  // Synchroner Lauf (für kurze Aufgaben der Oberfläche, z. B. toString() anzeigen).
+  // Der Zustand eines evtl. pausierten Programms bleibt dabei erhalten.
   run(fn) {
-    this.steps = 0; this.depth = 0; this.callStack = [];
+    const saved = { steps: this.steps, depth: this.depth, callStack: this.callStack, line: this.line, nextYield: this.nextYield };
+    this.steps = 0; this.depth = 0; this.callStack = []; this.nextYield = 0;
     try { const v = fn(); return { ok: true, value: v }; }
     catch (e) { return this.convertError(e); }
+    finally { Object.assign(this, saved); }
   }
+  // Treibt einen Generator ohne Pause bis zum Ende (verschachtelte Aufrufe aus
+  // eingebauten Methoden heraus, z. B. compareTo beim Sortieren). Hier gilt weiter
+  // die Schrittgrenze gegen Endlosschleifen, weil die Oberfläche währenddessen steht.
+  runSync(g) {
+    const base = this.steps;
+    let send, err = null;
+    for (;;) {
+      const r = err !== null ? g.throw(err) : g.next(send);
+      err = null; send = undefined;
+      if (r.done) return r.value;
+      const y = r.value;
+      if (y === TICK) {
+        if (this.steps - base > this.maxSteps) err = new JavaError('Ausführung abgebrochen: Das Programm hat zu viele Schritte gebraucht (Endlosschleife?)', this.line, 'runtime', this.curClassName());
+        this.nextYield = this.steps + 50000;
+      } else if (y instanceof Suspend) {
+        try { send = y.sync ? y.sync(this) : undefined; } catch (e) { err = e; }
+      }
+    }
+  }
+  // Unterbrechbarer Lauf: makeGen() liefert einen Generator (z. B. callMethodG).
+  // Ergebnis: Promise mit demselben Aufbau wie run(); bei „Beenden“ { ok: false, stopped: true }.
+  // Zwischen den Zeitscheiben bleibt die Oberfläche bedienbar; Grafik wird live abgespielt.
+  runAsync(makeGen) {
+    if (this.task) return Promise.resolve({ ok: false, busy: true, message: 'Es läuft bereits ein Programm' });
+    this.steps = 0; this.depth = 0; this.callStack = [];
+    const task = { stopped: false, resolve: null, startedAt: Date.now() };
+    this.task = task;
+    const io = this.io;
+    const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    return new Promise((resolve) => {
+      let done = false, g = null, send, err = null, lastPaint = now();
+      const finish = (res) => {
+        if (done) return; done = true;
+        if (this.task === task) this.task = null;
+        this.nextYield = 0;
+        if (io.onStop) { try { io.onStop(res); } catch (e) { } }
+        resolve(res);
+      };
+      task.finish = finish;
+      const fail = (e) => { let res; try { res = this.convertError(e); } catch (x) { res = { ok: false, message: 'Interner Fehler: ' + (x && x.message) }; } finish(res); };
+      const later = (fn) => {
+        // Kurze Pause, damit Klicks und Grafik dazwischen drankommen. Mindestens alle
+        // 50 ms über setTimeout, damit der Browser sicher neu zeichnet.
+        if (now() - lastPaint > 50 || typeof MessageChannel === 'undefined') { lastPaint = now(); setTimeout(fn, 0); return; }
+        const ch = new MessageChannel(); ch.port1.onmessage = () => { ch.port1.close(); fn(); }; ch.port2.postMessage(0);
+      };
+      const gfxBusy = () => { const gx = io.gfx; return !!(gx && gx.busy && gx.busy()); };
+      const resume = () => {
+        if (done || task.stopped) return;
+        if (gfxBusy()) { io.gfx.whenIdle(() => later(resume)); return; }
+        step();
+      };
+      const step = () => {
+        if (done || task.stopped) return;
+        const t0 = now();
+        for (;;) {
+          this.nextYield = this.steps + 20000;
+          let r;
+          try { r = err !== null ? g.throw(err) : g.next(send); }
+          catch (e) { return fail(e); }
+          err = null; send = undefined;
+          if (r.done) return finish({ ok: true, value: r.value });
+          const y = r.value;
+          if (y instanceof Suspend) {
+            if (io.onSlice) { try { io.onSlice(); } catch (e) { } }
+            let p;
+            try { p = Promise.resolve(y.start(this)); } catch (e) { err = e; continue; }
+            p.then((v) => { send = v; later(resume); }, (e) => { err = e; later(resume); });
+            return;
+          }
+          if (task.stopped) return;
+          if (now() - t0 > 12 || gfxBusy()) break;
+        }
+        if (io.onSlice) { try { io.onSlice(); } catch (e) { } }
+        later(resume);
+      };
+      try { g = makeGen(); } catch (e) { return fail(e); }
+      step();
+    });
+  }
+  get running() { return !!this.task; }
+  // Laufendes Programm beenden (Knopf „Beenden“). Der Generator wird einfach
+  // nicht weiter ausgeführt; der Aufrufstapel wird zurückgesetzt.
+  stop() {
+    const t = this.task; if (!t) return false;
+    t.stopped = true; this.task = null;
+    this.depth = 0; this.callStack = [];
+    t.finish({ ok: false, stopped: true, message: 'Programm wurde beendet' });
+    return true;
+  }
+  // Beim nächsten Schritt die Kontrolle abgeben (z. B. wenn die Grafik hinterherhängt)
+  yieldSoon() { this.nextYield = 0; }
+  // Wartet, bis die Grafik alles abgespielt hat (Turtle-Bewegungen, Pausen).
+  whenGfxIdle() {
+    const gx = this.io.gfx;
+    if (!gx || !gx.whenIdle) return Promise.resolve();
+    return new Promise((res) => gx.whenIdle(res));
+  }
+  // Echte Pause (Thread.sleep, delay): im normalen Lauf wird gewartet; in einem
+  // verschachtelten Lauf wird die Pause wie bisher als Grafikbefehl aufgezeichnet.
+  sleep(ms, value) {
+    ms = Math.max(0, Number(ms) || 0);
+    return new Suspend(
+      () => this.whenGfxIdle().then(() => new Promise((res) => { const gx = this.io.gfx; setTimeout(() => res(value), gx && gx.skipping && gx.skipping() ? 0 : ms); })),
+      () => { const gx = this.io.gfx; if (gx && ms > 0) gx.op(0, { t: 'sleep', ms }); return value; });
+  }
+  // Eingabe o. Ä.: erst die Grafik fertig abspielen, dann fn() ausführen.
+  afterGfx(fn) { return new Suspend(() => this.whenGfxIdle().then(() => fn()), () => fn()); }
   convertError(e) {
     if (e instanceof JThrow) {
       let msg; try { msg = this.str(e.obj); } catch (_) { msg = e.obj.cls.fullName; }
@@ -858,9 +1008,9 @@ class Runtime {
     if (e instanceof ReturnSig) return { ok: true, value: e.value };
     throw e;
   }
-  step() { if (++this.steps > this.maxSteps) this.rtError('Ausführung abgebrochen: Das Programm hat zu viele Schritte gebraucht (Endlosschleife?)'); }
 
   // ------------------------------------------------ Klassen-Initialisierung
+  // Statische Initialisierung läuft ohne Pause (verschachtelt), wie ein Block.
   ensureStaticInit(cls) {
     if (!cls || cls.staticInit || cls.native) return;
     cls.staticInit = 1;
@@ -877,19 +1027,25 @@ class Runtime {
         for (let c = cls; c; c = c.superClass) for (const f of c.fieldList) if (!f.static) o.fields[f.name] = defaultValue(f.type);
         cls.staticValues[ec.name] = o; cls.enumConsts.push(o);
         const args = ec.args.map(a => this.eval(a, ctx));
-        this.runCtor(cls, o, args, ec.line);
+        this.runSync(this.runCtorG(cls, o, args, ec.line));
       });
       for (const f of d.fields) if (f.static && f.init) { this.line = f.line; cls.staticValues[f.name] = this.initValue(f.init, f.type, ctx); }
-      for (const b of d.inits) if (b.static) this.exec(b.body, ctx);
+      for (const b of d.inits) if (b.static) this.runSync(this.exec(b.body, ctx));
     } finally { this.callStack.pop(); }
   }
   initValue(init, type, ctx) {
     if (init.k === 'ArrayInit') return this.arrayInit(init, type, ctx);
     return this.coerce(this.eval(init, ctx), type, init.line);
   }
+  *initValueG(init, type, ctx) {
+    if (isPure(init)) return this.initValue(init, type, ctx);
+    if (init.k === 'ArrayInit') return yield* this.arrayInitG(init, type, ctx);
+    return this.coerce(yield* this.geval(init, ctx), type, init.line);
+  }
 
   // ------------------------------------------------ Objekte erzeugen
-  instantiate(cls, args, line, type) {
+  instantiate(cls, args, line, type) { return this.runSync(this.instantiateG(cls, args, line, type)); }
+  *instantiateG(cls, args, line, type) {
     if (cls.native) {
       if (!cls.native.ctor) this.rtError(`Von ${cls.name} können keine Objekte mit new erzeugt werden`, line);
       return cls.native.ctor(this, args, line, type);
@@ -900,10 +1056,10 @@ class Runtime {
     this.ensureStaticInit(cls);
     const obj = new JObject(cls);
     for (let c = cls; c; c = c.superClass) for (const f of c.fieldList) if (!f.static) obj.fields[f.name] = defaultValue(f.type);
-    this.runCtor(cls, obj, args, line);
+    yield* this.runCtorG(cls, obj, args, line);
     return obj;
   }
-  runCtor(cls, obj, args, line) {
+  *runCtorG(cls, obj, args, line) {
     if (cls && cls.native) { if (cls.native.initInstance) cls.native.initInstance(this, obj, args, line); return; }
     if (!cls || !cls.decl) return;
     let ctor = null;
@@ -919,20 +1075,25 @@ class Runtime {
       const first = stmts[0]; let explicitThis = false;
       if (first && first.k === 'Expr' && first.e.k === 'CtorCall') {
         this.line = first.line;
-        const cargs = first.e.args.map(a => this.eval(a, ctx));
-        if (first.e.which === 'super') this.runCtor(cls.superClass, obj, cargs, first.line);
-        else { explicitThis = true; this.runCtor(cls, obj, cargs, first.line); }
+        const cargs = yield* this.argsG(first.e.args, ctx);
+        if (first.e.which === 'super') yield* this.runCtorG(cls.superClass, obj, cargs, first.line);
+        else { explicitThis = true; yield* this.runCtorG(cls, obj, cargs, first.line); }
         stmts = stmts.slice(1);
-      } else if (cls.superClass) this.runCtor(cls.superClass, obj, [], line);
+      } else if (cls.superClass) yield* this.runCtorG(cls.superClass, obj, [], line);
       if (!explicitThis) {
-        for (const f of cls.decl.fields) if (!f.static && f.init) { this.line = f.line; obj.fields[f.name] = this.initValue(f.init, f.type, { self: obj, cls, env: new Env(null), isStatic: false, ctor: true }); }
-        for (const b of cls.decl.inits) if (!b.static) this.exec(b.body, ctx);
+        for (const f of cls.decl.fields) if (!f.static && f.init) { this.line = f.line; obj.fields[f.name] = yield* this.initValueG(f.init, f.type, { self: obj, cls, env: new Env(null), isStatic: false, ctor: true }); }
+        for (const b of cls.decl.inits) if (!b.static) yield* this.exec(b.body, ctx);
       }
-      try { for (const s of stmts) this.exec(s, ctx); }
+      try { for (const s of stmts) yield* this.exec(s, ctx); }
       catch (e) { if (!(e instanceof ReturnSig)) throw e; }
     } finally { this.depth--; this.callStack.pop(); this.line = line; }
   }
-
+  // Argumentliste auswerten (ohne Generator, wenn kein Argument einen Aufruf enthält)
+  *argsG(list, ctx) {
+    const n = list.length, out = new Array(n);
+    for (let i = 0; i < n; i++) { const a = list[i]; out[i] = isPure(a) ? this.eval(a, ctx) : yield* this.geval(a, ctx); }
+    return out;
+  }
   // ------------------------------------------------ Methoden
   matchScore(v, t) {
     if (!t) return 1;
@@ -981,7 +1142,8 @@ class Runtime {
     }
     return best;
   }
-  invoke(m, self, args, line) {
+  invoke(m, self, args, line) { return this.runSync(this.invokeG(m, self, args, line)); }
+  *invokeG(m, self, args, line) {
     if (m.abstract) this.rtError(`Abstrakte Methode ${m.name} kann nicht aufgerufen werden`, line);
     if (m.static) this.ensureStaticInit(m.cls);
     if (++this.depth > this.maxDepth) { this.depth = 0; this.throwJava('StackOverflowError'); }
@@ -990,7 +1152,9 @@ class Runtime {
     const ctx = { self: m.static ? null : self, cls: m.cls, env, isStatic: m.static, method: m };
     this.callStack.push({ cls: m.cls.name, method: m.name, callLine: this.line });
     try {
-      this.exec(m.body, ctx);
+      if (++this.steps >= this.nextYield) yield TICK;
+      this.line = m.body.line;
+      yield* this.execList(m.body.stmts, ctx);
       if (m.ret.name !== 'void') this.rtError(`Methode ${m.name} endet ohne return`, m.body.endLine);
       return undefined;
     } catch (e) {
@@ -998,12 +1162,13 @@ class Runtime {
       throw e;
     } finally { this.depth--; this.callStack.pop(); this.line = line; }
   }
-  invokeVirtual(obj, m, args, line) {
-    if (m.static || !(obj instanceof JObject) || obj.cls.native) return this.invoke(m, obj, args, line);
+  invokeVirtual(obj, m, args, line) { return this.runSync(this.invokeVirtualG(obj, m, args, line)); }
+  *invokeVirtualG(obj, m, args, line) {
+    if (m.static || !(obj instanceof JObject) || obj.cls.native) return yield* this.invokeG(m, obj, args, line);
     const sig = m.params.map(p => typeStr(p.type)).join(',');
     const impl = this.lookupMethods(obj.cls, m.name).find(x => !x.abstract && x.params.map(p => typeStr(p.type)).join(',') === sig)
       || this.lookupMethods(obj.cls, m.name).find(x => !x.abstract && x.params.length === m.params.length) || m;
-    return this.invoke(impl, obj, args, line);
+    return yield* this.invokeG(impl, obj, args, line);
   }
 
   // ------------------------------------------------ Typen & Werte
@@ -1195,51 +1360,83 @@ class Runtime {
   }
 
   // ------------------------------------------------ Anweisungen
-  exec(s, ctx) {
-    if (++this.steps > this.maxSteps) this.rtError('Ausführung abgebrochen: Das Programm hat zu viele Schritte gebraucht (Endlosschleife?)', s.line);
+  // exec ist ein Generator: Jede Anweisung zählt einen Schritt; ist die Zeitscheibe
+  // verbraucht, wird mit `yield TICK` die Kontrolle abgegeben.
+  *exec(s, ctx) {
+    if (++this.steps >= this.nextYield) yield TICK;
     this.line = s.line;
     switch (s.k) {
       case 'Block': {
         const c2 = { ...ctx, env: new Env(ctx.env) };
-        for (const st of s.stmts) this.exec(st, c2);
+        const stmts = s.stmts;
+        for (let i = 0, n = stmts.length; i < n; i++) {
+          const st = stmts[i];
+          if (st.$se === pureEpoch ? st.$s : this.markSimple(st)) { this.execSimple(st, c2); if (this.steps >= this.nextYield) yield TICK; }
+          else if (st.$c) {
+            // Aufruf als Anweisung (z. B. liste.add(x)): eingebaute Methoden ohne Generator
+            ++this.steps; this.line = st.line;
+            const e = st.e, o = this.eval(e.obj, c2), args = e.args.map(a => this.eval(a, c2));
+            this.line = e.line;
+            const r = this.nativeFast(o, e.name, args, e.line);
+            if (r === NOFAST) { if (e.$n === undefined) e.$n = false; yield* this.callOnG(o, e.name, args, e.line, c2); }
+            else { this.learnNative(e, r); if (r instanceof Suspend) yield r; }
+            if (this.steps >= this.nextYield) yield TICK;
+          }
+          else yield* this.exec(st, c2);
+        }
         return;
       }
       case 'Local':
         for (const d of s.decls) {
           let v = UNINIT, t = d.type;
           if (d.init) {
-            v = this.initValue(d.init, t.name === 'var' ? null : t, ctx);
+            v = isPure(d.init) ? this.initValue(d.init, t.name === 'var' ? null : t, ctx) : yield* this.initValueG(d.init, t.name === 'var' ? null : t, ctx);
             if (t.name === 'var') { if (d.init.k === 'ArrayInit') this.rtError('var kann nicht mit { … } verwendet werden'); t = this.typeOfValue(v); }
           }
           ctx.env.declare(d.name, t, v);
         }
         return;
-      case 'Expr': this.eval(s.e, ctx); return;
+      case 'Expr': {
+        const e = s.e;
+        if (e.k === 'Call') {
+          if (e.obj && e.obj.k !== 'Super' && isPure(e.obj) && allPure(e.args)) {
+            // Aufruf als Anweisung, z. B. liste.add(x) oder t.forward(10)
+            const o = this.eval(e.obj, ctx), args = e.args.map(a => this.eval(a, ctx));
+            this.line = e.line;
+            const r = this.nativeFast(o, e.name, args, e.line);
+            if (r === NOFAST) { if (e.$n === undefined) e.$n = false; yield* this.callOnG(o, e.name, args, e.line, ctx); }
+            else { this.learnNative(e, r); if (r instanceof Suspend) yield r; }
+          } else yield* this.evalCallG(e, ctx);
+        } else if (e.k === 'Assign') yield* this.evalAssignG(e, ctx); else yield* this.geval(e, ctx); return; }
       case 'Empty': return;
-      case 'If': if (this.cond(s.c, ctx)) this.exec(s.a, ctx); else if (s.b) this.exec(s.b, ctx); return;
-      case 'While':
-        while (this.cond(s.c, ctx)) {
-          try { this.exec(s.body, ctx); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
-          this.step();
+      case 'If': if (isPure(s.c) ? this.cond(s.c, ctx) : yield* this.condG(s.c, ctx)) yield* this.exec(s.a, ctx); else if (s.b) yield* this.exec(s.b, ctx); return;
+      case 'While': {
+        while (isPure(s.c) ? this.cond(s.c, ctx) : yield* this.condG(s.c, ctx)) {
+          try { if (s.body.$se === pureEpoch ? s.body.$s : this.markSimple(s.body)) this.execSimple(s.body, ctx); else yield* this.exec(s.body, ctx); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
+          if (++this.steps >= this.nextYield) yield TICK;
         }
         return;
-      case 'DoWhile':
+      }
+      case 'DoWhile': {
         do {
-          try { this.exec(s.body, ctx); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
-          this.step();
-        } while (this.cond(s.c, ctx));
+          try { if (s.body.$se === pureEpoch ? s.body.$s : this.markSimple(s.body)) this.execSimple(s.body, ctx); else yield* this.exec(s.body, ctx); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
+          if (++this.steps >= this.nextYield) yield TICK;
+        } while (isPure(s.c) ? this.cond(s.c, ctx) : yield* this.condG(s.c, ctx));
         return;
+      }
       case 'For': {
         const c2 = { ...ctx, env: new Env(ctx.env) };
-        for (const i of s.init) this.exec(i, c2);
-        for (; !s.c || this.cond(s.c, c2); this.runUpdates(s.upd, c2)) {
-          this.line = s.line; this.step();
-          try { this.exec(s.body, c2); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
+        for (const i of s.init) yield* this.exec(i, c2);
+        for (; !s.c || (isPure(s.c) ? this.cond(s.c, c2) : yield* this.condG(s.c, c2));) {
+          this.line = s.line;
+          if (++this.steps >= this.nextYield) yield TICK;
+          try { if (s.body.$se === pureEpoch ? s.body.$s : this.markSimple(s.body)) this.execSimple(s.body, c2); else yield* this.exec(s.body, c2); } catch (e) { if (e === BREAK) break; if (e !== CONTINUE) throw e; }
+          if (allPure(s.upd)) this.runUpdates(s.upd, c2); else for (const u of s.upd) yield* this.geval(u, c2);
         }
         return;
       }
       case 'ForEach': {
-        const coll = this.eval(s.it, ctx);
+        const coll = isPure(s.it) ? this.eval(s.it, ctx) : yield* this.geval(s.it, ctx);
         if (coll === null) this.npe('for-each über null');
         let items, live = null;
         if (coll instanceof JArray) items = coll.data;
@@ -1251,23 +1448,24 @@ class Runtime {
           const c2 = { ...ctx, env: new Env(ctx.env) };
           const t = s.type.name === 'var' ? this.typeOfValue(items[i]) : s.type;
           c2.env.declare(s.name, t, s.type.name === 'var' ? items[i] : this.coerce(items[i], s.type, s.line));
-          try { this.exec(s.body, c2); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
+          if (++this.steps >= this.nextYield) yield TICK;
+          try { if (s.body.$se === pureEpoch ? s.body.$s : this.markSimple(s.body)) this.execSimple(s.body, c2); else yield* this.exec(s.body, c2); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
         }
         if (live !== null && items.length !== live) this.throwJava('ConcurrentModificationException', 'Liste wurde während der for-each-Schleife verändert');
         return;
       }
-      case 'Return': throw new ReturnSig(s.e ? this.eval(s.e, ctx) : undefined);
+      case 'Return': throw new ReturnSig(s.e ? (isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx)) : undefined);
       case 'Break': throw BREAK;
       case 'Continue': throw CONTINUE;
       case 'Throw': {
-        const v = this.eval(s.e, ctx);
+        const v = isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx);
         if (v === null) this.npe('throw null');
         if (!(v instanceof JObject) || !v.cls.isSubclassOf(this.classes.get('Throwable'))) this.rtError('Nur Ausnahme-Objekte (Throwable) können geworfen werden', s.line);
         this.line = s.line;
         throw new JThrow(v, this.stackSnapshot());
       }
       case 'Try': {
-        try { this.exec(s.block, ctx); }
+        try { yield* this.exec(s.block, ctx); }
         catch (e) {
           let ex = e;
           if (e instanceof RangeError) { try { ex = new JThrow(this.instantiate(this.classes.get('StackOverflowError'), [], this.line), this.stackSnapshot()); } catch (_) { throw e; } }
@@ -1276,12 +1474,12 @@ class Runtime {
           if (!cc) throw ex;
           const c2 = { ...ctx, env: new Env(ctx.env) };
           c2.env.declare(cc.name, T(cc.types[0]), ex.obj);
-          this.exec(cc.body, c2);
-        } finally { if (s.fin) this.exec(s.fin, ctx); }
+          yield* this.exec(cc.body, c2);
+        } finally { if (s.fin) yield* this.exec(s.fin, ctx); }
         return;
       }
       case 'Switch': {
-        const v = this.eval(s.e, ctx);
+        const v = isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx);
         if (v === null) this.npe('switch über null');
         let idx = -1;
         for (let i = 0; i < s.cases.length && idx < 0; i++) {
@@ -1295,18 +1493,74 @@ class Runtime {
         if (idx < 0) return;
         const c2 = { ...ctx, env: new Env(ctx.env) };
         try {
-          if (s.arrow) { for (const st of s.cases[idx].stmts) this.exec(st, c2); }
-          else for (let i = idx; i < s.cases.length; i++) for (const st of s.cases[i].stmts) this.exec(st, c2);
+          if (s.arrow) { for (const st of s.cases[idx].stmts) yield* this.exec(st, c2); }
+          else for (let i = idx; i < s.cases.length; i++) for (const st of s.cases[i].stmts) yield* this.exec(st, c2);
         } catch (e) { if (e === BREAK) return; throw e; }
         return;
       }
       default: this.rtError('Unbekannte Anweisung ' + s.k);
     }
   }
+  // Anweisungsfolge; „einfache“ Anweisungen (ohne Aufrufe und Schleifen) laufen
+  // ohne eigenen Generator, das spart Zeit und Stapelplatz.
+  *execList(stmts, ctx) {
+    for (let i = 0, n = stmts.length; i < n; i++) {
+      const st = stmts[i];
+      if (st.$se === pureEpoch ? st.$s : this.markSimple(st)) { this.execSimple(st, ctx); if (this.steps >= this.nextYield) yield TICK; }
+      else yield* this.exec(st, ctx);
+    }
+  }
+  markSimple(s) {
+    let r = false;
+    switch (s.k) {
+      case 'Expr': {
+        r = isPure(s.e);
+        const e = s.e;
+        s.$c = !r && e.k === 'Call' && !!e.obj && e.obj.k !== 'Super' && isPure(e.obj) && allPure(e.args);
+        break;
+      }
+      case 'Local': r = s.decls.every(d => !d.init || isPure(d.init)); break;
+      case 'Empty': case 'Break': case 'Continue': r = true; break;
+      case 'Return': r = !s.e || isPure(s.e); break;
+      case 'If': r = isPure(s.c) && this.markSimple(s.a) && (!s.b || this.markSimple(s.b)); break;
+      case 'Block': r = s.stmts.every(x => this.markSimple(x)); break;
+    }
+    s.$se = pureEpoch;
+    return (s.$s = r);
+  }
+  // Gegenstück zu exec für einfache Anweisungen (synchron)
+  execSimple(s, ctx) {
+    ++this.steps;
+    this.line = s.line;
+    switch (s.k) {
+      case 'Expr': this.eval(s.e, ctx); return;
+      case 'Local':
+        for (const d of s.decls) {
+          let v = UNINIT, t = d.type;
+          if (d.init) {
+            v = this.initValue(d.init, t.name === 'var' ? null : t, ctx);
+            if (t.name === 'var') { if (d.init.k === 'ArrayInit') this.rtError('var kann nicht mit { … } verwendet werden'); t = this.typeOfValue(v); }
+          }
+          ctx.env.declare(d.name, t, v);
+        }
+        return;
+      case 'Empty': return;
+      case 'Break': throw BREAK;
+      case 'Continue': throw CONTINUE;
+      case 'Return': throw new ReturnSig(s.e ? this.eval(s.e, ctx) : undefined);
+      case 'If': if (this.cond(s.c, ctx)) this.execSimple(s.a, ctx); else if (s.b) this.execSimple(s.b, ctx); return;
+      case 'Block': { const c2 = { ...ctx, env: new Env(ctx.env) }; for (const st of s.stmts) this.execSimple(st, c2); return; }
+    }
+  }
   runUpdates(upd, ctx) { for (const u of upd) this.eval(u, ctx); }
   enumConst(cls, name, line) { this.ensureStaticInit(cls); const o = cls.enumConsts.find(e => e.enumName === name); if (!o) this.rtError(`${cls.name} hat keine Konstante ${name}`, line); return o; }
   cond(e, ctx) {
     const v = this.eval(e, ctx);
+    if (typeof v !== 'boolean') this.rtError(`Bedingung muss vom Typ boolean sein, ist aber ${this.typeNameOf(v)}`, e.line);
+    return v;
+  }
+  *condG(e, ctx) {
+    const v = yield* this.geval(e, ctx);
     if (typeof v !== 'boolean') this.rtError(`Bedingung muss vom Typ boolean sein, ist aber ${this.typeNameOf(v)}`, e.line);
     return v;
   }
@@ -1324,14 +1578,8 @@ class Runtime {
         const a = this.eval(e.arr, ctx); const i = this.toInt(this.eval(e.idx, ctx), e.line);
         this.checkIndex(a, i, e.line); return a.data[i];
       }
-      case 'Call': return this.evalCall(e, ctx);
-      case 'New': {
-        const cls = this.classes.get(e.type.name);
-        if (!cls) this.rtError(`Klasse '${e.type.name}' nicht gefunden`, e.line);
-        const args = e.args.map(a => this.eval(a, ctx));
-        this.line = e.line;
-        return this.instantiate(cls, args, e.line, e.type);
-      }
+      case 'Call': return e.$n === true ? this.callFast(e, ctx) : this.runSync(this.evalCallG(e, ctx));
+      case 'New': return this.runSync(this.geval(e, ctx));
       case 'NewArray': {
         const full = { ...e.elem, dims: e.total };
         if (e.init) return this.arrayInit(e.init, full, ctx);
@@ -1347,8 +1595,67 @@ class Runtime {
         return this.binop(e.op, l, r, e.line);
       }
       case 'Unary': return this.unop(e.op, this.eval(e.e, ctx), e.line);
-      case 'PreInc': case 'PostInc': {
-        const ref = this.lvalue(e.e, ctx); const old = ref.get();
+      case 'PreInc': case 'PostInc': return this.incr(this.lvalue(e.e, ctx), e);
+      case 'Cond': return this.cond(e.c, ctx) ? this.eval(e.a, ctx) : this.eval(e.b, ctx);
+      case 'Cast': return this.cast(this.eval(e.e, ctx), e.type, e.line);
+      case 'InstanceOf': return this.instanceOf(this.eval(e.e, ctx), e, ctx);
+      case 'CtorCall': this.rtError(`${e.which}(…) ist nur als erste Anweisung in einem Konstruktor erlaubt`, e.line);
+    }
+    this.rtError('Unbekannter Ausdruck ' + e.k, e.line);
+  }
+  // Ausdruck mit Aufrufen als Generator auswerten; reine Teilausdrücke synchron
+  *geval(e, ctx) {
+    if (isPure(e)) return this.eval(e, ctx);
+    switch (e.k) {
+      case 'Paren': return yield* this.geval(e.e, ctx);
+      case 'Field': return this.fieldOf(yield* this.geval(e.obj, ctx), e, ctx);
+      case 'Index': {
+        const a = isPure(e.arr) ? this.eval(e.arr, ctx) : yield* this.geval(e.arr, ctx);
+        const i = this.toInt(isPure(e.idx) ? this.eval(e.idx, ctx) : yield* this.geval(e.idx, ctx), e.line);
+        this.checkIndex(a, i, e.line); return a.data[i];
+      }
+      case 'Call': return yield* this.evalCallG(e, ctx);
+      case 'New': {
+        const cls = this.classes.get(e.type.name);
+        if (!cls) this.rtError(`Klasse '${e.type.name}' nicht gefunden`, e.line);
+        const args = yield* this.argsG(e.args, ctx);
+        this.line = e.line;
+        return yield* this.instantiateG(cls, args, e.line, e.type);
+      }
+      case 'NewArray': {
+        const full = { ...e.elem, dims: e.total };
+        if (e.init) return yield* this.arrayInitG(e.init, full, ctx);
+        const sizes = [];
+        for (const d of e.dims) sizes.push(this.toInt(isPure(d) ? this.eval(d, ctx) : yield* this.geval(d, ctx), e.line));
+        return this.makeArray(e.elem, sizes, e.total);
+      }
+      case 'Assign': return yield* this.evalAssignG(e, ctx);
+      case 'Bin': {
+        if (e.op === '&&' || e.op === '||') {
+          const l = isPure(e.l) ? this.eval(e.l, ctx) : yield* this.geval(e.l, ctx); this.boolCheck(l, e.op, e.line);
+          if (e.op === '&&' ? !l : l) return l;
+          const r = isPure(e.r) ? this.eval(e.r, ctx) : yield* this.geval(e.r, ctx); this.boolCheck(r, e.op, e.line); return r;
+        }
+        const l = isPure(e.l) ? this.eval(e.l, ctx) : yield* this.geval(e.l, ctx);
+        const r = isPure(e.r) ? this.eval(e.r, ctx) : yield* this.geval(e.r, ctx);
+        return this.binop(e.op, l, r, e.line);
+      }
+      case 'Unary': return this.unop(e.op, yield* this.geval(e.e, ctx), e.line);
+      case 'PreInc': case 'PostInc': return this.incr(yield* this.lvalueG(e.e, ctx), e);
+      case 'Cond': return (isPure(e.c) ? this.cond(e.c, ctx) : yield* this.condG(e.c, ctx)) ? yield* this.geval(e.a, ctx) : yield* this.geval(e.b, ctx);
+      case 'Cast': return this.cast(yield* this.geval(e.e, ctx), e.type, e.line);
+      case 'InstanceOf': return this.instanceOf(yield* this.geval(e.e, ctx), e, ctx);
+    }
+    return this.eval(e, ctx);
+  }
+  instanceOf(v, e, ctx) {
+    const r = v !== null && this.isInstance(v, e.type);
+    if (r && e.bind) ctx.env.declare(e.bind, e.type, v);
+    return r;
+  }
+  incr(ref, e) {
+    {
+        const old = ref.get();
         const d = e.op === '++' ? 1 : -1; let nv;
         if (typeof old === 'number') nv = ref.type && ref.type.name === 'byte' ? ((old + d) << 24) >> 24 : ref.type && ref.type.name === 'short' ? ((old + d) << 16) >> 16 : (old + d) | 0;
         else if (old instanceof JDouble) nv = new JDouble(old.v + d);
@@ -1358,17 +1665,7 @@ class Runtime {
         else this.rtError(`${e.op} geht nur mit Zahlen, nicht mit ${this.typeNameOf(old)}`, e.line);
         ref.set(nv);
         return e.k === 'PreInc' ? nv : old;
-      }
-      case 'Cond': return this.cond(e.c, ctx) ? this.eval(e.a, ctx) : this.eval(e.b, ctx);
-      case 'Cast': return this.cast(this.eval(e.e, ctx), e.type, e.line);
-      case 'InstanceOf': {
-        const v = this.eval(e.e, ctx); const r = v !== null && this.isInstance(v, e.type);
-        if (r && e.bind) ctx.env.declare(e.bind, e.type, v);
-        return r;
-      }
-      case 'CtorCall': this.rtError(`${e.which}(…) ist nur als erste Anweisung in einem Konstruktor erlaubt`, e.line);
     }
-    this.rtError('Unbekannter Ausdruck ' + e.k, e.line);
   }
   boolCheck(v, op, line) { if (typeof v !== 'boolean') this.rtError(`Operator ${op} braucht boolean-Werte, nicht ${this.typeNameOf(v)}`, line); }
   evalName(e, ctx) {
@@ -1401,7 +1698,9 @@ class Runtime {
       this.checkAccess(f.field, f.owner, ctx, e.line);
       return f.field.static ? this.getStatic(f.owner, f.field) : ctx.self.fields[e.name];
     }
-    const o = this.eval(e.obj, ctx);
+    return this.fieldOf(this.eval(e.obj, ctx), e, ctx);
+  }
+  fieldOf(o, e, ctx) {
     if (o instanceof JClassRef) {
       const f = this.findField(o.cls, e.name);
       if (!f || !f.field.static) this.rtError(f ? `'${e.name}' ist kein statisches Attribut – Zugriff nur über ein Objekt` : `Klasse ${o.cls.name} hat kein Attribut '${e.name}'`, e.line);
@@ -1440,6 +1739,25 @@ class Runtime {
     const et = { ...type, dims: type.dims - 1 };
     return new JArray(et, init.elems.map(x => x.k === 'ArrayInit' ? this.arrayInit(x, et, ctx) : this.coerce(this.eval(x, ctx), et, x.line)));
   }
+  *arrayInitG(init, type, ctx) {
+    if (isPure(init)) return this.arrayInit(init, type, ctx);
+    if (!type) this.rtError('Typ für Array-Initialisierer unbekannt', init.line);
+    if (type.dims < 1) this.rtError(`{ … } passt nicht zum Typ ${typeStr(type)}`, init.line);
+    const et = { ...type, dims: type.dims - 1 };
+    const out = [];
+    for (const x of init.elems) out.push(x.k === 'ArrayInit' ? yield* this.arrayInitG(x, et, ctx) : this.coerce(yield* this.geval(x, ctx), et, x.line));
+    return new JArray(et, out);
+  }
+  *lvalueG(t, ctx) {
+    if (isPure(t)) return this.lvalue(t, ctx);
+    if (t.k === 'Field') return this.fieldRef(yield* this.geval(t.obj, ctx), t, ctx);
+    if (t.k === 'Index') {
+      const a = isPure(t.arr) ? this.eval(t.arr, ctx) : yield* this.geval(t.arr, ctx);
+      const i = this.toInt(isPure(t.idx) ? this.eval(t.idx, ctx) : yield* this.geval(t.idx, ctx), t.line);
+      return this.indexRef(a, i, t);
+    }
+    return this.lvalue(t, ctx);
+  }
   lvalue(t, ctx) {
     const rt = this;
     if (t.k === 'Name') {
@@ -1465,7 +1783,13 @@ class Runtime {
         const o = ctx.self;
         return { type: f.field.type, get() { return o.fields[t.name]; }, set(x) { o.fields[t.name] = x; } };
       }
-      const o = this.eval(t.obj, ctx);
+      return this.fieldRef(this.eval(t.obj, ctx), t, ctx);
+    }
+    if (t.k === 'Index') return this.indexRef(this.eval(t.arr, ctx), this.toInt(this.eval(t.idx, ctx), t.line), t);
+    this.rtError('Hier kann nichts zugewiesen werden', t.line);
+  }
+  fieldRef(o, t, ctx) {
+    {
       if (o instanceof JClassRef) {
         const f = this.findField(o.cls, t.name);
         if (!f || !f.field.static) this.rtError(`Klasse ${o.cls.name} hat kein statisches Attribut '${t.name}'`, t.line);
@@ -1482,12 +1806,10 @@ class Runtime {
       this.finalCheck(f, ctx, t.line);
       return { type: f.field.type, get() { return o.fields[t.name]; }, set(x) { o.fields[t.name] = x; } };
     }
-    if (t.k === 'Index') {
-      const a = this.eval(t.arr, ctx); const i = this.toInt(this.eval(t.idx, ctx), t.line);
-      this.checkIndex(a, i, t.line);
-      return { type: a.elemType, get() { return a.data[i]; }, set(x) { a.data[i] = x; } };
-    }
-    this.rtError('Hier kann nichts zugewiesen werden', t.line);
+  }
+  indexRef(a, i, t) {
+    this.checkIndex(a, i, t.line);
+    return { type: a.elemType, get() { return a.data[i]; }, set(x) { a.data[i] = x; } };
   }
   finalCheck(f, ctx, line) {
     if (f.field.final && !(ctx.ctor && ctx.cls === f.owner) && !(ctx.clinit && ctx.cls === f.owner)) this.rtError(`'${f.field.name}' ist final und kann nicht verändert werden`, line);
@@ -1499,12 +1821,21 @@ class Runtime {
     this.ensureStaticInit(f.owner);
     return { type: f.field.type, get() { return f.owner.staticValues[f.field.name]; }, set(x) { f.owner.staticValues[f.field.name] = x; } };
   }
+  *evalAssignG(e, ctx) {
+    const ref = isPure(e.target) ? this.lvalue(e.target, ctx) : yield* this.lvalueG(e.target, ctx);
+    if (e.op === '=') { const v = this.coerce(isPure(e.value) ? this.eval(e.value, ctx) : yield* this.geval(e.value, ctx), ref.type, e.line); ref.set(v); return v; }
+    const cur = ref.get(); const rhs = isPure(e.value) ? this.eval(e.value, ctx) : yield* this.geval(e.value, ctx);
+    return this.compound(ref, cur, rhs, e);
+  }
   evalAssign(e, ctx) {
     const ref = this.lvalue(e.target, ctx);
+    if (e.op === '=') { const v = this.coerce(this.eval(e.value, ctx), ref.type, e.line); ref.set(v); return v; }
+    const cur = ref.get(); const rhs = this.eval(e.value, ctx);
+    return this.compound(ref, cur, rhs, e);
+  }
+  compound(ref, cur, rhs, e) {
     let v;
-    if (e.op === '=') v = this.coerce(this.eval(e.value, ctx), ref.type, e.line);
-    else {
-      const cur = ref.get(); const rhs = this.eval(e.value, ctx);
+    {
       const op = e.op.slice(0, -1);
       v = this.binop(op, cur, rhs, e.line);
       if (ref.type && ref.type.dims === 0 && PRIMS.has(ref.type.name)) v = this.cast(v, ref.type, e.line);
@@ -1576,48 +1907,79 @@ class Runtime {
   }
 
   // ------------------------------------------------ Methodenaufrufe
-  evalCall(e, ctx) {
+  *evalCallG(e, ctx) {
     const line = e.line;
     if (e.obj === null) {
       const ms = this.lookupMethods(ctx.cls, e.name);
-      if (ctx.self && (!ms.length || !ms.some(m => m.params.length === e.args.length))) { const nf = this.nativeMethod(ctx.cls, e.name); if (nf) { const a = e.args.map(x => this.eval(x, ctx)); this.line = line; return nf(this, ctx.self, a, line); } }
-      if (!ctx.self && !ms.length) { const nsf = (() => { for (let c = ctx.cls; c; c = c.superClass) { const f = c.native && c.native.statics && c.native.statics[e.name]; if (f) return f; } return null; })(); if (nsf) return nsf(this, e.args.map(x => this.eval(x, ctx)), line); }
-      if (!ms.length && ctx.self && ['toString', 'equals', 'hashCode', 'getClass', 'name', 'ordinal', 'compareTo'].includes(e.name)) return this.objectMethod(ctx.self, e.name, e.args.map(a => this.eval(a, ctx)), line);
+      if (ctx.self && (!ms.length || !ms.some(m => m.params.length === e.args.length))) { const nf = this.nativeMethod(ctx.cls, e.name); if (nf) { const a = (yield* this.argsG(e.args, ctx)); this.line = line; { const r = nf(this, ctx.self, a, line); return r instanceof Suspend ? yield r : r; } } }
+      if (!ctx.self && !ms.length) { const nsf = (() => { for (let c = ctx.cls; c; c = c.superClass) { const f = c.native && c.native.statics && c.native.statics[e.name]; if (f) return f; } return null; })(); if (nsf) { const r = nsf(this, (yield* this.argsG(e.args, ctx)), line); return r instanceof Suspend ? yield r : r; } }
+      if (!ms.length && ctx.self && ['toString', 'equals', 'hashCode', 'getClass', 'name', 'ordinal', 'compareTo'].includes(e.name)) return this.objectMethod(ctx.self, e.name, (yield* this.argsG(e.args, ctx)), line);
       if (!ms.length) this.rtError(`Methode '${e.name}' nicht gefunden`, line);
-      const args = e.args.map(a => this.eval(a, ctx));
+      const args = (yield* this.argsG(e.args, ctx));
       this.line = line;
       const m = this.selectOverload(ms, args, e.name, line);
-      if (m.static) return this.invoke(m, null, args, line);
+      if (m.static) return yield* this.invokeG(m, null, args, line);
       if (!ctx.self) this.rtError(`Die Methode ${e.name}() ist nicht statisch und kann nicht aus einer statischen Methode aufgerufen werden – erzeuge zuerst ein Objekt`, line);
-      if (m.vis === 'private') return this.invoke(m, ctx.self, args, line);
-      return this.invokeVirtual(ctx.self, m, args, line);
+      if (m.vis === 'private') return yield* this.invokeG(m, ctx.self, args, line);
+      return yield* this.invokeVirtualG(ctx.self, m, args, line);
     }
     if (e.obj.k === 'Super') {
       if (!ctx.self) this.rtError("'super' gibt es nicht in einer statischen Methode", line);
       const sc = ctx.cls.superClass;
       const ms = this.lookupMethods(sc, e.name).filter(m => !m.abstract);
-      const args = e.args.map(a => this.eval(a, ctx));
+      const args = (yield* this.argsG(e.args, ctx));
       this.line = line;
-      if (!ms.length) { const nf = this.nativeMethod(sc, e.name); if (nf) return nf(this, ctx.self, args, line); }
+      if (!ms.length) { const nf = this.nativeMethod(sc, e.name); if (nf) { const r = nf(this, ctx.self, args, line); return r instanceof Suspend ? yield r : r; } }
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) return this.objectMethod(ctx.self, e.name, args, line, true);
         this.rtError(`Die Oberklasse hat keine (nicht-abstrakte) Methode '${e.name}'`, line);
       }
       const m = this.selectOverload(ms, args, e.name, line);
-      return this.invoke(m, ctx.self, args, line);
+      return yield* this.invokeG(m, ctx.self, args, line);
     }
-    const o = this.eval(e.obj, ctx);
-    const args = e.args.map(a => this.eval(a, ctx));
+    const o = isPure(e.obj) ? this.eval(e.obj, ctx) : yield* this.geval(e.obj, ctx);
+    const args = allPure(e.args) ? e.args.map(a => this.eval(a, ctx)) : yield* this.argsG(e.args, ctx);
     this.line = line;
-    return this.callOn(o, e.name, args, line, ctx);
+    const r = this.nativeFast(o, e.name, args, line);
+    if (r !== NOFAST) { this.learnNative(e, r); return r instanceof Suspend ? yield r : r; }
+    if (e.$n === undefined) e.$n = false;
+    return yield* this.callOnG(o, e.name, args, line, ctx);
   }
-  callOn(o, name, args, line, ctx) {
+  // Aufrufstelle, die bisher immer eine eingebaute Methode traf, synchron ausführen.
+  // Trifft sie doch einmal eigenen Code, wird sie dauerhaft als „nicht rein“ markiert.
+  callFast(e, ctx) {
+    const o = this.eval(e.obj, ctx), args = e.args.map(a => this.eval(a, ctx));
+    this.line = e.line;
+    const r = this.nativeFast(o, e.name, args, e.line);
+    if (r === NOFAST) { e.$n = false; pureEpoch++; return this.runSync(this.callOnG(o, e.name, args, e.line, ctx)); }
+    if (r instanceof Suspend) { e.$n = false; pureEpoch++; return r.sync ? r.sync(this) : undefined; }
+    return r;
+  }
+  learnNative(e, r) { if (e.$n === undefined && !(r instanceof Suspend) && e.obj && e.obj.k !== 'Super') { e.$n = true; pureEpoch++; } }
+  // Schneller Weg für eingebaute Klassen (String, ArrayList, Math …) ohne weiteren
+  // Generator. Liefert NOFAST, wenn der normale Weg (callOnG) nötig ist.
+  nativeFast(o, name, args, line) {
+    if (typeof o === 'string') return this.stringMethod(o, name, args, line);
+    if (o instanceof JObject) {
+      if (!o.cls.native) return NOFAST;
+      for (let c = o.cls; c; c = c.superClass) {
+        const f = c.native && c.native.methods && c.native.methods[name];
+        if (f) return f(this, o, args, line);
+      }
+    } else if (o instanceof JClassRef && o.cls.native) {
+      const f = o.cls.native.statics && o.cls.native.statics[name];
+      if (f) return f(this, args, line);
+    }
+    return NOFAST;
+  }
+  callOn(o, name, args, line, ctx) { return this.runSync(this.callOnG(o, name, args, line, ctx)); }
+  *callOnG(o, name, args, line, ctx) {
     if (o instanceof JClassRef) {
       const c = o.cls;
       if (c.native) {
         const f = c.native.statics && c.native.statics[name];
         if (!f) this.rtError(`Methode '${name}' gibt es in ${c.name} nicht (oder sie wird nicht unterstützt)`, line);
-        return f(this, args, line);
+        { const r = f(this, args, line); return r instanceof Suspend ? yield r : r; }
       }
       if (c.isEnum && name === 'values' && !args.length) { this.ensureStaticInit(c); return new JArray(T(c.name), c.enumConsts.slice()); }
       if (c.isEnum && name === 'valueOf' && args.length === 1) { this.ensureStaticInit(c); const r = c.enumConsts.find(x => x.enumName === args[0]); if (!r) this.throwJava('IllegalArgumentException', `No enum constant ${c.name}.${args[0]}`); return r; }
@@ -1626,7 +1988,7 @@ class Runtime {
       const m = this.selectOverload(ms, args, name, line);
       if (!m.static) this.rtError(`Methode ${name}() ist nicht statisch – rufe sie an einem Objekt auf`, line);
       if (ctx) this.checkAccess(m, m.cls, ctx, line, 'Methode');
-      return this.invoke(m, null, args, line);
+      return yield* this.invokeG(m, null, args, line);
     }
     if (o === null) this.npe(`Methode ${name}() wurde auf null aufgerufen`);
     if (typeof o === 'string') return this.stringMethod(o, name, args, line);
@@ -1640,21 +2002,21 @@ class Runtime {
       if (o.cls.native) {
         for (let c = o.cls; c; c = c.superClass) {
           const f = c.native && c.native.methods && c.native.methods[name];
-          if (f) return f(this, o, args, line);
+          if (f) { const r = f(this, o, args, line); return r instanceof Suspend ? yield r : r; }
         }
         if (['equals', 'hashCode', 'toString', 'getClass'].includes(name)) return this.objectMethod(o, name, args, line);
         this.rtError(`Methode '${name}' gibt es für ${o.cls.name} nicht (oder sie wird nicht unterstützt)`, line);
       }
       const ms = this.lookupMethods(o.cls, name);
-      if (!ms.length || !ms.some(m => m.params.length === args.length)) { const nf = this.nativeMethod(o.cls, name); if (nf) return nf(this, o, args, line); }
+      if (!ms.length || !ms.some(m => m.params.length === args.length)) { const nf = this.nativeMethod(o.cls, name); if (nf) { const r = nf(this, o, args, line); return r instanceof Suspend ? yield r : r; } }
       if (!ms.length) {
         if (['equals', 'hashCode', 'toString', 'getClass', 'name', 'ordinal', 'compareTo'].includes(name)) return this.objectMethod(o, name, args, line);
         this.rtError(`Klasse ${o.cls.name} hat keine Methode '${name}'`, line);
       }
       const m = this.selectOverload(ms, args, name, line);
       if (ctx) this.checkAccess(m, m.cls, ctx, line, 'Methode');
-      if (m.static) return this.invoke(m, null, args, line);
-      return this.invokeVirtual(o, m, args, line);
+      if (m.static) return yield* this.invokeG(m, null, args, line);
+      return yield* this.invokeVirtualG(o, m, args, line);
     }
     this.rtError(`Auf einem Wert vom Typ ${this.typeNameOf(o)} kann keine Methode aufgerufen werden`, line);
   }
@@ -1757,19 +2119,25 @@ class Runtime {
   }
 
   // ------------------------------------------------ Schnittstelle für die Oberfläche
-  evalSnippet(code, env) {
+  // Direkteingabe: zerlegt den Text; liefert { error } oder { gen, post }.
+  prepSnippet(code, env) {
     const src = code.trim();
     const ctx = { self: null, cls: this.padClass, env, isStatic: true };
-    if (!src) return { ok: true, hasValue: false };
+    if (!src) return { done: { ok: true, hasValue: false } };
     let expr = null;
     if (!src.endsWith(';')) {
       try { const p = new Parser(src); const e = p.parseExpr(); if (p.tok.t === 'eof') expr = e; } catch (e) { expr = null; }
     }
     if (expr && !(expr.k === 'Assign' || expr.k === 'PreInc' || expr.k === 'PostInc')) {
-      const r = this.run(() => this.eval(expr, ctx));
-      if (r.ok && r.value instanceof JClassRef) return { ok: false, message: `${r.value.cls.name} ist eine Klasse und kein Wert` };
-      if (r.ok) return { ok: true, hasValue: r.value !== undefined, value: r.value };
-      return r;
+      const rt = this;
+      return {
+        gen: function* () { return yield* rt.geval(expr, ctx); },
+        post: (r) => {
+          if (r.ok && r.value instanceof JClassRef) return { ok: false, message: `${r.value.cls.name} ist eine Klasse und kein Wert` };
+          if (r.ok) return { ok: true, hasValue: r.value !== undefined, value: r.value };
+          return r;
+        },
+      };
     }
     let stmts;
     try {
@@ -1777,13 +2145,24 @@ class Runtime {
       stmts = [];
       while (p.tok.t !== 'eof') stmts.push(p.parseStmt());
     } catch (e) {
-      if (e instanceof JavaError) return { ok: false, message: e.message, kind: 'compile' };
+      if (e instanceof JavaError) return { done: { ok: false, message: e.message, kind: 'compile' } };
       throw e;
     }
-    const r = this.run(() => { for (const s of stmts) this.exec(s, ctx); });
-    if (!r.ok) return r;
-    if (stmts.length === 1 && stmts[0].k === 'Expr' && stmts[0].e.k === 'Assign' && !src.endsWith(';')) return { ok: true, hasValue: false };
-    return { ok: true, hasValue: false };
+    const rt = this;
+    return {
+      gen: function* () { for (const s of stmts) yield* rt.exec(s, ctx); },
+      post: (r) => (r.ok ? { ok: true, hasValue: false } : r),
+    };
+  }
+  evalSnippet(code, env) {
+    const p = this.prepSnippet(code, env);
+    if (p.done) return p.done;
+    return p.post(this.run(() => this.runSync(p.gen())));
+  }
+  evalSnippetAsync(code, env) {
+    const p = this.prepSnippet(code, env);
+    if (p.done) return Promise.resolve(p.done);
+    return this.runAsync(p.gen).then(r => (r.stopped || r.busy ? r : p.post(r)));
   }
   evalArg(text, type, env) {
     const src = text.trim();
@@ -1849,11 +2228,12 @@ class Runtime {
     if (ifaceDefaults.length) groups.push({ from: 'Interfaces', methods: ifaceDefaults, inherited: true });
     return groups;
   }
-  callMethod(obj, m, args) {
-    if (m.native) return this.callOn(obj, m.name, args, 0, null);
-    if (m.isCtor) return this.instantiate(m.cls, args, 0);
-    if (m.static) return this.invoke(m, null, args, 0);
-    return this.invokeVirtual(obj, m, args, 0);
+  callMethod(obj, m, args) { return this.runSync(this.callMethodG(obj, m, args)); }
+  *callMethodG(obj, m, args) {
+    if (m.native) return yield* this.callOnG(obj, m.name, args, 0, null);
+    if (m.isCtor) return yield* this.instantiateG(m.cls, args, 0);
+    if (m.static) return yield* this.invokeG(m, null, args, 0);
+    return yield* this.invokeVirtualG(obj, m, args, 0);
   }
   inspect(v) {
     const rows = [];
@@ -2120,7 +2500,7 @@ class Runtime {
       swap(rt, a) { const L = collArg(a[0]); const i = intArg(a[1]), j = intArg(a[2]); listIdx(null, i, L.length); listIdx(null, j, L.length); [L[i], L[j]] = [L[j], L[i]]; },
       frequency(rt, a) { return collArg(a[0]).filter(x => rt.javaEquals(a[1], x)).length; },
     } });
-    def('Thread', { statics: { sleep() { } } });
+    def('Thread', { statics: { sleep(rt, a) { return rt.sleep(a.length ? rt.num(a[0]) : 0); } } });
     def('Objects', { pkg: 'java.util', statics: { equals(rt, a) { return rt.javaEquals(a[0], a[1]); }, hash(rt, a) { let h = 1; for (const x of a) h = (Math.imul(31, h) + rt.hashOf(x)) | 0; return h; }, isNull(rt, a) { return a[0] === null; }, requireNonNull(rt, a) { if (a[0] === null) rt.npe(a[1] || null); return a[0]; } } });
 
   }
@@ -2688,5 +3068,5 @@ function quickInfo(code) {
 }
 
 Runtime.extensions = [];
-global.JavaRT = { Runtime, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
+global.JavaRT = { Runtime, Suspend, TICK, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
 })(typeof window !== 'undefined' ? window : globalThis);
