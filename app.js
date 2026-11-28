@@ -455,8 +455,54 @@ function markDirty(id) {
   if (!st.dirty || st.error) { st.dirty = true; st.error = null; const el = document.querySelector(`.cbox[data-id="${id}"]`); if (el) { el.classList.add('dirty'); el.classList.remove('has-error'); const bd = el.querySelector('.badge'); if (bd) bd.remove(); } }
 }
 
+// ------------------------------------------------------------ Einstellungen
+const SETTINGS = 'javawerkbank.settings.v1';
+const SET_DEFAULT = { fontSize: 13, theme: 'auto', scopes: true, autoClose: true, indent: 4 };
+const SET = (() => { try { return { ...SET_DEFAULT, ...(JSON.parse(localStorage.getItem(SETTINGS) || 'null') || {}) }; } catch (e) { return { ...SET_DEFAULT }; } })();
+const FONT_SIZES = [11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32];
+const LH = () => Math.round(SET.fontSize * 1.54);
+const IND = () => ' '.repeat(SET.indent);
+let charW = 7.8;
+function measureChar() {
+  const cv = document.createElement('canvas').getContext('2d');
+  cv.font = `${SET.fontSize}px ${getComputedStyle(document.documentElement).getPropertyValue('--mono') || 'monospace'}`;
+  const w = cv.measureText('M'.repeat(50)).width / 50; if (w > 0) charW = w;
+}
+function applySettings(persist) {
+  const r = document.documentElement;
+  r.style.setProperty('--ed-fs', SET.fontSize + 'px'); r.style.setProperty('--ed-lh', LH() + 'px');
+  if (SET.theme === 'auto') r.removeAttribute('data-theme'); else r.setAttribute('data-theme', SET.theme);
+  measureChar();
+  if (persist) { try { localStorage.setItem(SETTINGS, JSON.stringify(SET)); } catch (e) { } }
+  if (S.editing) renderEditor();
+}
+applySettings(false);
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { measureChar(); if (S.editing) renderEditor(); });
+function changeFontSize(dir) {
+  let i = FONT_SIZES.indexOf(SET.fontSize); if (i < 0) i = FONT_SIZES.indexOf(13);
+  i = Math.max(0, Math.min(FONT_SIZES.length - 1, i + dir)); SET.fontSize = FONT_SIZES[i]; applySettings(true);
+  toast(`Schriftgröße ${SET.fontSize} pt`);
+}
+function settingsDialog() {
+  const f = document.createElement('form'); f.className = 'settings';
+  f.innerHTML = `<label for="stFs">Schriftgröße</label><select id="stFs">${FONT_SIZES.map(n => `<option value="${n}"${n === SET.fontSize ? ' selected' : ''}>${n}${n === 13 ? ' (Standard)' : n >= 20 ? ' (Beamer)' : ''}</option>`).join('')}</select>
+  <label for="stTheme">Darstellung</label><select id="stTheme"><option value="auto">wie das System</option><option value="light">hell</option><option value="dark">dunkel</option></select>
+  <label for="stInd">Einrückung</label><select id="stInd"><option value="2">2 Leerzeichen</option><option value="4">4 Leerzeichen</option></select>
+  <label class="chk"><input type="checkbox" id="stScopes"> Bereiche farbig hinterlegen (Klasse grün, Methode gelb, Schleife blau, Verzweigung rosa)</label>
+  <label class="chk"><input type="checkbox" id="stClose"> Klammern automatisch schließen</label>
+  <p class="hint">Im Editor ändert <code>Strg</code> + <code>+</code> / <code>−</code> die Schriftgröße. Schriftgröße gilt für Editor und Konsole.</p>`;
+  const q = (id) => f.querySelector('#' + id);
+  q('stTheme').value = SET.theme; q('stInd').value = String(SET.indent); q('stScopes').checked = SET.scopes; q('stClose').checked = SET.autoClose;
+  f.addEventListener('change', () => {
+    SET.fontSize = +q('stFs').value; SET.theme = q('stTheme').value; SET.indent = +q('stInd').value;
+    SET.scopes = q('stScopes').checked; SET.autoClose = q('stClose').checked; applySettings(true);
+  });
+  f.addEventListener('submit', (e) => e.preventDefault());
+  openModal({ title: 'Einstellungen', body: f, actions: [{ label: 'Fertig', primary: true }] });
+}
+
 // ------------------------------------------------------------ Editor
-const edText = $('edText'), edHl = $('edHl'), edGutter = $('edGutter');
+const edText = $('edText'), edHl = $('edHl'), edGutter = $('edGutter'), edLines = $('edLines'), edDeco = $('edDeco');
 let errLine = 0;
 const KWS = new Set('abstract assert break case catch class continue default do else enum extends final finally for if implements import instanceof interface native new package private protected public return static super switch synchronized this throw throws transient try volatile while var'.split(' '));
 const LITS = new Set(['true', 'false', 'null']);
@@ -480,11 +526,46 @@ function highlight(code) {
   if (last < code.length) push(code.slice(last), null);
   return lines;
 }
+// Zwischenspeicher für Analyse des aktuellen Texts
+const ana = { text: null, mask: null, starts: null, lines: null, scopes: [], maxCols: 0 };
+function analyse() {
+  const v = edText.value; if (ana.text === v) return ana;
+  ana.text = v; ana.mask = WBEd.codeMask(v); ana.starts = WBEd.lineStarts(v); ana.lines = v.split('\n');
+  ana.scopes = WBEd.scopes(v, ana.mask).filter(s => s.kind !== 'init');
+  ana.maxCols = ana.lines.reduce((m, l) => Math.max(m, WBEd.visCol(l, l.length)), 0);
+  return ana;
+}
+const PAD_X = 12, PAD_Y = 8;
+function posBox(pos, len, cls) {
+  const a = analyse(); const ln = WBEd.lineOf(a.starts, pos); const line = a.lines[ln]; const off = pos - a.starts[ln];
+  const c0 = WBEd.visCol(line, off), c1 = WBEd.visCol(line, off + len);
+  return `<div class="${cls}" style="left:${PAD_X + c0 * charW}px;top:${PAD_Y + ln * LH()}px;width:${Math.max(2, (c1 - c0) * charW)}px;height:${LH()}px"></div>`;
+}
+function renderDeco() {
+  if (!S.editing) return;
+  const a = analyse(); const lh = LH(); let h = '';
+  if (SET.scopes) {
+    const full = Math.max(edText.clientWidth - 4, PAD_X * 2 + a.maxCols * charW + 16);
+    for (const s of a.scopes) {
+      const left = Math.max(2, PAD_X + s.col * charW - 6);
+      const right = full - s.depth * 3;
+      h += `<div class="sc ${s.kind}" style="left:${left}px;top:${PAD_Y + s.startLine * lh}px;width:${Math.max(10, right - left)}px;height:${(s.endLine - s.startLine + 1) * lh}px"></div>`;
+    }
+  }
+  if (find.open && find.q) find.matches.forEach((p, i) => { h += posBox(p, find.qLen, 'mk' + (i === find.cur ? ' cur' : '')); });
+  if (document.activeElement === edText && edText.selectionStart === edText.selectionEnd) {
+    const b = WBEd.bracketAt(a.text, a.mask, edText.selectionStart);
+    if (b) { h += posBox(b.a, 1, 'br' + (b.b < 0 ? ' bad' : '')); if (b.b >= 0) h += posBox(b.b, 1, 'br'); }
+  }
+  edDeco.innerHTML = h;
+}
 function renderEditor() {
   const lines = highlight(edText.value);
-  edHl.innerHTML = lines.map((l, i) => `<div class="l${i + 1 === errLine ? ' err' : ''}">${l || '​'}</div>`).join('') + '<div class="l">​</div>';
+  edLines.innerHTML = lines.map((l, i) => `<div class="l${i + 1 === errLine ? ' err' : ''}">${l || '​'}</div>`).join('') + '<div class="l">​</div>';
   let g = ''; for (let i = 1; i <= lines.length; i++) g += `<div${i === errLine ? ' class="err"' : ''}>${i}</div>`;
   edGutter.innerHTML = g + '<div>&nbsp;</div>';
+  if (find.open) computeMatches(false);
+  renderDeco();
   syncScroll();
 }
 function syncScroll() { edHl.scrollTop = edText.scrollTop; edHl.scrollLeft = edText.scrollLeft; edGutter.scrollTop = edText.scrollTop; }
@@ -507,7 +588,7 @@ function openEditor(id) {
   setTimeout(() => { edText.focus({ preventScroll: true }); if (errLine) gotoLine(errLine); }, 0);
   renderArrows();
 }
-function closeEditor() { syncEditor(); S.editing = null; $('editorPane').hidden = true; renderDiagram(); }
+function closeEditor() { syncEditor(); closeFind(false); S.editing = null; $('editorPane').hidden = true; renderDiagram(); }
 function syncEditor() {
   if (!S.editing) return;
   const c = classById(S.editing); if (!c) return;
@@ -517,10 +598,31 @@ function syncEditor() {
   save();
 }
 function markErrorLine(line, msg) { errLine = line; setStatus(`Zeile ${line}: ${msg}`, 'err', line); renderEditor(); gotoLine(line); }
+function scrollToLine(line) {
+  const lh = LH(), top = (line - 1) * lh, vis = edText.clientHeight;
+  if (top < edText.scrollTop + lh || top > edText.scrollTop + vis - 3 * lh) edText.scrollTop = Math.max(0, top - Math.floor(vis / 3));
+  syncScroll();
+}
+function scrollToPos(pos) {
+  const a = analyse(); const ln = WBEd.lineOf(a.starts, pos); scrollToLine(ln + 1);
+  const x = PAD_X + WBEd.visCol(a.lines[ln], pos - a.starts[ln]) * charW;
+  if (x < edText.scrollLeft + 20 || x > edText.scrollLeft + edText.clientWidth - 40) edText.scrollLeft = Math.max(0, x - edText.clientWidth / 2);
+  syncScroll();
+}
 function gotoLine(line) {
-  const lines = edText.value.split('\n'); let pos = 0; for (let i = 0; i < line - 1 && i < lines.length; i++) pos += lines[i].length + 1;
+  const lines = edText.value.split('\n'); line = Math.max(1, Math.min(lines.length, line)); let pos = 0; for (let i = 0; i < line - 1 && i < lines.length; i++) pos += lines[i].length + 1;
   edText.focus({ preventScroll: true }); edText.setSelectionRange(pos, pos + (lines[line - 1] || '').length);
-  edText.scrollTop = Math.max(0, (line - 6) * 20); syncScroll();
+  scrollToLine(line); renderDeco();
+}
+function gotoLineDialog() {
+  const n = edText.value.split('\n').length;
+  const cur = edText.value.slice(0, edText.selectionStart).split('\n').length;
+  const form = document.createElement('form'); form.className = 'field';
+  form.innerHTML = `<label for="glLine">Zeilennummer (1 bis ${n})</label><input id="glLine" inputmode="numeric" autocomplete="off">`;
+  form.querySelector('input').value = cur;
+  const ok = () => { const v = parseInt(form.querySelector('input').value, 10); if (v > 0) setTimeout(() => gotoLine(v), 0); };
+  form.addEventListener('submit', (e) => { e.preventDefault(); ok(); modals[modals.length - 1].close(); });
+  openModal({ title: 'Gehe zu Zeile', body: form, actions: [{ label: 'Abbrechen' }, { label: 'Springen', primary: true, action: ok }] });
 }
 let edTimer = null;
 edText.addEventListener('input', () => {
@@ -530,40 +632,187 @@ edText.addEventListener('input', () => {
   clearTimeout(edTimer); edTimer = setTimeout(() => { const before = c && c.name; syncEditor(); if (c && (before !== c.name)) renderDiagram(); else renderArrows(); }, 400);
 });
 edText.addEventListener('scroll', syncScroll);
+for (const ev of ['keyup', 'mouseup', 'focus', 'blur']) edText.addEventListener(ev, () => renderDeco());
+window.addEventListener('resize', () => { if (S.editing) renderDeco(); });
 function insertText(t) { if (!document.execCommand('insertText', false, t)) { const s = edText.selectionStart, e = edText.selectionEnd; edText.setRangeText(t, s, e, 'end'); edText.dispatchEvent(new Event('input')); } }
+function deleteSel() { if (!document.execCommand('delete', false)) { const s = edText.selectionStart, e = edText.selectionEnd; edText.setRangeText('', s, e, 'end'); edText.dispatchEvent(new Event('input')); } }
+// Ganze Zeilen der Auswahl durch neue ersetzen (rückgängig machbar)
+function replaceLines(fn) {
+  const v = edText.value, s = edText.selectionStart, e = edText.selectionEnd;
+  const ls = v.lastIndexOf('\n', s - 1) + 1;
+  let le = v.indexOf('\n', e > s && v[e - 1] === '\n' ? e - 1 : e); if (le < 0) le = v.length;
+  const old = v.slice(ls, le); const nw = fn(old.split('\n')).join('\n');
+  if (nw === old) return;
+  edText.focus({ preventScroll: true }); edText.setSelectionRange(ls, le); insertText(nw);
+  edText.setSelectionRange(ls, ls + nw.length);
+}
+function toggleComment() { replaceLines(WBEd.toggleComment); }
+function autoIndent() {
+  const v = edText.value; const nv = WBEd.reindent(v, IND());
+  if (nv === v) { setStatus('Einrückung ist schon in Ordnung.', 'ok'); return; }
+  const line = v.slice(0, edText.selectionStart).split('\n').length; const top = edText.scrollTop;
+  edText.focus({ preventScroll: true }); edText.setSelectionRange(0, v.length); insertText(nv);
+  const ls = nv.split('\n').slice(0, line - 1).reduce((n, l) => n + l.length + 1, 0);
+  const ind = (nv.slice(ls).match(/^[ \t]*/) || [''])[0].length;
+  edText.setSelectionRange(ls + ind, ls + ind); edText.scrollTop = top; syncScroll();
+  setStatus('Quelltext neu eingerückt. Strg+Z macht es rückgängig.');
+}
+const OPEN_CLOSE = { '(': ')', '[': ']' };
 edText.addEventListener('keydown', (ev) => {
   const v = edText.value, s = edText.selectionStart, e = edText.selectionEnd;
-  if ((ev.ctrlKey || ev.metaKey) && (ev.key === 's' || ev.key === 'S')) { ev.preventDefault(); compileAll(); return; }
+  const ctrl = ev.ctrlKey || ev.metaKey;
+  if (ctrl && !ev.altKey) {
+    const k = ev.key.toLowerCase();
+    if (k === 's') { ev.preventDefault(); compileAll(); return; }
+    if (k === 'f' && ev.shiftKey) { ev.preventDefault(); autoIndent(); return; }
+    if (k === 'f') { ev.preventDefault(); openFind(false); return; }
+    if (k === 'h' || k === 'r') { ev.preventDefault(); openFind(true); return; }
+    if (k === 'g') { ev.preventDefault(); gotoLineDialog(); return; }
+    if (k === '/' || k === '#' || ev.code === 'Slash') { ev.preventDefault(); toggleComment(); return; }
+    if (k === '+' || k === '=' || ev.code === 'NumpadAdd') { ev.preventDefault(); changeFontSize(1); return; }
+    if (k === '-' || ev.code === 'NumpadSubtract') { ev.preventDefault(); changeFontSize(-1); return; }
+  }
+  if (ev.key === 'F3') { ev.preventDefault(); if (find.q) findStep(ev.shiftKey ? -1 : 1); else openFind(false); return; }
+  if (ev.key === 'Escape' && find.open) { ev.preventDefault(); ev.stopPropagation(); closeFind(true); return; }
   if (ev.key === 'Tab') {
     ev.preventDefault();
     const ls = v.lastIndexOf('\n', s - 1) + 1;
     if (s !== e && v.slice(s, e).includes('\n') || ev.shiftKey) {
       const le = v.indexOf('\n', e - 1) === -1 ? v.length : v.indexOf('\n', e - (e > s && v[e - 1] === '\n' ? 1 : 0));
       const block = v.slice(ls, le);
-      const nb = ev.shiftKey ? block.replace(/^( {1,4}|\t)/gm, '') : block.replace(/^/gm, '    ');
+      const nb = ev.shiftKey ? block.replace(new RegExp(`^( {1,${SET.indent}}|\\t)`, 'gm'), '') : block.replace(/^/gm, IND());
       edText.setSelectionRange(ls, le); insertText(nb); edText.setSelectionRange(ls, ls + nb.length);
-    } else insertText('    ');
+    } else insertText(IND());
     return;
   }
-  if (ev.key === 'Enter' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+  if (ev.key === 'Enter' && !ctrl && !ev.altKey) {
     ev.preventDefault();
     const ls = v.lastIndexOf('\n', s - 1) + 1; const cur = v.slice(ls, s);
     let ind = (cur.match(/^[ \t]*/) || [''])[0];
     const before = v.slice(0, s).trimEnd(); const after = v.slice(e);
     if (before.endsWith('{')) {
-      const inner = ind + '    ';
+      const inner = ind + IND();
       if (/^[ \t]*\}/.test(after)) { insertText('\n' + inner + '\n' + ind); const p = edText.selectionStart - ind.length - 1; edText.setSelectionRange(p, p); return; }
+      const a = analyse();
+      if (SET.autoClose && !after.split('\n')[0].trim() && WBEd.unbalancedBraces(a.text, a.mask) > 0) {
+        insertText('\n' + inner + '\n' + ind + '}'); const p = edText.selectionStart - ind.length - 2; edText.setSelectionRange(p, p); return;
+      }
       ind = inner;
     } else if (/^\s*\/?\*\*?/.test(cur) && !cur.includes('*/')) { insertText('\n' + ind.replace(/\/$/, '') + (cur.trim().startsWith('/*') ? ' * ' : '* ')); return; }
     insertText('\n' + ind); return;
   }
   if (ev.key === '}') {
     const ls = v.lastIndexOf('\n', s - 1) + 1; const cur = v.slice(ls, s);
-    if (/^[ \t]+$/.test(cur) && s === e) { ev.preventDefault(); edText.setSelectionRange(Math.max(ls, s - 4), s); insertText('}'); }
+    if (/^[ \t]+$/.test(cur) && s === e) { ev.preventDefault(); edText.setSelectionRange(Math.max(ls, s - SET.indent), s); insertText('}'); }
+    return;
+  }
+  if (SET.autoClose && !ctrl && !ev.altKey) {
+    const a = analyse(); const inCode = !(s > 0 && a.mask[s - 1]);
+    if (OPEN_CLOSE[ev.key] && inCode) {
+      const nxt = v[e] || '';
+      if (s !== e) { ev.preventDefault(); const sel = v.slice(s, e); insertText(ev.key + sel + OPEN_CLOSE[ev.key]); edText.setSelectionRange(s + 1, s + 1 + sel.length); return; }
+      if (!nxt || /[\s)\];,]/.test(nxt)) { ev.preventDefault(); insertText(ev.key + OPEN_CLOSE[ev.key]); edText.setSelectionRange(s + 1, s + 1); return; }
+    }
+    if ((ev.key === ')' || ev.key === ']') && s === e && v[s] === ev.key) {
+      const m = a.mask[s] ? -1 : WBEd.findMatch(v, a.mask, s);
+      if (m >= 0) { ev.preventDefault(); edText.setSelectionRange(s + 1, s + 1); renderDeco(); return; }
+    }
+    if (ev.key === 'Backspace' && s === e && s > 0 && OPEN_CLOSE[v[s - 1]] === v[s]) { ev.preventDefault(); edText.setSelectionRange(s - 1, s + 1); deleteSel(); return; }
   }
 });
 $('edCompile').addEventListener('click', () => compileAll());
 $('edClose').addEventListener('click', closeEditor);
+$('edMenu').addEventListener('click', () => {
+  if (!menuEl.hidden) { hideMenu(); return; }
+  const r = $('edMenu').getBoundingClientRect();
+  showMenu(r.left, r.bottom + 4, [
+    { label: 'Suchen …   Strg+F', plain: true, action: () => openFind(false) },
+    { label: 'Suchen und Ersetzen …   Strg+H', plain: true, action: () => openFind(true) },
+    { label: 'Gehe zu Zeile …   Strg+G', plain: true, action: gotoLineDialog },
+    { sep: true },
+    { label: 'Automatisch einrücken   Strg+Umschalt+F', plain: true, action: autoIndent },
+    { label: 'Ein-/Auskommentieren   Strg+#', plain: true, action: toggleComment },
+    { sep: true },
+    { label: 'Schrift größer   Strg++', plain: true, action: () => changeFontSize(1) },
+    { label: 'Schrift kleiner   Strg+−', plain: true, action: () => changeFontSize(-1) },
+    { label: (SET.scopes ? 'Bereichsfärbung ausschalten' : 'Bereichsfärbung einschalten'), plain: true, action: () => { SET.scopes = !SET.scopes; applySettings(true); } },
+  ]);
+});
+
+// ------------------------------------------------------------ Suchen und Ersetzen
+const find = { open: false, q: '', qLen: 0, matches: [], cur: -1 };
+const fdText = $('fdText'), fdRep = $('fdRep');
+function computeMatches(keepNear) {
+  const q = fdText.value; find.q = q; find.qLen = q.length; find.matches = [];
+  if (q) {
+    const cs = $('fdCase').checked; const hay = cs ? edText.value : edText.value.toLowerCase(); const needle = cs ? q : q.toLowerCase();
+    for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + Math.max(1, needle.length))) find.matches.push(i);
+  }
+  if (keepNear) { const s = edText.selectionStart; find.cur = find.matches.findIndex(p => p >= s); if (find.cur < 0) find.cur = find.matches.length ? 0 : -1; }
+  else if (find.cur >= find.matches.length) find.cur = find.matches.length - 1;
+  const n = find.matches.length;
+  $('fdCount').textContent = !q ? '' : n ? `${find.cur + 1} von ${n}` : 'keine Treffer';
+  fdText.classList.toggle('none', !!q && !n);
+}
+function selectMatch() {
+  if (find.cur < 0) { renderDeco(); return; }
+  const p = find.matches[find.cur]; edText.setSelectionRange(p, p + find.qLen); scrollToPos(p);
+  $('fdCount').textContent = `${find.cur + 1} von ${find.matches.length}`; renderDeco();
+}
+function findStep(dir) {
+  if (!find.matches.length) return;
+  find.cur = (find.cur + dir + find.matches.length) % find.matches.length; selectMatch();
+}
+function openFind(withReplace) {
+  if (!S.editing) return;
+  const v = edText.value, s = edText.selectionStart, e = edText.selectionEnd;
+  find.open = true; $('edFind').hidden = false;
+  if (withReplace) $('fdRepRow').hidden = false;
+  if (e > s && !v.slice(s, e).includes('\n')) fdText.value = v.slice(s, e);
+  edText.setSelectionRange(s, s);
+  computeMatches(true); selectMatch();
+  (withReplace && fdText.value ? fdRep : fdText).focus(); (withReplace && fdText.value ? fdRep : fdText).select();
+}
+function closeFind(focusEditor) {
+  if (!find.open) return;
+  find.open = false; $('edFind').hidden = true; $('fdRepRow').hidden = true; renderDeco();
+  if (focusEditor) { const p = find.cur >= 0 ? find.matches[find.cur] : null; edText.focus({ preventScroll: true }); if (p !== null && p !== undefined) edText.setSelectionRange(p, p + find.qLen); }
+}
+function replaceOne() {
+  if (find.cur < 0) return;
+  const p = find.matches[find.cur], rep = fdRep.value;
+  edText.focus({ preventScroll: true }); edText.setSelectionRange(p, p + find.qLen); insertText(rep);
+  computeMatches(false);
+  find.cur = find.matches.findIndex(x => x >= p + rep.length); if (find.cur < 0) find.cur = find.matches.length ? 0 : -1;
+  selectMatch(); fdRep.focus();
+}
+function replaceAll() {
+  computeMatches(false); const n = find.matches.length; if (!n) return;
+  const v = edText.value, rep = fdRep.value; let out = '', last = 0;
+  for (const p of find.matches) { out += v.slice(last, p) + rep; last = p + find.qLen; }
+  out += v.slice(last);
+  const top = edText.scrollTop;
+  edText.focus({ preventScroll: true }); edText.setSelectionRange(0, v.length); insertText(out); edText.setSelectionRange(0, 0); edText.scrollTop = top;
+  computeMatches(true); renderDeco(); fdRep.focus();
+  setStatus(`${n} ${n === 1 ? 'Stelle' : 'Stellen'} ersetzt. Strg+Z macht es rückgängig.`);
+}
+fdText.addEventListener('input', () => { computeMatches(true); selectMatch(); });
+$('fdCase').addEventListener('change', () => { computeMatches(true); selectMatch(); });
+for (const inp of [fdText, fdRep]) inp.addEventListener('keydown', (ev) => {
+  const ctrl = ev.ctrlKey || ev.metaKey;
+  if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeFind(true); }
+  else if (ev.key === 'Enter' && inp === fdText) { ev.preventDefault(); findStep(ev.shiftKey ? -1 : 1); }
+  else if (ev.key === 'Enter' && inp === fdRep) { ev.preventDefault(); if (ctrl) replaceAll(); else replaceOne(); }
+  else if (ev.key === 'F3') { ev.preventDefault(); findStep(ev.shiftKey ? -1 : 1); }
+  else if (ctrl && (ev.key === 'h' || ev.key === 'r')) { ev.preventDefault(); $('fdRepRow').hidden = false; fdRep.focus(); }
+  else if (ctrl && ev.key === 'f') { ev.preventDefault(); fdText.focus(); fdText.select(); }
+});
+$('fdNext').addEventListener('click', () => findStep(1));
+$('fdPrev').addEventListener('click', () => findStep(-1));
+$('fdClose').addEventListener('click', () => closeFind(true));
+$('fdToggle').addEventListener('click', () => { const r = $('fdRepRow'); r.hidden = !r.hidden; (r.hidden ? fdText : fdRep).focus(); });
+$('fdRepOne').addEventListener('click', replaceOne);
+$('fdRepAll').addEventListener('click', replaceAll);
 
 // ------------------------------------------------------------ Klassen anlegen/entfernen
 function template(name, kind) {
@@ -802,6 +1051,7 @@ function helpDialog() {
   const d = document.createElement('div'); d.className = 'helpgrid';
   d.innerHTML = `<p><b>Klassendiagramm:</b> Klick auf eine Klasse öffnet ihr Menü (Objekte erzeugen, statische Methoden aufrufen). Doppelklick öffnet den Quelltext. Klassen lassen sich verschieben.</p>
   <p><b>Übersetzen:</b> Nach jeder Änderung neu übersetzen (Knopf oder <code>Strg+S</code> im Editor). Schraffierte Klassen sind noch nicht übersetzt. Fehler werden mit Zeile im Editor markiert.</p>
+  <p><b>Editor:</b> Farbige Bereiche zeigen die Struktur (Klasse grün, Methode gelb, Schleife blau, Verzweigung rosa). Steht der Cursor an einer Klammer, wird die passende Klammer markiert. Über „Bearbeiten ▾“ oder Tastenkürzel: <code>Strg+F</code> Suchen, <code>Strg+H</code> Ersetzen, <code>Strg+G</code> Gehe zu Zeile, <code>Strg+Umschalt+F</code> automatisch einrücken, <code>Strg+#</code> ein-/auskommentieren, <code>Strg</code> + <code>+</code>/<code>−</code> Schriftgröße. Weitere Einstellungen (Beamer-Schrift, dunkles Design) unter ⚙.</p>
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
   <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Eingaben mit <code>Scanner</code> erscheinen als Eingabedialog. Nicht unterstützt: Lambdas, innere Klassen.</p>
@@ -846,6 +1096,7 @@ $('btnNewClass').addEventListener('click', newClassDialog);
 $('btnCompile').addEventListener('click', () => compileAll());
 $('btnProject').addEventListener('click', () => { if (!menuEl.hidden) { hideMenu(); return; } projectMenu(); });
 $('btnHelp').addEventListener('click', helpDialog);
+$('btnSettings').addEventListener('click', settingsDialog);
 $('btnClearBench').addEventListener('click', clearBench);
 $('btnClearConsole').addEventListener('click', () => { if ($('pad').hidden) consoleEl.innerHTML = ''; else padLog.innerHTML = ''; });
 $('tabConsole').addEventListener('click', () => showTab('console'));
