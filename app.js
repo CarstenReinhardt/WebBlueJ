@@ -658,11 +658,11 @@ function settingsDialog() {
 // ------------------------------------------------------------ Editor
 const edText = $('edText'), edHl = $('edHl'), edGutter = $('edGutter'), edLines = $('edLines'), edDeco = $('edDeco');
 let errLine = 0;
-const KWS = new Set('abstract assert break case catch class continue default do else enum extends final finally for if implements import instanceof interface native new package private protected public return static super switch synchronized this throw throws transient try volatile while var'.split(' '));
+const KWS = new Set('abstract assert break case catch class continue default do else enum extends final finally for if implements import instanceof interface native new package private protected public return static super switch synchronized this throw throws transient try volatile while var yield record'.split(' '));
 const LITS = new Set(['true', 'false', 'null']);
 const PRIMS = new Set(['int', 'double', 'boolean', 'char', 'long', 'float', 'short', 'byte', 'void']);
 function highlight(code) {
-  const re = /(\/\*[\s\S]*?(?:\*\/|$))|(\/\/[^\n]*)|("(?:[^"\\\n]|\\.)*"?)|('(?:[^'\\\n]|\\.)*'?)|(\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?[lLdDfF]?\b)|([A-Za-z_$À-ɏ][\w$À-ɏ]*)/g;
+  const re = /(\/\*[\s\S]*?(?:\*\/|$))|(\/\/[^\n]*)|("""[\s\S]*?(?:"""|$)|"(?:[^"\\\n]|\\.)*"?)|('(?:[^'\\\n]|\\.)*'?)|(\b\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?[lLdDfF]?\b)|([A-Za-z_$À-ɏ][\w$À-ɏ]*)/g;
   const lines = [''];
   const push = (text, cls) => {
     const parts = text.split('\n');

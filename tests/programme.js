@@ -228,4 +228,148 @@ public class Main {
     System.out.println(r instanceof Runnable);
   }
 }` }] },
+{ name: 'java.util', classes: [
+ { name: 'Main', code: `import java.util.*;
+public class Main {
+  public static void main(String[] args) {
+    ArrayList<String> l = new ArrayList<>(List.of("a", "bb", "c", "dd"));
+    Iterator<String> it = l.iterator();
+    while (it.hasNext()) { String s = it.next(); if (s.length() == 2) it.remove(); }
+    System.out.println(l);
+    Stack<Integer> st = new Stack<>();
+    st.push(1); st.push(2); st.push(3);
+    System.out.println(st + " " + st.peek() + " " + st.pop() + " " + st + " " + st.search(1) + " " + st.empty());
+    Queue<String> q = new LinkedList<>();
+    q.offer("x"); q.add("y"); q.offer("z");
+    System.out.println(q.peek() + " " + q.poll() + " " + q + " " + q.size());
+    Deque<Integer> d = new ArrayDeque<>();
+    d.push(1); d.push(2); d.addLast(9); d.offerFirst(0);
+    System.out.println(d + " " + d.peekFirst() + " " + d.peekLast() + " " + d.pop() + " " + d.pollLast() + " " + d);
+    PriorityQueue<Integer> pq = new PriorityQueue<>();
+    for (int x : new int[] { 5, 1, 8, 3, 2, 9, 4 }) pq.add(x);
+    System.out.println(pq);
+    String r = ""; while (!pq.isEmpty()) r += pq.poll() + " ";
+    System.out.println(r);
+    PriorityQueue<String> pq2 = new PriorityQueue<>((a, b) -> b.length() - a.length());
+    pq2.add("aa"); pq2.add("b"); pq2.add("cccc"); System.out.println(pq2.poll() + " " + pq2);
+    TreeMap<String, Integer> tm = new TreeMap<>();
+    tm.put("kiwi", 3); tm.put("apfel", 5); tm.put("birne", 2);
+    for (Map.Entry<String, Integer> e : tm.entrySet()) System.out.println(e.getKey() + " -> " + e.getValue());
+    for (Map.Entry<String, Integer> e : tm.entrySet()) e.setValue(e.getValue() * 10);
+    System.out.println(tm + " " + tm.firstKey() + " " + tm.lastKey() + " " + tm.floorKey("c") + " " + tm.ceilingKey("c"));
+    tm.keySet().remove("kiwi");
+    System.out.println(tm);
+    TreeSet<Integer> ts = new TreeSet<>(Arrays.asList(5, 1, 9, 3));
+    System.out.println(ts.first() + " " + ts.last() + " " + ts.floor(4) + " " + ts.higher(5) + " " + ts);
+    Set<String> hs = new HashSet<>(List.of("a", "b", "c"));
+    hs.retainAll(List.of("b", "c", "d"));
+    System.out.println(hs + " " + hs.containsAll(List.of("b")));
+    List<Integer> nums = new ArrayList<>();
+    Collections.addAll(nums, 4, 2, 7);
+    Collections.sort(nums);
+    System.out.println(nums + " " + Collections.binarySearch(nums, 4) + " " + Collections.nCopies(3, "x"));
+    int[] a = { 1, 3, 5, 7 }; System.out.println(Arrays.binarySearch(a, 5) + " " + Arrays.binarySearch(a, 4));
+    Map<String, Integer> m = Map.of("eins", 1, "zwei", 2);
+    System.out.println(m.get("zwei"));
+    try { new Stack<String>().pop(); } catch (EmptyStackException e) { System.out.println("leer: " + e); }
+    Bereich b = new Bereich(1, 4);
+    for (int x : b) System.out.print(x + " ");
+    System.out.println();
+    Iterator<String> it2 = l.iterator(); it2.next();
+    l.add("neu");
+    try { it2.next(); } catch (ConcurrentModificationException e) { System.out.println("CME"); }
+  }
+}` },
+ { name: 'Bereich', code: `import java.util.*;
+public class Bereich implements Iterable<Integer> {
+  private int von, bis;
+  public Bereich(int von, int bis) { this.von = von; this.bis = bis; }
+  public Iterator<Integer> iterator() {
+    return new Iterator<Integer>() {
+      int i = von;
+      public boolean hasNext() { return i <= bis; }
+      public Integer next() { return i++; }
+    };
+  }
+}` }] },
+{ name: 'Geprüfte Ausnahmen', classes: [{ name: 'Main', code: `import java.io.*;
+public class Main {
+  static class KontoFehler extends Exception {
+    private int betrag;
+    KontoFehler(String text, int betrag) { super(text); this.betrag = betrag; }
+    int getBetrag() { return betrag; }
+  }
+  static int stand = 100;
+  static void abheben(int b) throws KontoFehler {
+    if (b > stand) throw new KontoFehler("Nicht gedeckt", b - stand);
+    stand -= b;
+  }
+  static void lesen(String name) throws IOException {
+    if (name.isEmpty()) throw new FileNotFoundException("keine Datei");
+    System.out.println("lese " + name);
+  }
+  public static void main(String[] args) throws InterruptedException {
+    try { abheben(30); abheben(100); } catch (KontoFehler e) { System.out.println(e.getMessage() + " fehlt " + e.getBetrag()); }
+    try { lesen("a.txt"); lesen(""); } catch (FileNotFoundException e) { System.out.println("FNF " + e); } catch (IOException e) { System.out.println("IO"); }
+    Thread.sleep(1);
+    System.out.println("stand " + stand);
+  }
+}` }] },
+{ name: 'Neuere Sprachmittel', classes: [{ name: 'Main', code: `import java.util.*;
+public class Main {
+  enum Tag { MO, DI, MI, DO, FR, SA, SO }
+  record Punkt(int x, int y) {
+    Punkt { if (x < 0) x = 0; }
+    double abstand() { return Math.sqrt(x * x + y * y); }
+    static Punkt ursprung() { return new Punkt(0, 0); }
+  }
+  static String art(Tag t) {
+    return switch (t) {
+      case SA, SO -> "Wochenende";
+      case FR -> { String s = "fast"; yield s + " Wochenende"; }
+      default -> "Arbeitstag";
+    };
+  }
+  static int punkte(char note) {
+    int p = switch (note) { case 'A': yield 4; case 'B': yield 3; default: yield 0; };
+    return p;
+  }
+  public static void main(String[] args) {
+    for (Tag t : Tag.values()) System.out.print(art(t) + ";");
+    System.out.println();
+    System.out.println(punkte('A') + punkte('B') + punkte('X'));
+    Punkt p = new Punkt(3, 4), q = new Punkt(3, 4), r = new Punkt(-5, 1);
+    System.out.println(p + " " + p.x() + " " + p.abstand() + " " + p.equals(q) + " " + (p == q) + " " + (p.hashCode() == q.hashCode()) + " " + r + " " + Punkt.ursprung());
+    Set<Punkt> menge = new HashSet<>(List.of(p, q, r)); System.out.println(menge.size());
+    record Paar(String name, int alter) { }
+    var leute = new ArrayList<Paar>();
+    leute.add(new Paar("Bo", 30)); leute.add(new Paar("Al", 20));
+    leute.sort(Comparator.comparingInt(Paar::alter));
+    System.out.println(leute);
+    var n = 5; var text = """
+        Zeile 1
+          Zeile 2
+        """;
+    System.out.print(text + n);
+    System.out.println();
+    int k = 2;
+    String w = switch (k) { case 1 -> "eins"; case 2 -> "zwei"; default -> throw new IllegalArgumentException("?"); };
+    System.out.println(w);
+  }
+}` }] },
+{ name: 'Textbloecke', classes: [{ name: 'Main', code: `public class Main {
+  public static void main(String[] args) {
+    String html = """
+        <html>
+            <p>Hallo "Welt"</p>   
+        </html>
+        """;
+    System.out.print(html);
+    String a = """
+      eins \\
+      zwei\\tdrei
+      vier""";
+    System.out.println("[" + a + "]");
+  }
+}` }] },
 ];

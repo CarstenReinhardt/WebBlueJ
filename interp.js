@@ -10,6 +10,7 @@ class JThrow { constructor(obj, trace) { this.obj = obj; this.trace = trace; } }
 class ExitSig { constructor(code) { this.code = code; } }
 const BREAK = { sig: 'break' }, CONTINUE = { sig: 'continue' };
 class ReturnSig { constructor(v) { this.value = v; } }
+class YieldSig { constructor(v) { this.value = v; } }
 
 // ---------------------------------------------------------------- Unterbrechbare Ausführung
 // Anweisungen und Ausdrücke mit Methodenaufrufen laufen als Generator-Funktionen.
@@ -39,6 +40,7 @@ function isPure(e) {
 function computePure(e) {
   if (e.k === 'New' || e.k === 'CtorCall') return false;
   if (e.k === 'Lambda') return true;
+  if (e.k === 'SwitchExpr') return false;
   if (e.k === 'MethodRef') return isPure(e.target);
   if (e.k === 'Call' && e.$n !== true) return false;
   for (const key in e) {
@@ -132,6 +134,40 @@ function lex(src) {
       default: err('Ungültige Escape-Sequenz: \\' + (e || ''));
     }
   }
+  // Textblock """ … """ (Java 15): gemeinsame Einrückung und Leerzeichen am Zeilenende entfernen
+  function textBlock(start, sl) {
+    i += 3;
+    while (i < n && (src[i] === ' ' || src[i] === '\t' || src[i] === '\r')) i++;
+    if (src[i] !== '\n') err('Nach """ muss der Text in einer neuen Zeile beginnen (Textblock)');
+    i++; line++;
+    const cs = i; let end = -1;
+    while (i < n) {
+      if (src[i] === '\\') { if (src[i + 1] === '\n') line++; i += 2; continue; }
+      if (src.startsWith('"""', i)) { end = i; break; }
+      if (src[i] === '\n') line++;
+      i++;
+    }
+    if (end < 0) { line = sl; err('Textblock wird nicht geschlossen: """ fehlt'); }
+    i = end + 3;
+    const lines = src.slice(cs, end).replace(/\r/g, '').split('\n');
+    const lastOwn = /^[ \t]*$/.test(lines[lines.length - 1]);
+    const ind = (l) => l.match(/^[ \t]*/)[0].length;
+    const sig = lines.filter((l, k) => k === lines.length - 1 || l.trim() !== '');
+    const cut = sig.length ? Math.min(...sig.map(ind)) : 0;
+    let body = lines.map(l => (l.trim() === '' ? '' : l.slice(cut)).replace(/[ \t]+$/, ''));
+    if (lastOwn) body[body.length - 1] = ''; 
+    let raw = body.join('\n');
+    // Escapes (auch \<Zeilenende> = Zeile fortsetzen)
+    let out = '';
+    for (let k = 0; k < raw.length; k++) {
+      const c = raw[k];
+      if (c !== '\\') { out += c; continue; }
+      const e = raw[++k];
+      const map = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', 0: '\0', '"': '"', "'": "'", '\\': '\\', s: ' ', '\n': '' };
+      if (e in map) out += map[e]; else err('Ungültige Escape-Sequenz im Textblock: \\' + (e || ''));
+    }
+    return { t: 'str', v: out, line: sl, pos: start, end: i };
+  }
   while (i < n) {
     const ch = src[i];
     if (ch === '\n') { line++; i++; continue; }
@@ -175,7 +211,7 @@ function lex(src) {
       continue;
     }
     if (ch === '"') {
-      if (src.startsWith('"""', i)) err('Textblöcke (""") werden nicht unterstützt');
+      if (src.startsWith('"""', i)) { toks.push(textBlock(start, sl)); continue; }
       i++; let s = '';
       for (;;) {
         if (i >= n || src[i] === '\n') err('Zeichenkette wird nicht geschlossen: " fehlt');
@@ -266,19 +302,24 @@ class Parser {
     do { names.push(this.ident('Typparameter')); if (this.accept('extends')) { this.parseType(); while (this.accept('&')) this.parseType(); } } while (this.accept(','));
     this.expect('>'); return names;
   }
+  isRecordStart() { return this.tok.t === 'id' && this.tok.v === 'record' && this.peek().t === 'id' && (this.isAt(2, '(') || this.isAt(2, '<')); }
   parseTypeDecl(pre) {
     const doc = pre ? pre.doc : this.docs[this.p];
     const mods = pre ? pre.mods : this.parseModifiers(); const line = pre ? pre.line : this.tok.line;
     let kind;
     if (this.accept('class')) kind = 'class'; else if (this.accept('interface')) kind = 'interface'; else if (this.accept('enum')) kind = 'enum';
+    else if (this.isRecordStart()) { this.p++; kind = 'record'; }
     else this.fail("'class' erwartet");
     const name = this.ident('Klassenname');
     const typeParams = this.is('<') ? this.parseTypeParams() : [];
+    let comps = null;
+    if (kind === 'record') { comps = this.parseParams(); mods.add('final'); if (this.is('extends')) this.fail('Ein record kann nicht mit extends erben (nur implements)'); }
     let superName = null, superArgs = null; const interfaces = [];
     if (kind === 'class' && this.accept('extends')) { const st = this.parseType(); superName = st.name; superArgs = st.args; }
     if (kind === 'interface' && this.accept('extends')) { do interfaces.push(this.parseType().name); while (this.accept(',')); }
     if (this.accept('implements')) { if (kind === 'interface') this.fail("Interfaces erweitern andere Interfaces mit 'extends'"); do interfaces.push(this.parseType().name); while (this.accept(',')); }
-    const decl = { kind, name, superName, superArgs, interfaces, mods, typeParams, fields: [], methods: [], ctors: [], inits: [], enumConsts: [], line, doc };
+    const decl = { kind: kind === 'record' ? 'class' : kind, name, superName, superArgs, interfaces, mods, typeParams, fields: [], methods: [], ctors: [], inits: [], enumConsts: [], line, doc };
+    if (comps) decl.record = comps;
     if (!this.is('{')) this.fail("'{' erwartet");
     this.p++;
     this.clsStack.push(decl);
@@ -290,7 +331,31 @@ class Parser {
     this.clsStack.pop();
     decl.endLine = this.tok.line;
     this.p++;
+    if (decl.record) this.completeRecord(decl);
     return decl;
+  }
+  // record: Attribute, kanonischer Konstruktor, Zugriffsmethoden, toString/equals/hashCode
+  completeRecord(d) {
+    const comps = d.record, line = d.line;
+    for (const c of comps) {
+      if (d.fields.some(f => f.name === c.name)) throw new JavaError(`Die Komponente '${c.name}' des records ist schon ein Attribut`, line);
+      d.fields.push({ name: c.name, type: c.type, init: null, mods: new Set(['private', 'final']), static: false, final: true, line, doc: null, vis: 'private' });
+    }
+    if (d.fields.some(f => !f.static && !comps.some(c => c.name === f.name))) throw new JavaError('Ein record darf keine weiteren Objekt-Attribute haben (nur static)', line);
+    const assign = comps.map(c => ({ k: 'Expr', e: { k: 'Assign', op: '=', target: { k: 'Field', obj: { k: 'This', line }, name: c.name, line }, value: { k: 'Name', name: c.name, line }, line }, line }));
+    const sig = (ps) => ps.map(p => typeStr(p.type)).join(',');
+    const canon = d.ctors.find(k => k.compact || sig(k.params) === sig(comps));
+    for (const k of d.ctors) if (k.compact) { k.params = comps.map(c => ({ ...c })); k.body.stmts.push(...assign); }
+    if (!canon) d.ctors.push({ name: d.name, params: comps.map(c => ({ ...c })), body: { k: 'Block', stmts: assign, line, endLine: line }, mods: new Set(['public']), line, doc: null, vis: 'public', isCtor: true, typeParams: [], ret: VOID, throws: [] });
+    const has = (n, k) => d.methods.some(m => m.name === n && m.params.length === k);
+    let code = '';
+    for (const c of comps) if (!has(c.name, 0)) code += `public ${typeStr(c.type)} ${c.name}() { return this.${c.name}; }\n`;
+    if (!has('toString', 0)) code += `public String toString() { return "${d.name}[" ${comps.map((c, i) => `+ "${i ? ', ' : ''}${c.name}=" + this.${c.name}`).join(' ')} + "]"; }\n`;
+    if (!has('equals', 1)) code += `public boolean equals(Object o) { if (this == o) return true; if (!(o instanceof ${d.name})) return false; ${d.name} r = (${d.name}) o; return true${comps.map(c => ` && java.util.Objects.equals(this.${c.name}, r.${c.name})`).join('')}; }\n`;
+    if (!has('hashCode', 0)) code += `public int hashCode() { return java.util.Objects.hash(${comps.map(c => 'this.' + c.name).join(', ')}); }\n`;
+    const sp = new Parser(code); for (const t of sp.toks) t.line = line;
+    sp.clsStack = [d];
+    while (sp.tok.t !== 'eof') sp.parseMember(d);
   }
   // Klasse innerhalb einer anderen Klasse (kind: 'member'), in einer Methode ('local') oder anonym ('anon')
   nested(nd, kind) {
@@ -314,17 +379,24 @@ class Parser {
     const doc = this.docs[this.p]; const line = this.tok.line;
     const mods = this.parseModifiers();
     if (this.is('{')) { decl.inits.push({ static: mods.has('static'), body: this.parseBlock(), line }); return; }
-    if (this.is('class') || this.is('interface') || this.is('enum')) {
+    if (this.is('class') || this.is('interface') || this.is('enum') || this.isRecordStart()) {
       const nd = this.nested(this.parseTypeDecl({ mods, doc, line }), 'member');
-      nd.staticNested = mods.has('static') || nd.kind !== 'class' || decl.kind === 'interface';
+      nd.staticNested = mods.has('static') || nd.kind !== 'class' || !!nd.record || decl.kind === 'interface';
       return;
     }
     const typeParams = this.is('<') ? this.parseTypeParams() : [];
+    if (decl.record && this.tok.t === 'id' && this.tok.v === decl.name && this.isAt(1, '{')) {
+      // kompakter Konstruktor eines records
+      this.p++;
+      const body = this.parseBlock();
+      decl.ctors.push({ name: decl.name, params: [], body, mods, line, doc, vis: visOf(mods), isCtor: true, typeParams, ret: VOID, throws: [], compact: true });
+      return;
+    }
     if (this.tok.t === 'id' && this.tok.v === decl.name && this.isAt(1, '(')) {
       this.p++;
-      const params = this.parseParams(); this.skipThrows();
+      const params = this.parseParams(); const throws = this.parseThrows();
       const body = this.parseBlock();
-      decl.ctors.push({ name: decl.name, params, body, mods, line, doc, vis: visOf(mods), isCtor: true, typeParams, ret: VOID });
+      decl.ctors.push({ name: decl.name, params, body, mods, line, doc, vis: visOf(mods), isCtor: true, typeParams, ret: VOID, throws });
       return;
     }
     if (this.tok.t === 'id' && this.isAt(1, '(')) throw new JavaError(`Rückgabetyp fehlt bei '${this.tok.v}' (oder der Konstruktorname stimmt nicht mit dem Klassennamen '${decl.name}' überein)`, this.tok.line);
@@ -335,14 +407,14 @@ class Parser {
       const params = this.parseParams();
       let dims = 0; while (this.accept('[')) { this.expect(']'); dims++; }
       if (dims) type = { ...type, dims: type.dims + dims };
-      this.skipThrows();
+      const throws = this.parseThrows();
       let body = null;
       if (this.is('{')) body = this.parseBlock(); else this.expect(';', `oder Methodenrumpf { … }`);
       const isI = decl.kind === 'interface';
       const isAbstract = mods.has('abstract') || (isI && !body);
       if (!body && !isAbstract) throw new JavaError(`Methode ${name}: Rumpf { … } fehlt (oder die Methode als abstract kennzeichnen)`, line);
       if (body && mods.has('abstract')) throw new JavaError(`Abstrakte Methode ${name} darf keinen Rumpf haben`, line);
-      decl.methods.push({ name, params, ret: type, body, mods, static: mods.has('static'), abstract: isAbstract, line, doc, vis: isI ? 'public' : visOf(mods), typeParams });
+      decl.methods.push({ name, params, ret: type, body, mods, static: mods.has('static'), abstract: isAbstract, line, doc, vis: isI ? 'public' : visOf(mods), typeParams, throws });
       return;
     }
     for (;;) {
@@ -359,7 +431,7 @@ class Parser {
     }
     this.expect(';');
   }
-  skipThrows() { if (this.accept('throws')) { do this.parseType(); while (this.accept(',')); } }
+  parseThrows() { const r = []; if (this.accept('throws')) { do r.push(this.parseType().name); while (this.accept(',')); } return r; }
   parseParams() {
     this.expect('('); const ps = [];
     if (!this.is(')')) {
@@ -439,6 +511,12 @@ class Parser {
         throw new JavaError(`'${t.v}' ist hier nicht erlaubt – fehlt vorher eine schließende Klammer '}'?`, line);
     }
     if (t.t === 'id' && this.isAt(1, ':')) { this.p += 2; return this.parseStmt(); }
+    if (t.t === 'id' && t.v === 'yield' && !['=', '.', '[', '++', '--', '+=', '-=', '(', ';'].some(o => this.isAt(1, o))) { this.p++; const e = this.parseExpr(); this.expect(';'); return { k: 'Yield', e, line }; }
+    if (this.isRecordStart()) {
+      if (!this.clsStack.length) this.fail('Records können hier nicht definiert werden');
+      const nd = this.nested(this.parseTypeDecl(), 'local'); nd.staticNested = true;
+      return { k: 'LocalClass', name: nd.name, line };
+    }
     if (this.isLocalDecl()) { const s = this.parseLocalDecl(); this.expect(';'); return s; }
     const e = this.parseExpr();
     this.expect(';');
@@ -510,7 +588,7 @@ class Parser {
       if (this.tok.t === 'eof') this.fail("'}' fehlt");
       const cl = this.tok.line; let labels;
       if (this.accept('default')) labels = null;
-      else { this.expect('case'); labels = []; do labels.push(this.parseTernary()); while (this.accept(',')); }
+      else { this.expect('case'); labels = []; this.noLambda = true; try { do labels.push(this.parseTernary()); while (this.accept(',')); } finally { this.noLambda = false; } }
       if (this.accept('->')) {
         arrow = true; let body;
         if (this.is('{')) body = this.parseBlock();
@@ -634,7 +712,7 @@ class Parser {
           return this.parsePrimary();
         }
         this.p++;
-        if (this.is('->')) { this.p++; return this.lambdaBody([{ name: t.v, type: null }], line); }
+        if (this.is('->') && !this.noLambda) { this.p++; return this.lambdaBody([{ name: t.v, type: null }], line); }
         if (this.is('(')) return { k: 'Call', obj: null, name: t.v, args: this.parseArgs(), line };
         return { k: 'Name', name: t.v, line };
       case 'kw':
@@ -651,6 +729,7 @@ class Parser {
             return { k: 'Field', obj: { k: 'Super', line }, name: nm, line };
           }
           case 'new': return this.parseNew();
+          case 'switch': { const sw = this.parseSwitch(); sw.k = 'SwitchExpr'; return sw; }
         }
         break;
       case 'op':
@@ -680,7 +759,7 @@ class Parser {
         e = { k: 'MethodRef', target: e, name: nm, line };
         continue;
       }
-      if (this.is('->')) this.fail('Lambda-Ausdruck an dieser Stelle nicht möglich');
+      if (this.is('->') && !this.noLambda) this.fail('Lambda-Ausdruck an dieser Stelle nicht möglich');
       break;
     }
     return e;
@@ -769,8 +848,8 @@ class Env {
   declare(n, type, value) { this.vars.set(n, { type, value }); }
 }
 
-const EXC = [['Exception', 'Throwable'], ['Error', 'Throwable'], ['RuntimeException', 'Exception'], ['ArithmeticException', 'RuntimeException'], ['NullPointerException', 'RuntimeException'], ['IllegalArgumentException', 'RuntimeException'], ['IllegalStateException', 'RuntimeException'], ['IndexOutOfBoundsException', 'RuntimeException'], ['ArrayIndexOutOfBoundsException', 'IndexOutOfBoundsException'], ['StringIndexOutOfBoundsException', 'IndexOutOfBoundsException'], ['ClassCastException', 'RuntimeException'], ['NumberFormatException', 'IllegalArgumentException'], ['UnsupportedOperationException', 'RuntimeException'], ['NegativeArraySizeException', 'RuntimeException'], ['StackOverflowError', 'Error'], ['NoSuchElementException', 'RuntimeException'], ['ConcurrentModificationException', 'RuntimeException'], ['InputMismatchException', 'RuntimeException'], ['CloneNotSupportedException', 'Exception'], ['InterruptedException', 'Exception']];
-const UTIL_EXC = new Set(['NoSuchElementException', 'ConcurrentModificationException', 'InputMismatchException']);
+const EXC = [['Exception', 'Throwable'], ['Error', 'Throwable'], ['RuntimeException', 'Exception'], ['ArithmeticException', 'RuntimeException'], ['NullPointerException', 'RuntimeException'], ['IllegalArgumentException', 'RuntimeException'], ['IllegalStateException', 'RuntimeException'], ['IndexOutOfBoundsException', 'RuntimeException'], ['ArrayIndexOutOfBoundsException', 'IndexOutOfBoundsException'], ['StringIndexOutOfBoundsException', 'IndexOutOfBoundsException'], ['ClassCastException', 'RuntimeException'], ['NumberFormatException', 'IllegalArgumentException'], ['UnsupportedOperationException', 'RuntimeException'], ['NegativeArraySizeException', 'RuntimeException'], ['StackOverflowError', 'Error'], ['NoSuchElementException', 'RuntimeException'], ['ConcurrentModificationException', 'RuntimeException'], ['InputMismatchException', 'RuntimeException'], ['CloneNotSupportedException', 'Exception'], ['InterruptedException', 'Exception'], ['EmptyStackException', 'RuntimeException'], ['IOException', 'Exception'], ['FileNotFoundException', 'IOException']];
+const UTIL_EXC = new Set(['NoSuchElementException', 'ConcurrentModificationException', 'InputMismatchException', 'EmptyStackException']);
 const PRELUDE = `
 public class Throwable {
   private String message;
@@ -801,6 +880,8 @@ class Runtime {
     // Weitere eingebaute Klassen als Java-Quelltext (z. B. Listener-Interfaces aus aplu.js)
     for (const p of Runtime.preludes) for (const d of new Parser(p.code).parseUnit()) { d.pkg = p.pkg; decls.push(d); }
     this.buildClasses(decls, true);
+    // Eingebaute Klassen, die ein Interface aus dem Java-Vorspann haben (z. B. Iterator)
+    for (const c of this.classes.values()) if (c.native && c.native.lateInterfaces) for (const n of c.native.lateInterfaces) { const i = this.classes.get(n); if (i && !c.interfaces.includes(i)) c.interfaces.push(i); }
     this.builtinClasses = new Map(this.classes);
     this.padClass = new ClassInfo('Direkteingabe', null, { builtin: true });
     this.padClass.superClass = this.classes.get('Object');
@@ -873,7 +954,7 @@ class Runtime {
       const prev = this.classes.get(d.name);
       if (prev && !builtin && prev.native && prev.native.lib) this.classes.delete(d.name);
       if (this.classes.has(d.name)) fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : `Klasse '${d.name}' gibt es doppelt`);
-      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : 'java.lang')) : null });
+      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : /^(IO|FileNotFound)Exception$/.test(d.name) ? 'java.io' : 'java.lang')) : null });
       c.fileId = d.fileId;
       if (d.nestKind) { c.nestKind = d.nestKind; c.staticNested = !!d.staticNested; }
       this.classes.set(d.name, c); made.push(c);
@@ -1152,6 +1233,7 @@ class Runtime {
       return { ok: false, exception: true, message: 'java.lang.StackOverflowError (Rekursion zu tief – fehlt eine Abbruchbedingung?)', trace: tr, line: tr[0] && tr[0].line, className: tr[0] && tr[0].cls };
     }
     if (e === BREAK || e === CONTINUE) return { ok: false, message: 'break/continue außerhalb einer Schleife' };
+    if (e instanceof YieldSig) return { ok: false, message: 'yield außerhalb eines switch-Ausdrucks' };
     if (e instanceof ReturnSig) return { ok: true, value: e.value };
     throw e;
   }
@@ -1732,8 +1814,23 @@ class Runtime {
         let items, live = null;
         if (coll instanceof JArray) items = coll.data;
         else if (coll instanceof JObject && coll.native && coll.native.list) { items = coll.native.list; live = items.length; }
-        else if (coll instanceof JObject && coll.native && coll.native.keys) this.rtError('Über eine Map kann nicht direkt iteriert werden – verwende keySet() oder values()', s.line);
-        else this.rtError(`for-each geht nur über Arrays und Listen, nicht über ${this.typeNameOf(coll)}`, s.line);
+        else if (coll instanceof JObject && coll.native && coll.native.keys) this.rtError('Über eine Map kann nicht direkt iteriert werden – verwende keySet(), values() oder entrySet()', s.line);
+        else if (coll instanceof JObject && (coll.lambda || this.lookupMethods(coll.cls, 'iterator').some(m => !m.abstract && !m.params.length))) {
+          // eigene Klasse, die Iterable implementiert: iterator(), hasNext(), next()
+          const it = yield* this.fnG(coll, 'iterator', [], s.line);
+          if (it === null) this.npe('iterator() hat null geliefert');
+          for (;;) {
+            const h = yield* this.fnG(it, 'hasNext', [], s.line);
+            if (h !== true) break;
+            const x = yield* this.fnG(it, 'next', [], s.line);
+            const c2 = { ...ctx, env: new Env(ctx.env) };
+            c2.env.declare(s.name, s.type.name === 'var' ? this.typeOfValue(x) : s.type, s.type.name === 'var' ? x : this.coerce(x, s.type, s.line));
+            if (++this.steps >= this.nextYield) yield TICK;
+            try { yield* this.exec(s.body, c2); } catch (e) { if (e === BREAK) break; if (e === CONTINUE) continue; throw e; }
+          }
+          return;
+        }
+        else this.rtError(`for-each geht nur über Arrays, Listen und Iterable-Objekte, nicht über ${this.typeNameOf(coll)}`, s.line);
         for (let i = 0; i < items.length; i++) {
           if (live !== null && items.length !== live) this.throwJava('ConcurrentModificationException', 'Liste wurde während der for-each-Schleife verändert');
           const c2 = { ...ctx, env: new Env(ctx.env) };
@@ -1747,6 +1844,7 @@ class Runtime {
       }
       case 'Return': throw new ReturnSig(s.e ? (isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx)) : undefined);
       case 'LocalClass': return;
+      case 'Yield': throw new YieldSig(isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx));
       case 'Break': throw BREAK;
       case 'Continue': throw CONTINUE;
       case 'Throw': {
@@ -1772,16 +1870,7 @@ class Runtime {
       }
       case 'Switch': {
         const v = isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx);
-        if (v === null) this.npe('switch über null');
-        let idx = -1;
-        for (let i = 0; i < s.cases.length && idx < 0; i++) {
-          const c = s.cases[i]; if (!c.labels) continue;
-          for (const l of c.labels) {
-            const lv = (v instanceof JObject && v.cls.isEnum && l.k === 'Name') ? this.enumConst(v.cls, l.name, l.line) : this.eval(l, ctx);
-            if (this.javaEquals(v, lv)) { idx = i; break; }
-          }
-        }
-        if (idx < 0) idx = s.cases.findIndex(c => !c.labels);
+        const idx = this.switchIndex(s, v, ctx);
         if (idx < 0) return;
         const c2 = { ...ctx, env: new Env(ctx.env) };
         try {
@@ -1792,6 +1881,33 @@ class Runtime {
       }
       default: this.rtError('Unbekannte Anweisung ' + s.k);
     }
+  }
+  switchIndex(s, v, ctx) {
+    if (v === null) this.npe('switch über null');
+    let idx = -1;
+    for (let i = 0; i < s.cases.length && idx < 0; i++) {
+      const c = s.cases[i]; if (!c.labels) continue;
+      for (const l of c.labels) {
+        const lv = (v instanceof JObject && v.cls.isEnum && l.k === 'Name') ? this.enumConst(v.cls, l.name, l.line) : this.eval(l, ctx);
+        if (this.javaEquals(v, lv)) { idx = i; break; }
+      }
+    }
+    if (idx < 0) idx = s.cases.findIndex(c => !c.labels);
+    return idx;
+  }
+  *switchExprG(s, ctx) {
+    const v = isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx);
+    const idx = this.switchIndex(s, v, ctx);
+    if (idx < 0) this.rtError(`Kein case passt zu ${this.str(v)} (der switch-Ausdruck braucht default)`, s.line);
+    const c2 = { ...ctx, env: new Env(ctx.env) };
+    try {
+      if (s.arrow) {
+        const st = s.cases[idx].stmts[0];
+        if (st.k === 'Expr') { this.line = st.line; return isPure(st.e) ? this.eval(st.e, c2) : yield* this.geval(st.e, c2); }
+        yield* this.exec(st, c2);
+      } else for (let i = idx; i < s.cases.length; i++) for (const st of s.cases[i].stmts) yield* this.exec(st, c2);
+    } catch (e) { if (e instanceof YieldSig) return e.value; throw e; }
+    this.rtError('Der switch-Ausdruck liefert keinen Wert (yield fehlt)', s.line);
   }
   // Anweisungsfolge; „einfache“ Anweisungen (ohne Aufrufe und Schleifen) laufen
   // ohne eigenen Generator, das spart Zeit und Stapelplatz.
@@ -1882,6 +1998,7 @@ class Runtime {
       }
       case 'Call': return e.$n === true ? this.callFast(e, ctx) : this.runSync(this.evalCallG(e, ctx));
       case 'New': return this.runSync(this.geval(e, ctx));
+      case 'SwitchExpr': return this.runSync(this.switchExprG(e, ctx));
       case 'NewArray': {
         const full = { ...e.elem, dims: e.total };
         if (e.init) return this.arrayInit(e.init, full, ctx);
@@ -1917,6 +2034,7 @@ class Runtime {
         this.checkIndex(a, i, e.line); return a.data[i];
       }
       case 'Call': return yield* this.evalCallG(e, ctx);
+      case 'SwitchExpr': return yield* this.switchExprG(e, ctx);
       case 'New': {
         const cls = this.classes.get(e.anon || e.type.name);
         if (!cls) this.rtError(`Klasse '${e.type.name}' nicht gefunden`, e.line);
@@ -2724,10 +2842,23 @@ class Runtime {
     const listIdx = (o, i, size) => { if (i < 0 || i >= size) ex('IndexOutOfBoundsException', `Index ${i} out of bounds for length ${size}`); };
     const elem = (o, v, line) => o.native.elemType ? rt.coerce(v, o.native.elemType, line) : v;
     const isColl = (v) => v instanceof JObject && v.native && v.native.list;
+    const LIST_NAMES = new Set(['ArrayList', 'LinkedList', 'ArrayDeque', 'Stack', 'Vector']);
+    // Iterator über das Array einer Liste/Menge (remove entfernt dort, bei keySet() auch aus der Map)
+    const mkIter = (L, owner) => { const it = new JObject(rt.classes.get('Itr')); it.native = { L, i: 0, last: -1, n: L.length, owner }; return it; };
+    const collOps = {
+      iterator(rt, o) { return mkIter(o.native.list, o); },
+      containsAll(rt, o, a) { return collArg0(a[0]).every(x => o.native.list.some(y => rt.javaEquals(x, y))); },
+      removeAll(rt, o, a) { const B = collArg0(a[0]); const L = o.native.list; const keep = L.filter(x => !B.some(y => rt.javaEquals(x, y))); const ch = keep.length !== L.length; dropFromMap(o, L.filter(x => !keep.includes(x))); L.length = 0; L.push(...keep); return ch; },
+      retainAll(rt, o, a) { const B = collArg0(a[0]); const L = o.native.list; const keep = L.filter(x => B.some(y => rt.javaEquals(x, y))); const ch = keep.length !== L.length; dropFromMap(o, L.filter(x => !keep.includes(x))); L.length = 0; L.push(...keep); return ch; },
+      toArray(rt, o) { return new JArray(T('Object'), o.native.list.slice()); },
+    };
+    const collArg0 = (v) => { if (v === null) rt.npe(); if (!isColl(v)) rt.rtError('Hier wird eine Liste oder Menge erwartet'); return v.native.list; };
+    // keySet()/entrySet() einer Map: Entfernen wirkt auch auf die Map
+    const dropFromMap = (o, keys) => { const m = o.native.mapOwner; if (!m) return; for (const k of keys) { const kk = o.native.entries ? k.native.key : k; const i = mapFind(m, kk); if (i >= 0) { m.native.keys.splice(i, 1); m.native.vals.splice(i, 1); } } };
     const listSpec = {
       pkg: 'java.util', interfaces: ['List'],
       ctor(rt, args, line, type) {
-        const o = new JObject(rt.classes.get(type && rt.classes.get(type.name) && rt.classes.get(type.name).native === listSpec ? type.name : 'ArrayList'));
+        const o = new JObject(rt.classes.get(type && LIST_NAMES.has(type.name) ? type.name : 'ArrayList'));
         o.native = { list: [], elemType: type && type.args && type.args[0] ? type.args[0] : null };
         if (args.length === 1 && isColl(args[0])) o.native.list = args[0].native.list.slice();
         return o;
@@ -2755,6 +2886,7 @@ class Runtime {
         replaceAll(rt, o, a, line) { const L = o.native.list; return new Delegate((function* () { for (let i = 0; i < L.length; i++) L[i] = elem(o, yield* rt.fnG(a[0], 'apply', [L[i]], line), line); })()); },
         toArray(rt, o) { return new JArray(T('Object'), o.native.list.slice()); },
         equals(rt, o, a) { return rt.javaEquals(o, a[0]); },
+        ...collOps,
         subList(rt, o, a) { const n = rt.classes.get('ArrayList'); const r = new JObject(n); r.native = { list: o.native.list.slice(intArg(a[0]), intArg(a[1])), elemType: o.native.elemType }; return r; },
       },
       toString(rt, o) { return '[' + o.native.list.map(x => x === o ? '(this Collection)' : rt.str(x)).join(', ') + ']'; },
@@ -2763,27 +2895,111 @@ class Runtime {
     def('Iterable', { isInterface: true, pkg: 'java.lang' });
     def('Collection', { isInterface: true, pkg: 'java.util', interfaces: ['Iterable'] });
     def('List', { isInterface: true, pkg: 'java.util', interfaces: ['Collection'] });
-    def('ArrayList', listSpec); def('LinkedList', listSpec);
+    def('ArrayList', listSpec);
+    def('Itr', { pkg: 'java.util', lateInterfaces: ['Iterator'], methods: {
+      hasNext(rt, o) { return o.native.i < o.native.L.length; },
+      next(rt, o) { const n = o.native; if (n.L.length !== n.n) ex('ConcurrentModificationException'); if (n.i >= n.L.length) ex('NoSuchElementException'); n.last = n.i; return n.L[n.i++]; },
+      remove(rt, o) {
+        const n = o.native; if (n.last < 0) ex('IllegalStateException', 'remove() nur einmal nach next()');
+        const [x] = n.L.splice(n.last, 1); n.i = n.last; n.last = -1; n.n = n.L.length;
+        if (n.owner) { dropFromMap(n.owner, [x]); if (n.owner.native.pq) n.owner.native.heapify(); }
+      },
+    }, retTypes: { hasNext: BOOL } });
+    // Warteschlangen: LinkedList und ArrayDeque (Deque), Stack, PriorityQueue
+    const L0 = (o) => o.native.list;
+    const dequeOps = {
+      offer(rt, o, a, line) { L0(o).push(elem(o, a[0], line)); return true; }, offerLast(rt, o, a, line) { L0(o).push(elem(o, a[0], line)); return true; }, offerFirst(rt, o, a, line) { L0(o).unshift(elem(o, a[0], line)); return true; },
+      poll(rt, o) { return L0(o).length ? L0(o).shift() : null; }, pollFirst(rt, o) { return L0(o).length ? L0(o).shift() : null; }, pollLast(rt, o) { return L0(o).length ? L0(o).pop() : null; },
+      peek(rt, o) { return L0(o).length ? L0(o)[0] : null; }, peekFirst(rt, o) { return L0(o).length ? L0(o)[0] : null; }, peekLast(rt, o) { const L = L0(o); return L.length ? L[L.length - 1] : null; },
+      element(rt, o) { if (!L0(o).length) ex('NoSuchElementException'); return L0(o)[0]; },
+      push(rt, o, a, line) { L0(o).unshift(elem(o, a[0], line)); }, pop(rt, o) { if (!L0(o).length) ex('NoSuchElementException'); return L0(o).shift(); },
+      remove(rt, o, a, line) { if (!a.length) { if (!L0(o).length) ex('NoSuchElementException'); return L0(o).shift(); } return listSpec.methods.remove(rt, o, a, line); },
+      descendingIterator(rt, o) { return mkIter(L0(o).slice().reverse(), null); },
+    };
+    def('Queue', { isInterface: true, pkg: 'java.util', interfaces: ['Collection'] });
+    def('Deque', { isInterface: true, pkg: 'java.util', interfaces: ['Queue'] });
+    def('LinkedList', { ...listSpec, interfaces: ['List', 'Deque'], methods: { ...listSpec.methods, ...dequeOps } });
+    const lm = listSpec.methods;
+    def('ArrayDeque', { ...listSpec, interfaces: ['Deque'], methods: { add: (rt, o, a, line) => { L0(o).push(elem(o, a[0], line)); return true; }, addAll: lm.addAll, size: lm.size, isEmpty: lm.isEmpty, clear: lm.clear, contains: lm.contains, getFirst: lm.getFirst, getLast: lm.getLast, addFirst: lm.addFirst, addLast: lm.addLast, removeFirst: lm.removeFirst, removeLast: lm.removeLast, forEach: lm.forEach, removeIf: lm.removeIf, ...collOps, ...dequeOps } });
+    def('Stack', { ...listSpec, interfaces: ['List'], methods: { ...listSpec.methods,
+      push(rt, o, a, line) { const v = elem(o, a[0], line); L0(o).push(v); return v; },
+      pop(rt, o) { if (!L0(o).length) ex('EmptyStackException'); return L0(o).pop(); },
+      peek(rt, o) { const L = L0(o); if (!L.length) ex('EmptyStackException'); return L[L.length - 1]; },
+      empty(rt, o) { return !L0(o).length; },
+      search(rt, o, a) { const L = L0(o); for (let i = L.length - 1; i >= 0; i--) if (rt.javaEquals(a[0], L[i])) return L.length - i; return -1; },
+    } });
+    // PriorityQueue als Binärheap wie in Java (gleiche Reihenfolge bei toString und for-each)
+    const pqSpec = {
+      pkg: 'java.util', interfaces: ['Queue'],
+      ctor(rt, args, line, type) {
+        const o = new JObject(rt.classes.get('PriorityQueue'));
+        const n = o.native = { list: [], elemType: type && type.args && type.args[0] || null, pq: true, cmp: null };
+        for (const x of args) { if (isColl(x)) n.list = x.native.list.slice(); else if (x instanceof JObject) n.cmp = x; }
+        n.heapify = () => { for (let i = (n.list.length >>> 1) - 1; i >= 0; i--) down(o, i, n.list[i]); };
+        n.heapify();
+        return o;
+      },
+      methods: {
+        add(rt, o, a, line) { return pqSpec.methods.offer(rt, o, a, line); },
+        offer(rt, o, a, line) { const v = elem(o, a[0], line); if (v === null) rt.npe(); const L = L0(o); L.push(v); up(o, L.length - 1, v); return true; },
+        peek(rt, o) { return L0(o).length ? L0(o)[0] : null; },
+        element(rt, o) { if (!L0(o).length) ex('NoSuchElementException'); return L0(o)[0]; },
+        poll(rt, o) { const L = L0(o); if (!L.length) return null; const r = L[0], x = L.pop(); if (L.length) down(o, 0, x); return r; },
+        remove(rt, o, a) {
+          const L = L0(o);
+          if (!a.length) { if (!L.length) ex('NoSuchElementException'); return pqSpec.methods.poll(rt, o); }
+          const i = L.findIndex(x => rt.javaEquals(a[0], x)); if (i < 0) return false;
+          const s2 = L.length - 1; if (s2 === i) { L.pop(); return true; }
+          const moved = L.pop(); down(o, i, moved); if (L[i] === moved) up(o, i, moved); return true;
+        },
+        size: lm.size, isEmpty: lm.isEmpty, clear: lm.clear, contains: lm.contains, forEach: lm.forEach,
+        addAll(rt, o, a, line) { for (const x of collArg0(a[0])) pqSpec.methods.offer(rt, o, [x], line); return true; },
+        ...collOps,
+      },
+      toString: listSpec.toString,
+      ui: [{ name: 'add', params: [{ type: T('Object'), name: 'element' }], ret: BOOL }, { name: 'poll', params: [], ret: T('Object') }, { name: 'peek', params: [], ret: T('Object') }, { name: 'size', params: [], ret: INT }],
+    };
+    const pqCmp = (o) => rt.cmpOf(o.native.cmp);
+    const up = (o, k, x) => { const q = L0(o), c = pqCmp(o); while (k > 0) { const p = (k - 1) >>> 1, e = q[p]; if (c(x, e) >= 0) break; q[k] = e; k = p; } q[k] = x; };
+    const down = (o, k, x) => { const q = L0(o), c = pqCmp(o), n = q.length, half = n >>> 1; while (k < half) { let ch = 2 * k + 1, cv = q[ch]; const r = ch + 1; if (r < n && c(cv, q[r]) > 0) cv = q[ch = r]; if (c(x, cv) <= 0) break; q[k] = cv; k = ch; } q[k] = x; };
+    def('PriorityQueue', pqSpec);
     const setSpec = {
       pkg: 'java.util', interfaces: ['Set'],
-      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeSet' ? 'TreeSet' : 'HashSet')); o.native = { list: [], elemType: type && type.args && type.args[0] || null, sorted: type && type.name === 'TreeSet' }; if (args.length === 1 && isColl(args[0])) for (const x of args[0].native.list) setSpec.methods.add(rt, o, [x]); else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
+      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && ['TreeSet', 'LinkedHashSet'].includes(type.name) ? type.name : 'HashSet')); o.native = { list: [], elemType: type && type.args && type.args[0] || null, sorted: type && type.name === 'TreeSet' }; if (args.length === 1 && isColl(args[0])) for (const x of args[0].native.list) setSpec.methods.add(rt, o, [x]); else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
       methods: {
         add(rt, o, a, line) { const v = elem(o, a[0], line); const c = o.native.cmp ? rt.cmpOf(o.native.cmp) : null; if (o.native.list.some(x => c ? c(v, x) === 0 : rt.javaEquals(v, x))) return false; o.native.list.push(v); if (o.native.sorted) o.native.list.sort(c || ((x, y) => rt.compareValues(x, y))); return true; },
-        remove(rt, o, a) { const k = o.native.list.findIndex(x => rt.javaEquals(a[0], x)); if (k >= 0) { o.native.list.splice(k, 1); return true; } return false; },
+        remove(rt, o, a) { const k = o.native.list.findIndex(x => rt.javaEquals(a[0], x)); if (k >= 0) { const [x] = o.native.list.splice(k, 1); dropFromMap(o, [x]); return true; } return false; },
         contains(rt, o, a) { return o.native.list.some(x => rt.javaEquals(a[0], x)); },
         size(rt, o) { return o.native.list.length; }, isEmpty(rt, o) { return !o.native.list.length; }, clear(rt, o) { o.native.list.length = 0; },
         addAll(rt, o, a) { let ch = false; for (const x of a[0].native.list) ch = setSpec.methods.add(rt, o, [x]) || ch; return ch; },
         forEach: listSpec.methods.forEach, removeIf: listSpec.methods.removeIf,
+        ...collOps,
+        first(rt, o) { if (!o.native.list.length) ex('NoSuchElementException'); return o.native.list[0]; },
+        last(rt, o) { const L = o.native.list; if (!L.length) ex('NoSuchElementException'); return L[L.length - 1]; },
+        pollFirst(rt, o) { return o.native.list.length ? o.native.list.shift() : null; },
+        pollLast(rt, o) { return o.native.list.length ? o.native.list.pop() : null; },
+        floor(rt, o, a) { return navig(o, a[0], (d) => d <= 0, true); }, lower(rt, o, a) { return navig(o, a[0], (d) => d < 0, true); },
+        ceiling(rt, o, a) { return navig(o, a[0], (d) => d >= 0, false); }, higher(rt, o, a) { return navig(o, a[0], (d) => d > 0, false); },
       },
       toString: listSpec.toString,
       ui: [{ name: 'add', params: [{ type: T('Object'), name: 'element' }], ret: BOOL }, { name: 'contains', params: [{ type: T('Object'), name: 'o' }], ret: BOOL }, { name: 'size', params: [], ret: INT }],
     };
     def('Set', { isInterface: true, pkg: 'java.util', interfaces: ['Collection'] });
-    def('HashSet', setSpec); def('TreeSet', setSpec);
+    def('HashSet', setSpec); def('TreeSet', setSpec); def('LinkedHashSet', setSpec);
+    // TreeSet/TreeMap: nächstes Element (floor, ceiling …); L ist sortiert
+    const navig = (o, v, ok, fromEnd) => { const L = o.native.list || o.native.keys, c = rt.cmpOf(o.native.cmp); if (fromEnd) { for (let i = L.length - 1; i >= 0; i--) if (ok(c(L[i], v))) return L[i]; } else for (const x of L) if (ok(c(x, v))) return x; return null; };
+    const mkEntry = (m, k) => { const e = new JObject(rt.classes.get('Entry')); e.native = { map: m, key: k }; return e; };
+    const entryVal = (e) => { const n = e.native; if (!n.map) return n.val; const i = mapFind(n.map, n.key); return i >= 0 ? n.map.native.vals[i] : null; };
+    def('Entry', { pkg: 'java.util', methods: {
+      getKey(rt, o) { return o.native.key; }, getValue(rt, o) { return entryVal(o); },
+      setValue(rt, o, a, line) { const old = entryVal(o); if (o.native.map) mapSpec.methods.put(rt, o.native.map, [o.native.key, a[0]], line); else o.native.val = a[0]; return old; },
+      equals(rt, o, a) { const b = a[0]; return b instanceof JObject && b.cls === o.cls && rt.javaEquals(o.native.key, b.native.key) && rt.javaEquals(entryVal(o), entryVal(b)); },
+      hashCode(rt, o) { return rt.hashOf(o.native.key) ^ rt.hashOf(entryVal(o)); },
+    }, toString(rt, o) { return rt.str(o.native.key) + '=' + rt.str(entryVal(o)); } });
     const mapFind = (o, k) => o.native.keys.findIndex(x => rt.javaEquals(k, x));
     const mapSpec = {
       pkg: 'java.util', interfaces: ['Map'],
-      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeMap' ? 'TreeMap' : 'HashMap')); o.native = { keys: [], vals: [], kType: type && type.args && type.args[0] || null, vType: type && type.args && type.args[1] || null, sorted: type && type.name === 'TreeMap' }; if (args.length === 1 && args[0] instanceof JObject && args[0].native && args[0].native.keys) { for (let i = 0; i < args[0].native.keys.length; i++) mapSpec.methods.put(rt, o, [args[0].native.keys[i], args[0].native.vals[i]]); } else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
+      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && ['TreeMap', 'LinkedHashMap'].includes(type.name) ? type.name : 'HashMap')); o.native = { keys: [], vals: [], kType: type && type.args && type.args[0] || null, vType: type && type.args && type.args[1] || null, sorted: type && type.name === 'TreeMap' }; if (args.length === 1 && args[0] instanceof JObject && args[0].native && args[0].native.keys) { for (let i = 0; i < args[0].native.keys.length; i++) mapSpec.methods.put(rt, o, [args[0].native.keys[i], args[0].native.vals[i]]); } else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
       methods: {
         put(rt, o, a, line) { const k = o.native.kType ? rt.coerce(a[0], o.native.kType, line) : a[0]; const v = o.native.vType ? rt.coerce(a[1], o.native.vType, line) : a[1]; const i = mapFind(o, k); if (i >= 0) { const old = o.native.vals[i]; o.native.vals[i] = v; return old; } o.native.keys.push(k); o.native.vals.push(v); if (o.native.sorted) { const c = rt.cmpOf(o.native.cmp); const idx = o.native.keys.map((_, j) => j).sort((x, y) => c(o.native.keys[x], o.native.keys[y])); o.native.keys = idx.map(j => o.native.keys[j]); o.native.vals = idx.map(j => o.native.vals[j]); } return null; },
         putIfAbsent(rt, o, a, line) { const i = mapFind(o, a[0]); if (i >= 0 && o.native.vals[i] !== null) return o.native.vals[i]; mapSpec.methods.put(rt, o, a, line); return null; },
@@ -2795,14 +3011,31 @@ class Runtime {
         containsKey(rt, o, a) { return mapFind(o, a[0]) >= 0; }, containsValue(rt, o, a) { return o.native.vals.some(v => rt.javaEquals(a[0], v)); },
         remove(rt, o, a) { const i = mapFind(o, a[0]); if (i < 0) return null; o.native.keys.splice(i, 1); return o.native.vals.splice(i, 1)[0]; },
         size(rt, o) { return o.native.keys.length; }, isEmpty(rt, o) { return !o.native.keys.length; }, clear(rt, o) { o.native.keys = []; o.native.vals = []; },
-        keySet(rt, o) { const s = new JObject(rt.classes.get('HashSet')); s.native = { list: o.native.keys.slice(), elemType: o.native.kType }; return s; },
+        keySet(rt, o) { const s = new JObject(rt.classes.get('HashSet')); s.native = { list: o.native.keys.slice(), elemType: o.native.kType, mapOwner: o }; return s; },
+        entrySet(rt, o) { const s = new JObject(rt.classes.get('HashSet')); s.native = { list: o.native.keys.map(k => mkEntry(o, k)), elemType: null, mapOwner: o, entries: true }; return s; },
+        putAll(rt, o, a, line) { const m = a[0]; if (m === null) rt.npe(); for (let i = 0; i < m.native.keys.length; i++) mapSpec.methods.put(rt, o, [m.native.keys[i], m.native.vals[i]], line); },
+        replace(rt, o, a, line) { const i = mapFind(o, a[0]); if (i < 0) return null; const old = o.native.vals[i]; o.native.vals[i] = a[1]; return old; },
+        firstKey(rt, o) { if (!o.native.keys.length) ex('NoSuchElementException'); return o.native.keys[0]; },
+        lastKey(rt, o) { const K = o.native.keys; if (!K.length) ex('NoSuchElementException'); return K[K.length - 1]; },
+        firstEntry(rt, o) { return o.native.keys.length ? mkEntry(o, o.native.keys[0]) : null; },
+        lastEntry(rt, o) { const K = o.native.keys; return K.length ? mkEntry(o, K[K.length - 1]) : null; },
+        floorKey(rt, o, a) { return navig(o, a[0], (d) => d <= 0, true); }, lowerKey(rt, o, a) { return navig(o, a[0], (d) => d < 0, true); },
+        ceilingKey(rt, o, a) { return navig(o, a[0], (d) => d >= 0, false); }, higherKey(rt, o, a) { return navig(o, a[0], (d) => d > 0, false); },
         values(rt, o) { const s = new JObject(rt.classes.get('ArrayList')); s.native = { list: o.native.vals.slice(), elemType: o.native.vType }; return s; },
       },
       toString(rt, o) { return '{' + o.native.keys.map((k, i) => rt.str(k) + '=' + rt.str(o.native.vals[i])).join(', ') + '}'; },
       ui: [{ name: 'put', params: [{ type: T('Object'), name: 'key' }, { type: T('Object'), name: 'value' }], ret: T('Object') }, { name: 'get', params: [{ type: T('Object'), name: 'key' }], ret: T('Object') }, { name: 'size', params: [], ret: INT }],
     };
-    def('Map', { isInterface: true, pkg: 'java.util' });
-    def('HashMap', mapSpec); def('TreeMap', mapSpec);
+    const mkList = (items, cls = 'ArrayList') => { const o = new JObject(rt.classes.get(cls)); o.native = { list: items, elemType: null }; return o; };
+    def('Map', { isInterface: true, pkg: 'java.util', statics: {
+      of(rt, a) { const o = mapSpec.ctor(rt, [], 0, T('HashMap')); for (let i = 0; i + 1 < a.length; i += 2) mapSpec.methods.put(rt, o, [a[i], a[i + 1]]); return o; },
+      entry(rt, a) { const e = new JObject(rt.classes.get('Entry')); e.native = { map: null, key: a[0], val: a[1] }; return e; },
+    }, staticRet: { of: T('Map'), entry: T('Entry') } });
+    def('HashMap', mapSpec); def('TreeMap', mapSpec); def('LinkedHashMap', mapSpec);
+    rt.classes.get('List').native.statics = { of(rt, a) { return mkList(a.length === 1 && a[0] instanceof JArray ? a[0].data.slice() : a.slice()); }, copyOf(rt, a) { return mkList(collArg0(a[0]).slice()); } };
+    rt.classes.get('List').native.staticRet = { of: T('List'), copyOf: T('List') };
+    rt.classes.get('Set').native.statics = { of(rt, a) { const o = setSpec.ctor(rt, [], 0, T('LinkedHashSet')); for (const x of a) if (!setSpec.methods.add(rt, o, [x])) ex('IllegalArgumentException', 'duplicate element: ' + rt.str(x)); return o; } };
+    rt.classes.get('Set').native.staticRet = { of: T('Set') };
 
     // ---- Random (Java-kompatibler Zufallsgenerator)
     const MULT = 0x5DEECE66Dn, MASK = (1n << 48n) - 1n;
@@ -2849,10 +3082,12 @@ class Runtime {
       copyOf(rt, a) { const arr = arrArg(a[0]); const n = intArg(a[1]); const d = arr.data.slice(0, n); while (d.length < n) d.push(defaultValue(arr.elemType)); return new JArray(arr.elemType, d); },
       copyOfRange(rt, a) { const arr = arrArg(a[0]); return new JArray(arr.elemType, arr.data.slice(intArg(a[1]), intArg(a[2]))); },
       equals(rt, a) { if (a[0] === null || a[1] === null) return a[0] === a[1]; return a[0].data.length === a[1].data.length && a[0].data.every((x, i) => rt.javaEquals(x, a[1].data[i])); },
+      binarySearch(rt, a) { return binSearch(arrArg(a[0]).data, a[1], rt.cmpOf(a[2])); },
       asList(rt, a) { const o = new JObject(rt.classes.get('ArrayList')); o.native = { list: a.length === 1 && a[0] instanceof JArray ? a[0].data.slice() : a.slice(), elemType: null }; return o; },
       stream() { rt.rtError('Streams werden nicht unterstützt'); },
     } });
     const collArg = (v) => { if (!isColl(v)) rt.rtError('Liste erwartet'); return v.native.list; };
+    const binSearch = (L, key, c) => { let lo = 0, hi = L.length - 1; while (lo <= hi) { const mid = (lo + hi) >>> 1, d = c(L[mid], key); if (d < 0) lo = mid + 1; else if (d > 0) hi = mid - 1; else return mid; } return -(lo + 1); };
     def('Collections', { pkg: 'java.util', statics: {
       sort(rt, a) { collArg(a[0]).sort(rt.cmpOf(a[1])); },
       reverseOrder(rt, a) { if (a.length) { const c = a[0]; return rt.nativeLambda('Comparator', (rt, b) => rt.cmpOf(c)(b[1], b[0])); } return rt.nativeLambda('Comparator', (rt, b) => rt.compareValues(b[1], b[0])); },
@@ -2862,6 +3097,12 @@ class Runtime {
       min(rt, a) { const L = collArg(a[0]); if (!L.length) ex('NoSuchElementException'); const c = rt.cmpOf(a[1]); return L.reduce((m, x) => c(x, m) < 0 ? x : m); },
       swap(rt, a) { const L = collArg(a[0]); const i = intArg(a[1]), j = intArg(a[2]); listIdx(null, i, L.length); listIdx(null, j, L.length); [L[i], L[j]] = [L[j], L[i]]; },
       frequency(rt, a) { return collArg(a[0]).filter(x => rt.javaEquals(a[1], x)).length; },
+      addAll(rt, a, line) { const o = a[0]; let ch = false; for (const x of a.slice(1)) ch = rt.callFn(o, 'add', [x]) !== false || ch; return ch; },
+      nCopies(rt, a) { const n = intArg(a[0]); if (n < 0) ex('IllegalArgumentException', 'List length = ' + n); return mkList(new Array(n).fill(a[1])); },
+      fill(rt, a) { collArg(a[0]).fill(a[1]); },
+      emptyList() { return mkList([]); },
+      unmodifiableList(rt, a) { return a[0]; }, unmodifiableSet(rt, a) { return a[0]; }, unmodifiableMap(rt, a) { return a[0]; },
+      binarySearch(rt, a) { return binSearch(collArg(a[0]), a[1], rt.cmpOf(a[2])); },
     } });
     def('Thread', { statics: { sleep(rt, a) { return rt.sleep(a.length ? rt.num(a[0]) : 0); } } });
     def('Objects', { pkg: 'java.util', statics: { equals(rt, a) { return rt.javaEquals(a[0], a[1]); }, hash(rt, a) { let h = 1; for (const x of a) h = (Math.imul(31, h) + rt.hashOf(x)) | 0; return h; }, isNull(rt, a) { return a[0] === null; }, requireNonNull(rt, a) { if (a[0] === null) rt.npe(a[1] || null); return a[0]; } } });
@@ -2880,7 +3121,7 @@ class Checker {
     try {
       for (const f of d.fields) {
         this.checkType(f.type, f.line);
-        if (f.init) { this.ctx = { isStatic: f.static, method: null, loops: 0, tps: c.typeParams }; const sc = new Scope(null); const t = f.init.k === 'ArrayInit' ? this.arrayInit(f.init, f.type, sc) : this.expr(f.init, sc); this.assignCheck(f.type, t, f.init, f.line); this.flushLambdas(0); }
+        if (f.init) { this.ctx = { isStatic: f.static, method: null, loops: 0, tps: c.typeParams }; const sc = new Scope(null); this.diamond(f.type, f.init); const t = f.init.k === 'ArrayInit' ? this.arrayInit(f.init, f.type, sc) : this.expr(f.init, sc); this.assignCheck(f.type, t, f.init, f.line); this.flushLambdas(0); }
       }
       for (const ec of d.enumConsts) { this.ctx = { isStatic: true, loops: 0, tps: [] }; this.ctorArgsCheck(c, ec.args.map(a => this.expr(a, new Scope(null))), ec.line); }
       for (const m of d.methods) {
@@ -2918,6 +3159,34 @@ class Checker {
     for (let en = this.encl; en; en = en.checker.encl) if ((en.checker.ctx && en.checker.ctx.tps || []).includes(name)) return true;
     return false;
   }
+  // ---- geprüfte Ausnahmen (wie javac: abfangen oder mit throws deklarieren)
+  throwsOf(m, line) {
+    const out = [];
+    for (const n of (m && m.throws) || []) {
+      const c = this.rt.classes.get(n);
+      if (!c) this.err(line, `Ausnahmeklasse '${n}' nicht gefunden` + suggest(n, [...this.rt.classes.keys()].filter(k => /Exception|Error|Throwable/.test(k))));
+      if (!c.isSubclassOf(this.rt.classes.get('Throwable'))) this.err(line, `Hinter throws dürfen nur Ausnahmeklassen stehen, ${n} ist keine`);
+      out.push(c);
+    }
+    return out;
+  }
+  isChecked(c) {
+    const k = (n) => this.rt.classes.get(n);
+    return !!c && c.isSubclassOf(k('Throwable')) && !c.isSubclassOf(k('RuntimeException')) && !c.isSubclassOf(k('Error'));
+  }
+  thrown(c, line) {
+    if (!this.isChecked(c) || !this.ctx) return;
+    const tries = this.ctx.tries || [];
+    for (let i = tries.length - 1; i >= 0; i--) {
+      const f = tries[i];
+      f.thrown.push(c);
+      if (f.catches.some(k => c.isSubclassOf(k))) return;
+    }
+    if ((this.ctx.throwsDecl || []).some(k => c.isSubclassOf(k))) return;
+    const where = this.ctx.method && this.ctx.method.lambda ? ' – in einem Lambda-Ausdruck geht nur try/catch' : this.ctx.method ? ` oder die Methode mit „throws ${c.name}“ kennzeichnen` : '';
+    this.err(line, `Die Ausnahme ${c.name} muss abgefangen werden (try/catch)${where}`);
+  }
+  thrownBy(m, line) { for (const n of (m && m.throws) || []) this.thrown(this.rt.classes.get(n), line); }
   // ---- verschachtelte Klassen und eingefangene Variablen
   // Lokale und anonyme Klassen werden an ihrer Stelle im umgebenden Code geprüft (encl),
   // damit sie die lokalen Variablen dort sehen.
@@ -2984,7 +3253,7 @@ class Checker {
     if (t.args) for (const a of t.args) this.checkType(a, line, tps);
   }
   body(m, isCtor) {
-    this.ctx = { isStatic: !!m.static, method: m, isCtor, loops: 0, switches: 0, tps: [...(this.cls.typeParams || []), ...(m.typeParams || [])] };
+    this.ctx = { isStatic: !!m.static, method: m, isCtor, loops: 0, switches: 0, tps: [...(this.cls.typeParams || []), ...(m.typeParams || [])], tries: [], throwsDecl: this.throwsOf(m, m.line) };
     const sc = new Scope(null);
     for (const p of m.params) sc.declare(p.name, p.type, m.line, this);
     const stmts = m.body.stmts;
@@ -3004,14 +3273,14 @@ class Checker {
   block(stmts, sc, start = 0) {
     for (let i = start; i < stmts.length; i++) {
       const s = stmts[i];
-      if (i > 0 && ['Return', 'Break', 'Continue', 'Throw'].includes(stmts[i - 1].k)) this.err(s.line, 'Diese Anweisung wird nie erreicht (sie steht nach return/break/continue/throw)');
+      if (i > 0 && ['Return', 'Break', 'Continue', 'Throw', 'Yield'].includes(stmts[i - 1].k)) this.err(s.line, 'Diese Anweisung wird nie erreicht (sie steht nach return/break/continue/throw)');
       this.stmt(s, sc);
     }
   }
   canComplete(s) {
     if (!s) return true;
     switch (s.k) {
-      case 'Return': case 'Throw': return false;
+      case 'Return': case 'Throw': case 'Yield': return false;
       case 'Block': return s.stmts.length === 0 || s.stmts.every(x => this.canComplete(x));
       case 'If': return !s.b || this.canComplete(s.a) || this.canComplete(s.b);
       case 'While': return !(s.c.k === 'Lit' && s.c.v === true) || this.hasBreak(s.body);
@@ -3062,6 +3331,7 @@ class Checker {
           let t = d.type;
           this.checkType(t, s.line);
           if (d.init) {
+            this.diamond(t, d.init);
             const it = d.init.k === 'ArrayInit' ? (t.name === 'var' ? this.err(s.line, 'var kann nicht mit { … } verwendet werden') : this.arrayInit(d.init, t, sc)) : this.expr(d.init, sc);
             if (t.name === 'var') { if (it && it.name === 'void') this.err(s.line, 'Die Methode liefert keinen Wert (void)'); if (it && it.lambda) this.err(s.line, 'Bei var ist der Typ eines Lambda-Ausdrucks unbekannt – gib das Interface an, z. B. Runnable r = () -> …'); t = it && it.name !== 'null' ? it : null; }
             else this.assignCheck(t, it, d.init, s.line);
@@ -3084,7 +3354,9 @@ class Checker {
         if (it) {
           if (it.dims > 0) et = { ...it, dims: it.dims - 1 };
           else if (PRIMS.has(it.name) || it.name === 'String') this.err(s.line, `for-each geht nur über Arrays und Listen, nicht über ${typeStr(it)}`);
+          else if (['Map', 'HashMap', 'TreeMap', 'LinkedHashMap'].includes(it.name)) this.err(s.line, 'Über eine Map geht for-each nicht direkt – verwende keySet(), values() oder entrySet()');
           else if (it.args && it.args.length === 1) et = it.args[0];
+          else { const ic = this.userClass(it); if (ic && ic.decl && !ic.builtin) { const im = this.rt.lookupMethods(ic, 'iterator').find(m => !m.params.length); if (!im && !ic.isSubclassOf(this.rt.classes.get('Iterable'))) this.err(s.line, `for-each geht nur über Arrays, Listen und Objekte, die Iterable implementieren – ${ic.name} tut das nicht`); if (im && im.ret && im.ret.args && im.ret.args[0] && this.norm(im.ret.args[0])) et = im.ret.args[0]; } }
         }
         if (s.type.name !== 'var') { this.checkType(s.type, s.line); if (et) this.assignCheck(s.type, et, null, s.line); }
         s2.declare(s.name, s.type.name === 'var' ? et : s.type, s.line, this);
@@ -3106,11 +3378,25 @@ class Checker {
       }
       case 'Break': if (!this.ctx.loops && !this.ctx.switches) this.err(s.line, 'break außerhalb einer Schleife oder eines switch'); return;
       case 'Continue': if (!this.ctx.loops) this.err(s.line, 'continue außerhalb einer Schleife'); return;
-      case 'Throw': { const t = this.expr(s.e, sc); const th = this.rt.classes.get('Throwable'); const c = t && this.rt.classes.get(t.name); if (t && !t.dims && c && !c.isSubclassOf(th)) this.err(s.line, `Nur Ausnahmen können geworfen werden, nicht ${typeStr(t)}`); return; }
+      case 'Throw': { const t = this.expr(s.e, sc); const th = this.rt.classes.get('Throwable'); const c = t && this.rt.classes.get(t.name); if (t && !t.dims && c && !c.isSubclassOf(th)) this.err(s.line, `Nur Ausnahmen können geworfen werden, nicht ${typeStr(t)}`); if (t && !t.dims && c) this.thrown(c, s.line); return; }
       case 'Try': {
-        this.stmt(s.block, sc);
+        const frame = { catches: [], thrown: [] };
+        for (const c of s.catches) for (const tn of c.types) { const k = this.rt.classes.get(tn); if (k) frame.catches.push(k); }
+        if (!this.ctx.tries) this.ctx.tries = [];
+        this.ctx.tries.push(frame);
+        try { this.stmt(s.block, sc); } finally { this.ctx.tries.pop(); }
+        for (const k of frame.catches) {
+          if (!this.isChecked(k) || k.name === 'Exception' || k.name === 'Throwable') continue;
+          if (!frame.thrown.some(x => x.isSubclassOf(k) || k.isSubclassOf(x))) this.err(s.line, `Die Ausnahme ${k.name} wird im try-Block nie geworfen – dieses catch ist überflüssig`);
+        }
         for (const c of s.catches) { for (const tn of c.types) { const k = this.rt.classes.get(tn); if (!k) this.err(s.line, `Ausnahmeklasse '${tn}' nicht gefunden` + suggest(tn, [...this.rt.classes.keys()].filter(n => /Exception|Error|Throwable/.test(n)))); } const s2 = new Scope(sc); s2.declare(c.name, T(c.types[0]), s.line, this); this.stmt(c.body, s2); }
         if (s.fin) this.stmt(s.fin, sc); return;
+      }
+      case 'Yield': {
+        const ys = this.ctx.yields;
+        if (!ys || !ys.length) this.err(s.line, 'yield ist nur in einem switch-Ausdruck erlaubt');
+        ys[ys.length - 1].push({ t: this.expr(s.e, sc), e: s.e, line: s.line });
+        return;
       }
       case 'Switch': {
         const t = this.expr(s.e, sc);
@@ -3302,6 +3588,7 @@ class Checker {
       case 'ArrayInit': this.err(e.line, 'Array-Initialisierer { … } ist hier nicht erlaubt');
       case 'Assign': {
         const lt = this.lval(e.target, sc);
+        if (e.op === '=') this.diamond(lt, e.value);
         const vt = this.expr(e.value, sc);
         if (e.op === '=') this.assignCheck(lt, vt, e.value, e.line);
         else if (e.op === '+=' && lt && lt.name === 'String' && !lt.dims) { }
@@ -3367,8 +3654,42 @@ class Checker {
         return lt;
       }
       case 'CtorCall': this.err(e.line, `${e.which}(…) ist nur als erste Anweisung in einem Konstruktor erlaubt`);
+      case 'SwitchExpr': return this.switchExpr(e, sc);
     }
     return null;
+  }
+  switchExpr(s, sc) {
+    const t = this.expr(s.e, sc);
+    const ec = t && !t.dims && this.rt.classes.get(t.name);
+    const isEnum = ec && ec.isEnum;
+    if (t && !t.dims && !isEnum && !['int', 'char', 'String', 'short', 'byte', 'Integer', 'Character'].includes(t.name)) this.err(s.line, `switch geht nicht mit ${typeStr(t)} (erlaubt: int, char, String, enum)`);
+    const covered = new Set();
+    const results = [];
+    if (!this.ctx.yields) this.ctx.yields = [];
+    this.ctx.yields.push(results);
+    const saved = { loops: this.ctx.loops, switches: this.ctx.switches };
+    this.ctx.loops = 0; this.ctx.switches = 0;   // break/continue führen nicht aus dem switch-Ausdruck heraus
+    try {
+      for (const c of s.cases) {
+        if (c.labels) for (const l of c.labels) {
+          if (isEnum && l.k === 'Name') { if (!ec.fieldMap.has(l.name)) this.err(c.line, `${ec.name} hat keine Konstante ${l.name}`); covered.add(l.name); }
+          else this.expr(l, new Scope(sc));
+        }
+        const s2 = new Scope(sc);
+        if (s.arrow) {
+          const st = c.stmts[0];
+          if (st.k === 'Expr') results.push({ t: this.expr(st.e, s2), e: st.e, line: st.line });
+          else { this.stmt(st, s2); if (st.k === 'Block' && this.canComplete(st)) this.err(st.endLine || st.line, 'Dieser Fall liefert keinen Wert – am Ende des Blocks fehlt yield'); }
+        } else for (const st of c.stmts) this.stmt(st, s2);
+      }
+    } finally { this.ctx.yields.pop(); Object.assign(this.ctx, saved); }
+    const hasDefault = s.cases.some(c => !c.labels);
+    if (!hasDefault && !(isEnum && ec.enumConsts !== undefined && [...ec.fieldMap.values()].filter(f => f.enumConst).every(f => covered.has(f.name)))) this.err(s.line, isEnum ? `Der switch-Ausdruck deckt nicht alle Werte von ${ec.name} ab – ergänze die fehlenden Fälle oder default` : 'Der switch-Ausdruck braucht einen default-Fall');
+    for (const r of results) if (r.t && r.t.name === 'void') this.err(r.line, 'Ein void-Methodenaufruf liefert keinen Wert für den switch-Ausdruck');
+    const ts = results.map(r => this.norm(r.t)).filter(Boolean);
+    if (!ts.length) return null;
+    if (ts.every(x => this.isNum(x))) return ts.reduce((a, b) => this.promote(a, b));
+    return ts.find(x => x.name !== 'null') || ts[0];
   }
   // Ziel einer Methodenreferenz prüfen; merkt die Zahl der Parameter, wenn sie feststeht
   refTarget(e, sc) {
@@ -3394,6 +3715,14 @@ class Checker {
     }
   }
   // Lambda/Methodenreferenz gegen den Zieltyp prüfen (to = null: unbekannt)
+  // new X<>(…): Typargumente vom Ziel übernehmen
+  diamond(to, e) {
+    if (e && e.k === 'New' && e.type.args && !e.type.args.length && to && to.args && to.args.length && !e.anon) {
+      const c = this.rt.classes.get(e.type.name);
+      if (c && (!c.typeParams.length || c.typeParams.length === to.args.length)) e.type.args = to.args;
+      else if (c && c.native && to.args.length <= 2) e.type.args = to.args;
+    }
+  }
   lambdaCheck(lt, to) {
     const e = lt.lambda, sc = lt.sc;
     if (e.$chk) return; e.$chk = true;
@@ -3423,7 +3752,8 @@ class Checker {
     });
     const ret = fm ? (fm.ret.name === 'void' ? VOID : sub(fm.ret)) : null;
     const saved = this.ctx, depth = this.depth;
-    this.ctx = { ...saved, method: { name: 'Lambda', ret, lambda: true, iface: tc && fm ? tc.name + '.' + fm.name : null }, isCtor: false, loops: 0, switches: 0 };
+    this.ctx = { ...saved, method: { name: 'Lambda', ret, lambda: true, iface: tc && fm ? tc.name + '.' + fm.name : null }, isCtor: false, loops: 0, switches: 0, tries: [], throwsDecl: fm ? (fm.throws || []).map(n => this.rt.classes.get(n)).filter(Boolean) : null };
+    if (!fm) this.ctx.throwsDecl = [this.rt.classes.get('Throwable')];
     try {
       if (e.expr) {
         const t = this.expr(e.body, s2);
@@ -3494,7 +3824,7 @@ class Checker {
     if (t.k === 'Field' && (t.obj.k === 'This' || t.obj.k === 'Super')) f = this.rt.findField(t.obj.k === 'This' ? this.cls : this.cls.superClass, t.name);
     if (t.k === 'Field' && t.obj.k === 'Name' && sc.get(t.obj.name) === undefined && !this.rt.findField(this.cls, t.obj.name) && this.rt.classes.has(t.obj.name)) f = this.rt.findField(this.rt.classes.get(t.obj.name), t.name);
     if (f && (f.field.final || f.field.native)) {
-      const ok = f.owner === this.cls && ((this.ctx.isCtor && !f.field.static && !this.encl) || (!this.ctx.method && f.field.static && this.ctx.isStatic));
+      const ok = f.owner === this.cls && ((this.ctx.isCtor && !f.field.static) || (!this.ctx.method && f.field.static && this.ctx.isStatic));
       if (!ok) this.err(t.line, `'${t.name}' ist final (konstant) und kann nicht verändert werden`);
     }
     if (t.k === 'Field' && ty === INT && t.name === 'length') { const at = this.expr(t.obj, sc); if (at && at.dims) this.err(t.line, 'Die Länge eines Arrays kann nicht verändert werden'); }
@@ -3523,6 +3853,7 @@ class Checker {
     if (!ok.length) this.err(line, `${label}(${cands[0].params.map(p => typeStr(p.type)).join(', ')}) passt nicht zu den Argumenten (${at.map(t => t ? (t.classRef ? t.classRef : typeStr(t)) : '?').join(', ')})`);
     const m = ok[0];
     at.forEach((a, i) => { if (a && a.lambda) this.lambdaCheck(a, m.params[i].type); });
+    this.thrownBy(m, line);
     const top = this.rt.topOf(this.cls);
     if (!isCtor && m.vis === 'private' && m.cls !== this.cls && this.rt.topOf(m.cls) !== top) this.err(line, `Methode ${m.name}() ist private in ${m.cls.name}`);
     if (isCtor && m.vis === 'private' && owner !== this.cls && this.rt.topOf(owner) !== top) this.err(line, `Konstruktor ${owner.name}(…) ist private`);
@@ -3580,6 +3911,7 @@ class Checker {
           if (c.name === 'System' && e.name === 'println') this.err(e.line, "Es heißt System.out.println(…)");
           this.err(e.line, `Methode '${e.name}' gibt es in ${c.name} nicht (oder sie wird nicht unterstützt)` + suggest(e.name, Object.keys(c.native.statics || {})));
         }
+        for (const n of NATIVE_THROWS[c.name + '.' + e.name] || []) this.thrown(this.rt.classes.get(n), e.line);
         if (c.native.staticRet && c.native.staticRet[e.name] !== undefined) return c.native.staticRet[e.name];
         return NATIVE_RET[c.name + '.' + e.name] || (c.name === 'Math' && ['abs', 'max', 'min'].includes(e.name) ? (at.length === 1 ? this.unbox(at[0]) : this.promote(at[0], at[1])) : null);
       }
@@ -3629,15 +3961,24 @@ class Checker {
 function nativeRet(rt, cls, name) { for (let c = cls; c; c = c.superClass) if (c.native && c.native.retTypes && c.native.retTypes[name] !== undefined) return c.native.retTypes[name]; return null; }
 function listRet(c, name, t) {
   const el = t.args && t.args[0] ? t.args[0] : null;
-  if (['size', 'indexOf', 'lastIndexOf', 'length'].includes(name)) return INT;
+  const isMap = ['HashMap', 'Map', 'TreeMap', 'LinkedHashMap'].includes(c.name);
+  if (['size', 'indexOf', 'lastIndexOf', 'length', 'search'].includes(name)) return INT;
+  if (['offer', 'offerFirst', 'offerLast', 'empty', 'hasNext', 'removeAll', 'retainAll', 'containsAll', 'addAll', 'removeIf'].includes(name)) return BOOL;
+  if (name === 'iterator' && !isMap) return T('Iterator', 0, el ? [el] : null);
+  if (['next', 'peek', 'poll', 'pop', 'push', 'element', 'first', 'last', 'pollFirst', 'pollLast', 'peekFirst', 'peekLast', 'floor', 'ceiling', 'higher', 'lower'].includes(name) && !isMap) return el;
+  if (['firstKey', 'lastKey', 'floorKey', 'ceilingKey', 'higherKey', 'lowerKey', 'getKey'].includes(name)) return el;
+  if (['getValue', 'setValue'].includes(name)) return t.args && t.args[1] || null;
+  if (name === 'entrySet' && t.args) return T('Set', 0, [T('Entry', 0, t.args)]);
+  if (['put', 'remove', 'getOrDefault', 'putIfAbsent', 'merge', 'computeIfAbsent'].includes(name) && isMap) return t.args && t.args[1] || null;
   if (['isEmpty', 'contains', 'containsKey', 'containsValue', 'add'].includes(name) && !(name === 'add' && false)) return name === 'add' ? null : BOOL;
-  if (['get', 'getFirst', 'getLast', 'removeFirst', 'removeLast'].includes(name)) { if (['HashMap', 'Map', 'TreeMap'].includes(c.name)) return t.args && t.args[1] || null; return el; }
+  if (['get', 'getFirst', 'getLast', 'removeFirst', 'removeLast', 'set'].includes(name)) { if (isMap) return t.args && t.args[1] || null; return el; }
   if (name === 'nextInt') return INT; if (name === 'nextDouble' || name === 'nextGaussian') return DOUBLE; if (name === 'nextBoolean') return BOOL;
   if (name === 'toString') return STRING;
   if (name === 'keySet' && t.args) return T('Set', 0, [t.args[0]]);
   if (name === 'values' && t.args) return T('Collection', 0, [t.args[1]]);
   return null;
 }
+const NATIVE_THROWS = { 'Thread.sleep': ['InterruptedException'] };
 const NATIVE_RET = {
   'Math.sqrt': DOUBLE, 'Math.pow': DOUBLE, 'Math.random': DOUBLE, 'Math.floor': DOUBLE, 'Math.ceil': DOUBLE, 'Math.sin': DOUBLE, 'Math.cos': DOUBLE, 'Math.tan': DOUBLE, 'Math.round': LONG, 'Math.cbrt': DOUBLE, 'Math.exp': DOUBLE, 'Math.log': DOUBLE, 'Math.log10': DOUBLE, 'Math.hypot': DOUBLE, 'Math.atan': DOUBLE, 'Math.atan2': DOUBLE, 'Math.toRadians': DOUBLE, 'Math.toDegrees': DOUBLE, 'Math.signum': DOUBLE, 'Math.rint': DOUBLE, 'Math.floorDiv': INT, 'Math.floorMod': INT,
   'Integer.parseInt': INT, 'Integer.valueOf': T('Integer'), 'Integer.toString': STRING, 'Integer.compare': INT, 'Integer.toBinaryString': STRING, 'Integer.toHexString': STRING,
@@ -3645,7 +3986,7 @@ const NATIVE_RET = {
   'Long.parseLong': LONG, 'Boolean.parseBoolean': BOOL,
   'String.valueOf': STRING, 'String.format': STRING, 'String.join': STRING,
   'Character.isDigit': BOOL, 'Character.isLetter': BOOL, 'Character.isLetterOrDigit': BOOL, 'Character.isUpperCase': BOOL, 'Character.isLowerCase': BOOL, 'Character.isWhitespace': BOOL, 'Character.getNumericValue': INT, 'Character.toString': STRING,
-  'Arrays.toString': STRING, 'Arrays.deepToString': STRING, 'Arrays.equals': BOOL, 'System.currentTimeMillis': LONG, 'System.nanoTime': LONG,
+  'Arrays.toString': STRING, 'Arrays.binarySearch': INT, 'Collections.binarySearch': INT, 'Collections.frequency': INT, 'Collections.addAll': BOOL, 'Arrays.deepToString': STRING, 'Arrays.equals': BOOL, 'System.currentTimeMillis': LONG, 'System.nanoTime': LONG,
   'Math.abs': null,
 };
 class StopCheck { }
@@ -3709,6 +4050,11 @@ public interface DoubleUnaryOperator { double applyAsDouble(double operand); }
 public interface DoubleBinaryOperator { double applyAsDouble(double left, double right); }
 ` });
 Runtime.preludes.push({ pkg: 'java.util', code: `
+public interface Iterator<E> {
+  boolean hasNext();
+  E next();
+  default void remove() { throw new UnsupportedOperationException("remove"); }
+}
 public interface Comparator<T> {
   int compare(T a, T b);
   default Comparator<T> reversed() { return (a, b) -> compare(b, a); }
