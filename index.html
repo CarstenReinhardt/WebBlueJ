@@ -87,6 +87,18 @@ button { cursor: pointer; }
 .cbox .badge { position: absolute; right: -8px; top: -8px; background: var(--err); color: #fff; border-radius: 10px; font-size: 11px; padding: 0 6px; line-height: 18px; }
 .legend { position: sticky; left: 8px; bottom: 8px; float: left; margin: 8px; font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--panel) 85%, transparent); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; display: flex; gap: 12px; flex-wrap: wrap; z-index: 2; }
 .legend span { display: inline-flex; align-items: center; gap: 5px; }
+.pkgbar { position: sticky; top: 0; left: 0; z-index: 3; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; padding: 6px 10px; background: color-mix(in srgb, var(--panel) 92%, transparent); border-bottom: 1px solid var(--line); font-size: 13px; }
+.pkgbar .crumb { border: 0; background: none; color: var(--obj); font: inherit; font-family: var(--mono); padding: 2px 4px; border-radius: 4px; cursor: pointer; }
+.pkgbar .crumb:hover { background: var(--line); }
+.pkgbar .crumb.cur { color: var(--ink); font-weight: 600; cursor: default; background: none; }
+.pkgbar .sep { color: var(--muted); }
+.pbox { position: absolute; width: 156px; cursor: grab; user-select: none; touch-action: none; }
+.pbox .ptab { width: 56px; height: 12px; background: var(--card); border: 1.5px solid var(--muted); border-bottom: 0; border-radius: 4px 4px 0 0; }
+.pbox .pbody { background: var(--card); border: 1.5px solid var(--muted); border-radius: 0 4px 4px 4px; box-shadow: var(--shadow); min-height: 54px; }
+.pbox .chead { color: var(--muted); padding: 3px 8px 0; font-size: 11px; letter-spacing: .04em; min-height: 6px; }
+.pbox .cname { font-family: var(--mono); font-weight: 600; padding: 6px 8px 12px; text-align: center; word-break: break-word; }
+.pbox.up .pbody { border-style: dashed; } .pbox.up .ptab { border-style: dashed; } .pbox.up .cname { color: var(--muted); font-weight: 400; }
+.pbox:focus-visible { outline: 2px solid var(--obj); outline-offset: 2px; }
 .hint-empty { position: absolute; left: 24px; top: 24px; color: var(--muted); max-width: 34ch; }
 
 /* Editor */
@@ -216,6 +228,25 @@ table.insp tr.from td { color: var(--muted); font-family: var(--ui); font-size: 
 .gfx-win:focus-within { border-color: var(--accent); }
 .gfx-stage { position: relative; width: 100%; background: #fff; touch-action: none; }
 .gfx-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.sw-body { background: #eeeeee; color: #1d1d1d; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; display: grid; overflow: auto; }
+.sw-root { min-height: 100%; }
+.sw-win[hidden] { display: none; }
+.sw-panel { min-width: 0; min-height: 0; }
+.sw-btn { font: inherit; color: #1d1d1d; padding: 4px 12px; min-height: 26px; border: 1px solid #8e8f8f; border-radius: 4px; background: linear-gradient(#ffffff, #dcdcdc); cursor: pointer; white-space: nowrap; }
+.sw-btn:hover:not(:disabled) { background: linear-gradient(#ffffff, #e9eef5); border-color: #6382be; }
+.sw-btn:active:not(:disabled) { background: linear-gradient(#d4d8de, #eef0f2); }
+.sw-btn:focus-visible, .sw-tf:focus, .sw-ta:focus { outline: 2px solid #7aa7e9; outline-offset: 0; }
+.sw-btn:disabled { color: #9a9a9a; cursor: default; }
+.sw-lbl { white-space: pre; display: flex; align-items: center; min-height: 18px; }
+.sw-tf, .sw-ta { font: inherit; color: #1d1d1d; background: #fff; border: 1px solid #a5acb5; border-radius: 2px; padding: 3px 5px; min-width: 0; box-sizing: border-box; }
+.sw-tf[readonly], .sw-ta[readonly] { background: #f4f4f4; }
+.sw-ta { resize: none; font-family: ui-monospace, monospace; }
+.sw-cb { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.sw-off { opacity: .6; }
+.sw-scroll { min-height: 0; border: 1px solid #a5acb5; background: #fff; }
+.sw-scroll > * { border: 0 !important; }
+.sw-legend { position: absolute; top: 2px; left: 8px; font-size: 12px; color: #333; }
+[data-layout="border"] > .sw-ta, [data-layout="grid"] > .sw-ta, [data-layout="scroll"] > .sw-ta { width: 100%; height: 100%; }
 .gfx-status { padding: 4px 10px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); font-family: var(--mono); }
 .toast.err { background: var(--err); color: #fff; }
 textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px; box-sizing: border-box; white-space: pre; }
@@ -267,6 +298,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 
   <main class="work">
     <section class="diagram" id="diagram" aria-label="Klassendiagramm">
+      <nav class="pkgbar" id="pkgBar" aria-label="Paket" hidden></nav>
       <div class="canvas" id="canvas">
         <svg id="arrows" aria-hidden="true">
           <defs>
@@ -358,6 +390,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 <script src="lib/jszip.min.js"></script>
 <script src="interp.js"></script>
 <script src="aplu.js"></script>
+<script src="swing.js"></script>
 <script src="gfx.js"></script>
 <script src="examples.js"></script>
 <script src="edtools.js"></script>

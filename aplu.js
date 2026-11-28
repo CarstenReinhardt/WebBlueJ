@@ -87,6 +87,7 @@ R.Runtime.extensions.push(function (rt) {
     toString(rt, o) { return `java.awt.Font[family=${o.native.family},style=${o.native.style},size=${o.native.size}]`; },
   });
   const fontCss = (f) => `${f.style & 2 ? 'italic ' : ''}${f.style & 1 ? 'bold ' : ''}${f.size}px ${/^(serif)$/i.test(f.family) ? 'Georgia, serif' : /mono/i.test(f.family) ? 'ui-monospace, monospace' : 'system-ui, sans-serif'}`;
+  rt.awt = { toColor: (v, line) => toColor(v, line), fontCss: (f) => fontCss(f), colorObj: (...c) => colorObj(...c) };   // für swing.js
 
   // ------------------------------------------------------------ Eingabe
   function ask(promptText, title) {
