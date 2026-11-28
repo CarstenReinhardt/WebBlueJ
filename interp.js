@@ -22,6 +22,9 @@ class Suspend {
   // sync(rt) → Ergebnis sofort (verschachtelter Lauf, z. B. toString() in einer Ausgabe)
   constructor(start, sync) { this.start = start; this.sync = sync; }
 }
+// Eingebaute Methode, die eigenen Code aufruft (z. B. forEach mit einem Lambda): Der
+// Generator g wird an der Aufrufstelle mit yield* ausgeführt (unterbrechbar).
+class Delegate extends Suspend { constructor(g) { super(() => Promise.reject(new Error('Delegate')), (rt) => rt.runSync(g)); this.g = g; } }
 // Enthält ein Ausdruck keinen Aufruf von eigenem Java-Code, ist er „rein“ und wird
 // ohne Generator ausgewertet. Aufrufstellen, die bisher immer bei einer eingebauten
 // Methode landeten (z. B. s.length(), Math.random()), gelten als rein (e.$n === true).
@@ -35,6 +38,8 @@ function isPure(e) {
 }
 function computePure(e) {
   if (e.k === 'New' || e.k === 'CtorCall') return false;
+  if (e.k === 'Lambda') return true;
+  if (e.k === 'MethodRef') return isPure(e.target);
   if (e.k === 'Call' && e.$n !== true) return false;
   for (const key in e) {
     if (key === 'type' || key === 'elem' || key === 'line' || key[0] === '$') continue;
@@ -208,7 +213,12 @@ const BIN = [['||'], ['&&'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=',
 const visOf = (m) => m.has('public') ? 'public' : m.has('private') ? 'private' : m.has('protected') ? 'protected' : 'package';
 
 class Parser {
-  constructor(src) { const r = lex(src); this.toks = r.toks; this.docs = r.docs; this.p = 0; }
+  constructor(src) {
+    const r = lex(src); this.toks = r.toks; this.docs = r.docs; this.p = 0;
+    this.extra = [];      // verschachtelte, lokale und anonyme Klassen (werden hinter der äußeren Klasse eingereiht)
+    this.clsStack = [];   // gerade gelesene Klassen (innen zuletzt)
+    this.anonN = new Map();
+  }
   get tok() { return this.toks[this.p]; }
   peek(k = 1) { return this.toks[Math.min(this.p + k, this.toks.length - 1)]; }
   is(v) { const t = this.tok; return (t.t === 'op' || t.t === 'kw') && t.v === v; }
@@ -238,7 +248,7 @@ class Parser {
   parseUnit() {
     const classes = [];
     while (this.is('package') || this.is('import')) { while (!this.is(';')) { if (this.tok.t === 'eof') this.fail("';' erwartet"); this.p++; } this.p++; }
-    while (this.tok.t !== 'eof') { if (this.accept(';')) continue; classes.push(this.parseTypeDecl()); }
+    while (this.tok.t !== 'eof') { if (this.accept(';')) continue; classes.push(this.parseTypeDecl()); classes.push(...this.extra.splice(0)); }
     return classes;
   }
   parseModifiers() {
@@ -256,9 +266,9 @@ class Parser {
     do { names.push(this.ident('Typparameter')); if (this.accept('extends')) { this.parseType(); while (this.accept('&')) this.parseType(); } } while (this.accept(','));
     this.expect('>'); return names;
   }
-  parseTypeDecl() {
-    const doc = this.docs[this.p];
-    const mods = this.parseModifiers(); const line = this.tok.line;
+  parseTypeDecl(pre) {
+    const doc = pre ? pre.doc : this.docs[this.p];
+    const mods = pre ? pre.mods : this.parseModifiers(); const line = pre ? pre.line : this.tok.line;
     let kind;
     if (this.accept('class')) kind = 'class'; else if (this.accept('interface')) kind = 'interface'; else if (this.accept('enum')) kind = 'enum';
     else this.fail("'class' erwartet");
@@ -271,14 +281,23 @@ class Parser {
     const decl = { kind, name, superName, superArgs, interfaces, mods, typeParams, fields: [], methods: [], ctors: [], inits: [], enumConsts: [], line, doc };
     if (!this.is('{')) this.fail("'{' erwartet");
     this.p++;
+    this.clsStack.push(decl);
     if (kind === 'enum') this.parseEnumConsts(decl);
     while (!this.is('}')) {
       if (this.tok.t === 'eof') throw new JavaError(`'}' am Ende der Klasse ${name} fehlt`, this.tok.line);
       this.parseMember(decl);
     }
+    this.clsStack.pop();
     decl.endLine = this.tok.line;
     this.p++;
     return decl;
+  }
+  // Klasse innerhalb einer anderen Klasse (kind: 'member'), in einer Methode ('local') oder anonym ('anon')
+  nested(nd, kind) {
+    const cur = this.clsStack[this.clsStack.length - 1];
+    nd.$outerDecl = cur; nd.nestKind = kind; nd.simpleName = nd.name;
+    this.extra.push(nd);
+    return nd;
   }
   parseEnumConsts(decl) {
     while (this.tok.t === 'id') {
@@ -295,7 +314,11 @@ class Parser {
     const doc = this.docs[this.p]; const line = this.tok.line;
     const mods = this.parseModifiers();
     if (this.is('{')) { decl.inits.push({ static: mods.has('static'), body: this.parseBlock(), line }); return; }
-    if (this.is('class') || this.is('interface') || this.is('enum')) throw new JavaError('Innere Klassen werden nicht unterstützt – lege dafür eine eigene Klasse an', line);
+    if (this.is('class') || this.is('interface') || this.is('enum')) {
+      const nd = this.nested(this.parseTypeDecl({ mods, doc, line }), 'member');
+      nd.staticNested = mods.has('static') || nd.kind !== 'class' || decl.kind === 'interface';
+      return;
+    }
     const typeParams = this.is('<') ? this.parseTypeParams() : [];
     if (this.tok.t === 'id' && this.tok.v === decl.name && this.isAt(1, '(')) {
       this.p++;
@@ -353,14 +376,16 @@ class Parser {
     return ps;
   }
   parseType() {
-    const t = this.tok; let name;
+    const t = this.tok; let name, qual = null;
     if (t.t === 'kw' && PRIMS.has(t.v)) { name = t.v; this.p++; }
-    else if (t.t === 'id') { name = t.v; this.p++; while (this.is('.') && this.peek().t === 'id') { this.p += 2; name = this.toks[this.p - 1].v; } }
+    else if (t.t === 'id') { name = t.v; this.p++; while (this.is('.') && this.peek().t === 'id') { this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
     else this.fail('Typ erwartet');
     let args = null;
     if (this.is('<')) args = this.parseTypeArgs();
     let dims = 0; while (this.is('[') && this.isAt(1, ']')) { this.p += 2; dims++; }
-    return { name, dims, args };
+    const r = { name, dims, args };
+    if (qual && /^[A-Z]/.test(qual)) r.qual = qual;   // Aussen.Innen
+    return r;
   }
   parseTypeArgs() {
     this.expect('<'); const args = [];
@@ -405,7 +430,11 @@ class Parser {
       case 'switch': return this.parseSwitch();
       case 'else': this.fail("'else' ohne passendes 'if'");
       case 'case': case 'default': this.fail("'case' außerhalb von switch");
-      case 'class': case 'interface': case 'enum': this.fail('Klassen können nicht innerhalb von Methoden definiert werden');
+      case 'class': case 'interface': case 'enum': {
+        if (!this.clsStack.length) this.fail('Klassen können hier nicht definiert werden');
+        const nd = this.nested(this.parseTypeDecl(), 'local');
+        return { k: 'LocalClass', name: nd.name, line };
+      }
       case 'public': case 'private': case 'protected': case 'static':
         throw new JavaError(`'${t.v}' ist hier nicht erlaubt – fehlt vorher eine schließende Klammer '}'?`, line);
     }
@@ -543,7 +572,7 @@ class Parser {
       if (t.v === '++' || t.v === '--') { this.p++; const e = this.parseUnary(); if (!['Name', 'Field', 'Index'].includes(e.k)) throw new JavaError(`${t.v} braucht eine Variable`, line); return { k: 'PreInc', op: t.v, e, line }; }
       if (t.v === '-' && this.peek().t === 'num' && this.peek().jt === 'int' && this.peek().v === 2147483648) { this.p += 2; return { k: 'Lit', v: -2147483648, line }; }
       if (t.v === '-' || t.v === '+' || t.v === '!' || t.v === '~') { this.p++; const e = this.parseUnary(); return { k: 'Unary', op: t.v, e, line }; }
-      if (t.v === '(') { const c = this.tryCast(); if (c) return c; }
+      if (t.v === '(') { const l = this.tryLambda(); if (l) return l; const c = this.tryCast(); if (c) return c; }
     }
     let e = this.parsePostfix(this.parsePrimary());
     while (this.is('++') || this.is('--')) {
@@ -551,6 +580,27 @@ class Parser {
       e = { k: 'PostInc', op: this.tok.v, e, line: this.tok.line }; this.p++;
     }
     return e;
+  }
+  // Lambda-Ausdruck: (a, b) -> …, (int a) -> { … }, () -> …
+  tryLambda() {
+    let d = 0, k = this.p;
+    for (; k < this.toks.length; k++) { const x = this.toks[k]; if (x.t === 'eof') return null; if (x.t === 'op' && x.v === '(') d++; else if (x.t === 'op' && x.v === ')') { if (--d === 0) break; } }
+    const nx = this.toks[k + 1];
+    if (!nx || nx.t !== 'op' || nx.v !== '->') return null;
+    const line = this.tok.line; this.p++;
+    const params = [];
+    if (!this.is(')')) {
+      do {
+        if (this.tok.t === 'id' && (this.isAt(1, ',') || this.isAt(1, ')'))) params.push({ name: this.ident(), type: null });
+        else { this.parseModifiers(); let type = this.parseType(); if (type.name === 'var') type = null; const name = this.ident('Parametername'); params.push({ name, type }); }
+      } while (this.accept(','));
+    }
+    this.expect(')'); this.expect('->');
+    return this.lambdaBody(params, line);
+  }
+  lambdaBody(params, line) {
+    if (this.is('{')) return { k: 'Lambda', params, body: this.parseBlock(), expr: false, line };
+    return { k: 'Lambda', params, body: this.parseExpr(), expr: true, line };
   }
   tryCast() {
     const save = this.p, line = this.tok.line; this.p++;
@@ -584,6 +634,7 @@ class Parser {
           return this.parsePrimary();
         }
         this.p++;
+        if (this.is('->')) { this.p++; return this.lambdaBody([{ name: t.v, type: null }], line); }
         if (this.is('(')) return { k: 'Call', obj: null, name: t.v, args: this.parseArgs(), line };
         return { k: 'Name', name: t.v, line };
       case 'kw':
@@ -616,14 +667,20 @@ class Parser {
         if (this.is('<')) this.parseTypeArgs();
         const line = this.tok.line;
         if (this.is('class')) this.fail('.class wird nicht unterstützt');
+        if (this.is('this') && e.k === 'Name') { this.p++; e = { k: 'OuterThis', name: e.name, line }; continue; }
         const nm = this.ident('Name nach dem Punkt');
         if (this.is('(')) e = { k: 'Call', obj: e, name: nm, args: this.parseArgs(), line };
         else e = { k: 'Field', obj: e, name: nm, line };
         continue;
       }
       if (this.is('[')) { const line = this.tok.line; this.p++; const idx = this.parseExpr(); this.expect(']'); e = { k: 'Index', arr: e, idx, line }; continue; }
-      if (this.is('::')) this.fail('Methodenreferenzen (::) werden nicht unterstützt');
-      if (this.is('->')) this.fail('Lambda-Ausdrücke werden nicht unterstützt');
+      if (this.is('::')) {
+        const line = this.tok.line; this.p++;
+        const nm = this.accept('new') ? 'new' : this.ident('Methodenname nach ::');
+        e = { k: 'MethodRef', target: e, name: nm, line };
+        continue;
+      }
+      if (this.is('->')) this.fail('Lambda-Ausdruck an dieser Stelle nicht möglich');
       break;
     }
     return e;
@@ -636,9 +693,9 @@ class Parser {
   }
   parseNew() {
     const line = this.tok.line; this.p++;
-    const t = this.tok; let name;
+    const t = this.tok; let name, qual = null;
     if (t.t === 'kw' && PRIMS.has(t.v)) { name = t.v; this.p++; }
-    else { name = this.ident('Klassenname nach new'); while (this.is('.') && this.peek().t === 'id') { this.p += 2; name = this.toks[this.p - 1].v; } }
+    else { name = this.ident('Klassenname nach new'); while (this.is('.') && this.peek().t === 'id') { this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
     let targs = null; if (this.is('<')) targs = this.parseTypeArgs();
     if (this.is('[')) {
       const dims = []; let extra = 0;
@@ -655,8 +712,27 @@ class Parser {
     if (PRIMS.has(name)) this.fail("'[' erwartet");
     if (!this.is('(')) this.fail(`'(' erwartet nach new ${name}`);
     const args = this.parseArgs();
-    if (this.is('{')) this.fail('Anonyme Klassen werden nicht unterstützt');
-    return { k: 'New', type: T(name, 0, targs), args, line };
+    const type = T(name, 0, targs); if (qual && /^[A-Z]/.test(qual)) type.qual = qual;
+    if (this.is('{')) return { k: 'New', type, args, line, anon: this.parseAnonBody(name, line) };
+    return { k: 'New', type, args, line };
+  }
+  // Rumpf einer anonymen Klasse: new Basis(…) { … }
+  parseAnonBody(base, line) {
+    if (!this.clsStack.length) this.fail('Anonyme Klassen sind hier nicht möglich (nur innerhalb einer Klasse)');
+    const top = this.clsStack[0].name, n = (this.anonN.get(top) || 0) + 1; this.anonN.set(top, n);
+    const name = top + '$' + n;
+    const decl = { kind: 'class', name, superName: null, superArgs: null, anonBase: base, interfaces: [], mods: new Set(), typeParams: [], fields: [], methods: [], ctors: [], inits: [], enumConsts: [], line, doc: null };
+    this.nested(decl, 'anon');
+    this.p++;
+    this.clsStack.push(decl);
+    while (!this.is('}')) {
+      if (this.tok.t === 'eof') throw new JavaError("'}' am Ende der anonymen Klasse fehlt", this.tok.line);
+      if (this.is('{') || ((this.tok.t === 'kw') && MODS.has(this.tok.v) && false)) { }
+      this.parseMember(decl);
+    }
+    this.clsStack.pop();
+    decl.endLine = this.tok.line; this.p++;
+    return name;
   }
 }
 
@@ -749,12 +825,46 @@ class Runtime {
       }
     }
     if (errors.length) return { ok: false, errors };
+    this.qualifyNested(decls);
     try { this.buildClasses(decls, false, errors); }
     catch (e) { if (e instanceof JavaError) errors.push({ fileId: e.fileId, line: e.line, message: e.message }); else throw e; }
     if (errors.length) return { ok: false, errors };
-    for (const c of this.userClasses) new Checker(this, c, errors).run();
+    for (const c of this.userClasses) if (c.nestKind !== 'local' && c.nestKind !== 'anon') new Checker(this, c, errors).run();
     if (errors.length) return { ok: false, errors };
     return { ok: true, errors: [] };
+  }
+  // Verschachtelte Klassen werden unter ihrem einfachen Namen geführt. Gibt es den Namen
+  // mehrfach (z. B. zwei Klassen mit je einer inneren Klasse Knoten) oder ist er schon von
+  // Java belegt, heißt die innere Klasse „Aussen.Innen“; Verweise innerhalb der äußeren
+  // Klasse und Verweise der Form Aussen.Innen werden darauf umgestellt.
+  qualifyNested(decls) {
+    const count = new Map();
+    for (const d of decls) count.set(d.name, (count.get(d.name) || 0) + 1);
+    const depth = (d) => { let n = 0; for (let x = d.$outerDecl; x; x = x.$outerDecl) n++; return n; };
+    const todo = decls.filter(d => (d.nestKind === 'member' || d.nestKind === 'local') && (count.get(d.name) > 1 || (this.builtinClasses.has(d.name) && !(this.builtinClasses.get(d.name).native || {}).lib)));
+    todo.sort((a, b) => depth(a) - depth(b));
+    const walk = (x, fn) => {
+      if (!x || typeof x !== 'object' || x instanceof Set) return;
+      if (Array.isArray(x)) { for (const y of x) walk(y, fn); return; }
+      fn(x);
+      for (const k in x) { if (k[0] === '$') continue; const v = x[k]; if (v && typeof v === 'object') walk(v, fn); }
+    };
+    for (const d of todo) {
+      const outer = d.$outerDecl, old = d.name, nw = outer.name + '.' + d.simpleName, oq = outer.simpleName || outer.name;
+      const inFamily = (x) => { for (let y = x; y; y = y.$outerDecl) if (y === outer) return true; return false; };
+      for (const x of decls) {
+        const fam = inFamily(x);
+        if (fam && x !== d) { if (x.superName === old) x.superName = nw; if (x.anonBase === old) x.anonBase = nw; x.interfaces = x.interfaces.map(n => n === old ? nw : n); }
+        walk([x.fields, x.methods, x.ctors, x.inits, x.enumConsts, x.superArgs], (n) => {
+          if (typeof n.name === 'string' && n.name === old && 'dims' in n && (fam ? (!n.qual || n.qual === oq) : n.qual === oq)) { n.name = nw; delete n.qual; }
+          if (!fam) return;
+          if ((n.k === 'Name' || n.k === 'LocalClass' || n.k === 'OuterThis') && n.name === old) n.name = nw;
+          if (n.k === 'New' && n.anon === undefined && n.type && n.type.name === old) n.type.name = nw;
+          if (Array.isArray(n.types) && n.body) n.types = n.types.map(t => t === old ? nw : t);
+        });
+      }
+      d.name = nw;
+    }
   }
   buildClasses(decls, builtin, errors) {
     const made = [];
@@ -765,11 +875,22 @@ class Runtime {
       if (this.classes.has(d.name)) fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : `Klasse '${d.name}' gibt es doppelt`);
       const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : 'java.lang')) : null });
       c.fileId = d.fileId;
+      if (d.nestKind) { c.nestKind = d.nestKind; c.staticNested = !!d.staticNested; }
       this.classes.set(d.name, c); made.push(c);
     }
     const obj = this.classes.get('Object');
     for (const c of made) {
       const d = c.decl;
+      if (d.$outerDecl) {
+        c.outer = this.classes.get(d.$outerDecl.name);
+        if (!c.outer.nestedMap) c.outer.nestedMap = new Map();
+        c.outer.nestedMap.set(d.simpleName, c);
+      }
+      if (d.anonBase) {
+        const b = this.classes.get(d.anonBase);
+        if (!b) fail(d, d.line, `Klasse oder Interface '${d.anonBase}' nicht gefunden` + suggest(d.anonBase, [...this.classes.keys()]));
+        if (b.isInterface) d.interfaces = [b.name]; else d.superName = b.name;
+      }
       if (d.superName) {
         const s = this.classes.get(d.superName);
         if (!s) fail(d, d.line, `Oberklasse '${d.superName}' nicht gefunden` + suggest(d.superName, [...this.classes.keys()]));
@@ -824,7 +945,7 @@ class Runtime {
         this.userClasses.push(c);
         if (c.isAbstract) continue;
         const missing = this.missingAbstract(c);
-        if (missing) { const e = new JavaError(`Klasse ${c.name} ist nicht abstract und überschreibt die abstrakte Methode ${missing.name}(${missing.params.map(p => typeStr(p.type)).join(', ')}) aus ${missing.cls.name} nicht`, c.decl.line); e.fileId = c.fileId; if (errors) errors.push({ fileId: c.fileId, line: c.decl.line, message: e.message }); else throw e; }
+        if (missing) { const sig = `${missing.name}(${missing.params.map(p => typeStr(p.type)).join(', ')})`; const e = new JavaError(c.nestKind === 'anon' ? `Die anonyme Klasse new ${c.decl.anonBase}(…) { … } muss die Methode ${sig} aus ${missing.cls.name} implementieren` : `Klasse ${c.name} ist nicht abstract und überschreibt die abstrakte Methode ${sig} aus ${missing.cls.name} nicht`, c.decl.line); e.fileId = c.fileId; if (errors) errors.push({ fileId: c.fileId, line: c.decl.line, message: e.message }); else throw e; }
       }
     }
   }
@@ -972,16 +1093,24 @@ class Runtime {
   // unterbrechbarer Lauf (io.runEvent). Läuft eines (es ist zwischen zwei Zeitscheiben
   // pausiert), wird der Aufruf sofort dazwischen ausgeführt – wie im Java-Ereignis-Thread.
   fireEvent(obj, name, args, label) {
-    const m = this.lookupMethods(obj.cls, name).find(x => !x.abstract && !x.static && x.params.length === args.length);
-    if (!m) return;
+    let gen;
+    if (obj.lambda) {
+      const fm = this.functionalMethod(obj.cls);
+      if (fm && fm.name !== name) return;
+      gen = () => this.callLambdaG(obj, args, 0);
+    } else {
+      const m = this.lookupMethods(obj.cls, name).find(x => !x.abstract && !x.static && x.params.length === args.length);
+      if (!m) return;
+      gen = () => this.callMethodG(obj, m, args);
+    }
     const io = this.io;
     if (this.task) {
-      const r = this.run(() => this.callMethod(obj, m, args));
+      const r = this.run(() => this.runSync(gen()));
       if (io.onEvent) { try { io.onEvent(r, label || name); } catch (e) { } }
       return;
     }
-    if (io.runEvent) { io.runEvent(() => this.callMethodG(obj, m, args), label || name); return; }
-    this.runAsync(() => this.callMethodG(obj, m, args));
+    if (io.runEvent) { io.runEvent(gen, label || name); return; }
+    this.runAsync(gen);
   }
   // Laufendes Programm beenden (Knopf „Beenden“). Der Generator wird einfach
   // nicht weiter ausgeführt; der Aufrufstapel wird zurückgesetzt.
@@ -1061,9 +1190,141 @@ class Runtime {
     return this.coerce(yield* this.geval(init, ctx), type, init.line);
   }
 
+  // ------------------------------------------------ Lambdas und Methodenreferenzen
+  // Ein Lambda ist ein Objekt des Ziel-Interfaces (z. B. Comparator) mit o.lambda:
+  // { e, env, self, cls } (Lambda-Ausdruck), { ref } (Methodenreferenz) oder { native(rt, args) }.
+  makeLambda(iface, L) {
+    const o = new JObject(this.classes.get(iface) || this.classes.get('Object'));
+    o.lambda = L;
+    return o;
+  }
+  nativeLambda(iface, fn) { return this.makeLambda(iface, { native: fn }); }
+  // Die eine abstrakte Methode eines funktionalen Interfaces (sonst null)
+  functionalMethod(c) {
+    if (!c || !c.isInterface) return null;
+    if (c.$fm !== undefined) return c.$fm;
+    const abs = new Map(), seen = new Set();
+    const visit = (k) => { if (!k || seen.has(k)) return; seen.add(k); for (const m of k.methodList) if (m.abstract && !m.static && !['equals', 'hashCode', 'toString'].includes(m.name)) { const key = m.name + '/' + m.params.length; if (!abs.has(key)) abs.set(key, m); } k.interfaces.forEach(visit); };
+    visit(c);
+    return (c.$fm = abs.size === 1 ? [...abs.values()][0] : null);
+  }
+  *callLambdaG(o, args, line) {
+    const L = o.lambda;
+    if (L.native) { const r = L.native(this, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
+    if (L.ref) return yield* this.callRefG(L.ref, args, line);
+    const e = L.e;
+    if (e.params.length !== args.length) this.rtError(`Der Lambda-Ausdruck erwartet ${e.params.length} Parameter, übergeben wurden ${args.length}`, line);
+    if (++this.depth > this.maxDepth) { this.depth = 0; this.throwJava('StackOverflowError'); }
+    const env = new Env(L.env);
+    for (let i = 0; i < args.length; i++) { const p = e.params[i]; env.declare(p.name, p.type, p.type ? this.coerce(args[i], p.type, line) : args[i]); }
+    const ctx = { self: L.self, cls: L.cls, env, isStatic: L.isStatic, method: null, lambda: true };
+    this.callStack.push({ cls: L.cls ? L.cls.name : '?', method: 'lambda$', callLine: this.line });
+    const fm = this.functionalMethod(o.cls);
+    const ret = fm && fm.ret && fm.ret.name !== 'void' && (PRIMS.has(fm.ret.name) || fm.ret.name === 'String') ? fm.ret : null;
+    try {
+      if (++this.steps >= this.nextYield) yield TICK;
+      let v;
+      if (e.expr) { this.line = e.body.line; v = isPure(e.body) ? this.eval(e.body, ctx) : yield* this.geval(e.body, ctx); }
+      else { this.line = e.body.line; yield* this.execList(e.body.stmts, ctx); v = undefined; }
+      return ret && v !== undefined ? this.coerce(v, ret, this.line) : v;
+    } catch (x) {
+      if (x instanceof ReturnSig) return ret && x.value !== undefined ? this.coerce(x.value, ret, this.line) : x.value;
+      throw x;
+    } finally { this.depth--; this.callStack.pop(); this.line = line; }
+  }
+  // Klasse::methode, objekt::methode, Klasse::new
+  *callRefG(R, args, line) {
+    const t = R.target, name = R.name;
+    if (t instanceof JClassRef) {
+      const c = t.cls;
+      if (name === 'new') return yield* this.instantiateG(c, args, line, T(c.name), null);
+      if (c.native) {
+        const f = c.native.statics && c.native.statics[name];
+        if (f) { const r = f(this, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
+      } else if (!(c.isEnum && ['values', 'valueOf'].includes(name))) {
+        const ms = this.lookupMethods(c, name);
+        const st = ms.filter(m => m.static && m.params.length === args.length);
+        if (st.length) return yield* this.invokeG(this.selectOverload(st, args, name, line), null, args, line);
+        if (!ms.length && !['toString', 'equals', 'hashCode', 'compareTo', 'name', 'ordinal'].includes(name)) this.rtError(`Klasse ${c.name} hat keine Methode '${name}'`, line);
+      } else return yield* this.callOnG(t, name, args, line, null);
+      // Objektmethode: das erste Argument ist das Objekt
+      if (!args.length) this.rtError(`${c.name}::${name} braucht ein Objekt als ersten Wert`, line);
+      return yield* this.callOnG(args[0], name, args.slice(1), line, null);
+    }
+    return yield* this.callOnG(t, name, args, line, null);
+  }
+  // Methode eines Lambda-Objekts: Methoden von Object, default-Methoden des Interfaces,
+  // sonst die funktionale Methode
+  *lambdaMethodG(o, name, args, line) {
+    const ms = this.lookupMethods(o.cls, name).filter(m => !m.abstract && m.params.length === args.length);
+    if (ms.length) { const m = this.selectOverload(ms, args, name, line); return yield* this.invokeG(m, m.static ? null : o, args, line); }
+    if (['equals', 'hashCode', 'toString', 'getClass'].includes(name) && !this.lookupMethods(o.cls, name).length) return this.objectMethod(o, name, args, line);
+    const fm = this.functionalMethod(o.cls);
+    if (fm && fm.name !== name && o.cls.name !== 'Object') this.rtError(`Methode '${name}' gibt es für ${o.cls.name} nicht`, line);
+    return yield* this.callLambdaG(o, args, line);
+  }
+  // Funktionales Objekt (Lambda oder Objekt einer eigenen Klasse) synchron aufrufen,
+  // z. B. beim Sortieren mit einem Comparator
+  callFn(f, name, args) {
+    if (f === null || f === undefined) this.npe(name + '() auf null');
+    if (f instanceof JObject && f.lambda) return this.runSync(this.lambdaMethodG(f, name, args, this.line));
+    return this.runSync(this.callOnG(f, name, args, this.line, null));
+  }
+  *fnG(f, name, args, line) {
+    if (f === null || f === undefined) this.npe(name + '() auf null');
+    if (f instanceof JObject && f.lambda) return yield* this.lambdaMethodG(f, name, args, line || this.line);
+    return yield* this.callOnG(f, name, args, line || this.line, null);
+  }
+  // Vergleichsfunktion für sort: natürliche Ordnung oder Comparator
+  cmpOf(c) {
+    if (c === null || c === undefined) return (x, y) => this.compareValues(x, y);
+    return (x, y) => this.toInt(this.callFn(c, 'compare', [x, y]));
+  }
+
   // ------------------------------------------------ Objekte erzeugen
   instantiate(cls, args, line, type) { return this.runSync(this.instantiateG(cls, args, line, type)); }
-  *instantiateG(cls, args, line, type) {
+  topOf(c) { while (c && c.outer) c = c.outer; return c; }
+  // Objekt der umgebenden Klasse, zu dem o (auf Ebene der Klasse c) gehört
+  outerObj(o, c) { return o && o.outers ? o.outers.get(c) || null : null; }
+  // Innere, lokale und anonyme Klassen: das umgebende Objekt und die eingefangenen
+  // lokalen Variablen merken (je Klassenebene, falls eine solche Klasse erweitert wird)
+  bindOuter(obj, cls, ctx) {
+    for (let c = cls; c && c.decl; c = c.superClass) {
+      if (!c.outer || c.staticNested) continue;
+      if (!obj.outers) obj.outers = new Map();
+      if (c.nestKind === 'member') {
+        let o = ctx ? ctx.self : null, k = ctx ? ctx.cls : null;
+        while (o && !o.cls.isSubclassOf(c.outer)) { o = this.outerObj(o, k); k = k && k.outer; }
+        obj.outers.set(c, o || null);
+      } else {
+        obj.outers.set(c, ctx && !ctx.isStatic ? ctx.self : null);
+        if (!obj.caps) obj.caps = new Map();
+        obj.caps.set(c, ctx ? ctx.env : null);
+      }
+    }
+  }
+  // Name außerhalb der eigenen Klasse suchen: eingefangene lokale Variablen, dann die
+  // Attribute der umgebenden Klassen (von innen nach außen)
+  outerName(ctx, name) {
+    let c = ctx.cls, o = ctx.self;
+    while (c && c.outer) {
+      const cap = o && o.caps ? o.caps.get(c) : null;
+      if (cap) { const v = cap.lookup(name); if (v) return { local: v }; }
+      o = this.outerObj(o, c); c = c.outer;
+      const f = this.findField(c, name);
+      if (f) return { f, self: o };
+    }
+    return null;
+  }
+  outerThis(e, ctx) {
+    const target = this.classes.get(e.name);
+    if (!target) this.rtError(`Klasse '${e.name}' nicht gefunden`, e.line);
+    let o = ctx.self, k = ctx.cls;
+    while (o && !o.cls.isSubclassOf(target)) { o = this.outerObj(o, k); k = k && k.outer; }
+    if (!o) this.rtError(`${e.name}.this gibt es hier nicht`, e.line);
+    return o;
+  }
+  *instantiateG(cls, args, line, type, ctx) {
     if (cls.native) {
       if (!cls.native.ctor) this.rtError(`Von ${cls.name} können keine Objekte mit new erzeugt werden`, line);
       return cls.native.ctor(this, args, line, type);
@@ -1074,6 +1335,7 @@ class Runtime {
     this.ensureStaticInit(cls);
     const obj = new JObject(cls);
     for (let c = cls; c; c = c.superClass) for (const f of c.fieldList) if (!f.static) obj.fields[f.name] = defaultValue(f.type);
+    if (cls.outer || (cls.superClass && cls.superClass.outer)) this.bindOuter(obj, cls, ctx);
     yield* this.runCtorG(cls, obj, args, line);
     return obj;
   }
@@ -1081,7 +1343,8 @@ class Runtime {
     if (cls && cls.native) { if (cls.native.initInstance) cls.native.initInstance(this, obj, args, line); return; }
     if (!cls || !cls.decl) return;
     let ctor = null;
-    if (!cls.ctors.length) { if (args.length) this.rtError(`Klasse ${cls.name} hat keinen Konstruktor mit ${args.length} Parameter(n)`, line); }
+    const anon = !!cls.decl.anonBase;
+    if (!cls.ctors.length) { if (args.length && !anon) this.rtError(`Klasse ${cls.name} hat keinen Konstruktor mit ${args.length} Parameter(n)`, line); }
     else ctor = this.selectOverload(cls.ctors, args, cls.name, line);
     if (++this.depth > this.maxDepth) { this.depth = 0; this.throwJava('StackOverflowError'); }
     this.callStack.push({ cls: cls.name, method: cls.name, callLine: this.line });
@@ -1097,7 +1360,7 @@ class Runtime {
         if (first.e.which === 'super') yield* this.runCtorG(cls.superClass, obj, cargs, first.line);
         else { explicitThis = true; yield* this.runCtorG(cls, obj, cargs, first.line); }
         stmts = stmts.slice(1);
-      } else if (cls.superClass) yield* this.runCtorG(cls.superClass, obj, [], line);
+      } else if (cls.superClass) yield* this.runCtorG(cls.superClass, obj, anon ? args : [], line);
       if (!explicitThis) {
         for (const f of cls.decl.fields) if (!f.static && f.init) { this.line = f.line; obj.fields[f.name] = yield* this.initValueG(f.init, f.type, { self: obj, cls, env: new Env(null), isStatic: false, ctor: true }); }
         for (const b of cls.decl.inits) if (!b.static) yield* this.exec(b.body, ctx);
@@ -1138,6 +1401,12 @@ class Runtime {
     const c = this.classes.get(n);
     if (!c) return 0.5;
     if (v === null) return 1;
+    if (v instanceof JObject && v.lambda && c.isInterface) {
+      if (v.cls === c) return 3;
+      const fm = this.functionalMethod(c); if (!fm) return -1e9;
+      if (v.lambda.e && v.lambda.e.params.length !== fm.params.length) return -1e9;
+      return v.cls.name === 'Object' ? 1 : 0.8;
+    }
     if (v instanceof JObject && v.cls.isSubclassOf(c)) { let d = 0; for (let k = v.cls; k && k !== c; k = k.superClass) d++; return 3 - d * 0.01; }
     if (n === 'Comparable' && (typeof v === 'string' || this.kindOf(v))) return 1;
     return -1e9;
@@ -1182,6 +1451,7 @@ class Runtime {
   }
   invokeVirtual(obj, m, args, line) { return this.runSync(this.invokeVirtualG(obj, m, args, line)); }
   *invokeVirtualG(obj, m, args, line) {
+    if (obj instanceof JObject && obj.lambda && !m.static) return m.abstract ? yield* this.callLambdaG(obj, args, line) : yield* this.invokeG(m, obj, args, line);
     if (m.static || !(obj instanceof JObject) || obj.cls.native) return yield* this.invokeG(m, obj, args, line);
     const sig = m.params.map(p => typeStr(p.type)).join(',');
     const impl = this.lookupMethods(obj.cls, m.name).find(x => !x.abstract && x.params.map(p => typeStr(p.type)).join(',') === sig)
@@ -1223,6 +1493,7 @@ class Runtime {
     const c = this.classes.get(t.name);
     if (!c) return true;
     if (c.name === 'Comparable' && (typeof v === 'string' || this.kindOf(v))) return true;
+    if (v instanceof JObject && v.lambda && c.isInterface && v.cls.name === 'Object') return true;
     return v instanceof JObject && v.cls.isSubclassOf(c);
   }
   num(v, line) {
@@ -1268,6 +1539,7 @@ class Runtime {
         const c = this.classes.get(t.name);
         if (!c) { if (!(v instanceof JClassRef)) return v; break; }
         if (v === null) return v;
+        if (v instanceof JObject && v.lambda && c.isInterface && !v.cls.isSubclassOf(c)) { if (v.cls.name === 'Object' || !this.functionalMethod(v.cls)) v.cls = c; return v; }
         if (v instanceof JObject && v.cls.isSubclassOf(c)) {
           if (v.native && t.args && t.args.length) {
             if (v.native.list && !v.native.elemType) v.native.elemType = t.args[0];
@@ -1330,6 +1602,7 @@ class Runtime {
     return String(v);
   }
   objToString(o) {
+    if (o.lambda) { const m = this.lookupMethods(o.cls, 'toString').find(x => x.params.length === 0 && !x.abstract && !x.static); if (!m) return (o.lambda.cls ? o.lambda.cls.name : 'Lambda') + '$$Lambda@' + idHash(o.id); }
     if (o.cls.native) { if (o.cls.native.toString) return o.cls.native.toString(this, o); return o.cls.fullName + '@' + idHash(o.id); }
     const m = this.lookupMethods(o.cls, 'toString').find(x => x.params.length === 0 && !x.abstract && !x.static);
     if (m) { const r = this.invoke(m, o, [], this.line); return r === null ? 'null' : this.str(r); }
@@ -1397,7 +1670,7 @@ class Runtime {
             this.line = e.line;
             const r = this.nativeFast(o, e.name, args, e.line);
             if (r === NOFAST) { if (e.$n === undefined) e.$n = false; yield* this.callOnG(o, e.name, args, e.line, c2); }
-            else { this.learnNative(e, r); if (r instanceof Suspend) yield r; }
+            else { this.learnNative(e, r); if (r instanceof Suspend) { if (r.g) yield* r.g; else yield r; } }
             if (this.steps >= this.nextYield) yield TICK;
           }
           else yield* this.exec(st, c2);
@@ -1423,7 +1696,7 @@ class Runtime {
             this.line = e.line;
             const r = this.nativeFast(o, e.name, args, e.line);
             if (r === NOFAST) { if (e.$n === undefined) e.$n = false; yield* this.callOnG(o, e.name, args, e.line, ctx); }
-            else { this.learnNative(e, r); if (r instanceof Suspend) yield r; }
+            else { this.learnNative(e, r); if (r instanceof Suspend) { if (r.g) yield* r.g; else yield r; } }
           } else yield* this.evalCallG(e, ctx);
         } else if (e.k === 'Assign') yield* this.evalAssignG(e, ctx); else yield* this.geval(e, ctx); return; }
       case 'Empty': return;
@@ -1473,6 +1746,7 @@ class Runtime {
         return;
       }
       case 'Return': throw new ReturnSig(s.e ? (isPure(s.e) ? this.eval(s.e, ctx) : yield* this.geval(s.e, ctx)) : undefined);
+      case 'LocalClass': return;
       case 'Break': throw BREAK;
       case 'Continue': throw CONTINUE;
       case 'Throw': {
@@ -1590,6 +1864,16 @@ class Runtime {
       case 'Paren': return this.eval(e.e, ctx);
       case 'Name': return this.evalName(e, ctx);
       case 'This': if (!ctx.self) this.rtError("'this' gibt es nicht in einer statischen Methode", e.line); return ctx.self;
+      case 'OuterThis': return this.outerThis(e, ctx);
+      case 'Lambda': return this.makeLambda(e.$iface, { e, env: ctx.env, self: ctx.self, cls: ctx.cls, isStatic: ctx.isStatic });
+      case 'MethodRef': {
+        let target;
+        if (e.target.k === 'Name' && !ctx.env.lookup(e.target.name) && !this.findField(ctx.cls, e.target.name) && this.classes.has(e.target.name)) target = new JClassRef(this.classes.get(e.target.name));
+        else target = this.eval(e.target, ctx);
+        if (target === null) this.npe('Methodenreferenz auf null');
+        if (e.name === 'new' && !(target instanceof JClassRef)) this.rtError('::new geht nur mit einem Klassennamen', e.line);
+        return this.makeLambda(e.$iface, { ref: { target, name: e.name }, cls: ctx.cls });
+      }
       case 'Super': if (!ctx.self) this.rtError("'super' gibt es nicht in einer statischen Methode", e.line); return ctx.self;
       case 'Field': return this.evalField(e, ctx);
       case 'Index': {
@@ -1634,11 +1918,11 @@ class Runtime {
       }
       case 'Call': return yield* this.evalCallG(e, ctx);
       case 'New': {
-        const cls = this.classes.get(e.type.name);
+        const cls = this.classes.get(e.anon || e.type.name);
         if (!cls) this.rtError(`Klasse '${e.type.name}' nicht gefunden`, e.line);
         const args = yield* this.argsG(e.args, ctx);
         this.line = e.line;
-        return yield* this.instantiateG(cls, args, e.line, e.type);
+        return yield* this.instantiateG(cls, args, e.line, e.type, ctx);
       }
       case 'NewArray': {
         const full = { ...e.elem, dims: e.total };
@@ -1695,6 +1979,15 @@ class Runtime {
       if (!ctx.self) this.rtError(`Auf das Attribut '${e.name}' kann in einer statischen Methode nicht zugegriffen werden`, e.line);
       return ctx.self.fields[e.name];
     }
+    if (ctx.cls && ctx.cls.outer) {
+      const r = this.outerName(ctx, e.name);
+      if (r) {
+        if (r.local) { if (r.local.value === UNINIT) this.rtError(`Variable '${e.name}' wurde noch kein Wert zugewiesen`, e.line); return r.local.value; }
+        if (r.f.field.static) return this.getStatic(r.f.owner, r.f.field);
+        if (!r.self) this.rtError(`Auf das Attribut '${e.name}' der äußeren Klasse kann hier nicht zugegriffen werden (kein Objekt der äußeren Klasse)`, e.line);
+        return r.self.fields[e.name];
+      }
+    }
     const c = this.classes.get(e.name);
     if (c) return new JClassRef(c);
     this.rtError(`Variable '${e.name}' nicht gefunden`, e.line);
@@ -1705,7 +1998,7 @@ class Runtime {
     return owner.staticValues[field.name];
   }
   checkAccess(field, owner, ctx, line, what) {
-    if (field.vis === 'private' && ctx.cls !== owner && !(ctx.cls && owner && ctx.cls.name === owner.name)) {
+    if (field.vis === 'private' && ctx.cls !== owner && !(ctx.cls && owner && ctx.cls.name === owner.name) && !(ctx.cls && this.topOf(ctx.cls) === this.topOf(owner))) {
       this.rtError(`${what || 'Attribut'} '${field.name}' ist private in ${owner.name} – Zugriff nur innerhalb der Klasse`, line);
     }
   }
@@ -1721,6 +2014,7 @@ class Runtime {
   fieldOf(o, e, ctx) {
     if (o instanceof JClassRef) {
       const f = this.findField(o.cls, e.name);
+      if (!f && o.cls.nestedMap && o.cls.nestedMap.has(e.name)) return new JClassRef(o.cls.nestedMap.get(e.name));
       if (!f || !f.field.static) this.rtError(f ? `'${e.name}' ist kein statisches Attribut – Zugriff nur über ein Objekt` : `Klasse ${o.cls.name} hat kein Attribut '${e.name}'`, e.line);
       this.checkAccess(f.field, f.owner, ctx, e.line);
       return this.getStatic(f.owner, f.field);
@@ -1788,6 +2082,15 @@ class Runtime {
         this.finalCheck(f, ctx, t.line);
         const o = ctx.self;
         return { type: f.field.type, get() { return o.fields[t.name]; }, set(x) { o.fields[t.name] = x; } };
+      }
+      const r = ctx.cls && ctx.cls.outer ? this.outerName(ctx, t.name) : null;
+      if (r) {
+        if (r.local) this.rtError(`Die lokale Variable '${t.name}' kann hier nicht verändert werden (sie muss final oder effektiv final sein)`, t.line);
+        if (r.f.field.static) return this.staticRef(r.f, ctx, t.line);
+        if (!r.self) this.rtError(`Auf das Attribut '${t.name}' der äußeren Klasse kann hier nicht zugegriffen werden`, t.line);
+        this.finalCheck(r.f, ctx, t.line);
+        const o = r.self;
+        return { type: r.f.field.type, get() { return o.fields[t.name]; }, set(x) { o.fields[t.name] = x; } };
       }
       this.rtError(`Variable '${t.name}' nicht gefunden`, t.line);
     }
@@ -1929,9 +2232,23 @@ class Runtime {
     const line = e.line;
     if (e.obj === null) {
       const ms = this.lookupMethods(ctx.cls, e.name);
-      if (ctx.self && (!ms.length || !ms.some(m => m.params.length === e.args.length))) { const nf = this.nativeMethod(ctx.cls, e.name); if (nf) { const a = (yield* this.argsG(e.args, ctx)); this.line = line; { const r = nf(this, ctx.self, a, line); return r instanceof Suspend ? yield r : r; } } }
-      if (!ctx.self && !ms.length) { const nsf = (() => { for (let c = ctx.cls; c; c = c.superClass) { const f = c.native && c.native.statics && c.native.statics[e.name]; if (f) return f; } return null; })(); if (nsf) { const r = nsf(this, (yield* this.argsG(e.args, ctx)), line); return r instanceof Suspend ? yield r : r; } }
+      if (ctx.self && (!ms.length || !ms.some(m => m.params.length === e.args.length))) { const nf = this.nativeMethod(ctx.cls, e.name); if (nf) { const a = (yield* this.argsG(e.args, ctx)); this.line = line; { const r = nf(this, ctx.self, a, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; } } }
+      if (!ctx.self && !ms.length) { const nsf = (() => { for (let c = ctx.cls; c; c = c.superClass) { const f = c.native && c.native.statics && c.native.statics[e.name]; if (f) return f; } return null; })(); if (nsf) { const r = nsf(this, (yield* this.argsG(e.args, ctx)), line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; } }
       if (!ms.length && ctx.self && ['toString', 'equals', 'hashCode', 'getClass', 'name', 'ordinal', 'compareTo'].includes(e.name)) return this.objectMethod(ctx.self, e.name, (yield* this.argsG(e.args, ctx)), line);
+      if (!ms.length && ctx.cls && ctx.cls.outer) {
+        // Methode einer umgebenden Klasse
+        for (let c = ctx.cls, o = ctx.self; c.outer;) {
+          o = this.outerObj(o, c); c = c.outer;
+          const oms = this.lookupMethods(c, e.name);
+          if (!oms.length) continue;
+          const args = (yield* this.argsG(e.args, ctx));
+          this.line = line;
+          const m = this.selectOverload(oms, args, e.name, line);
+          if (m.static) return yield* this.invokeG(m, null, args, line);
+          if (!o) this.rtError(`Die Methode ${e.name}() der äußeren Klasse braucht ein Objekt – hier gibt es keins (statischer Kontext)`, line);
+          return m.vis === 'private' ? yield* this.invokeG(m, o, args, line) : yield* this.invokeVirtualG(o, m, args, line);
+        }
+      }
       if (!ms.length) this.rtError(`Methode '${e.name}' nicht gefunden`, line);
       const args = (yield* this.argsG(e.args, ctx));
       this.line = line;
@@ -1947,7 +2264,7 @@ class Runtime {
       const ms = this.lookupMethods(sc, e.name).filter(m => !m.abstract);
       const args = (yield* this.argsG(e.args, ctx));
       this.line = line;
-      if (!ms.length) { const nf = this.nativeMethod(sc, e.name); if (nf) { const r = nf(this, ctx.self, args, line); return r instanceof Suspend ? yield r : r; } }
+      if (!ms.length) { const nf = this.nativeMethod(sc, e.name); if (nf) { const r = nf(this, ctx.self, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; } }
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) return this.objectMethod(ctx.self, e.name, args, line, true);
         this.rtError(`Die Oberklasse hat keine (nicht-abstrakte) Methode '${e.name}'`, line);
@@ -1959,7 +2276,7 @@ class Runtime {
     const args = allPure(e.args) ? e.args.map(a => this.eval(a, ctx)) : yield* this.argsG(e.args, ctx);
     this.line = line;
     const r = this.nativeFast(o, e.name, args, line);
-    if (r !== NOFAST) { this.learnNative(e, r); return r instanceof Suspend ? yield r : r; }
+    if (r !== NOFAST) { this.learnNative(e, r); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
     if (e.$n === undefined) e.$n = false;
     return yield* this.callOnG(o, e.name, args, line, ctx);
   }
@@ -1979,7 +2296,7 @@ class Runtime {
   nativeFast(o, name, args, line) {
     if (typeof o === 'string') return this.stringMethod(o, name, args, line);
     if (o instanceof JObject) {
-      if (!o.cls.native) return NOFAST;
+      if (!o.cls.native || o.lambda) return NOFAST;
       for (let c = o.cls; c; c = c.superClass) {
         const f = c.native && c.native.methods && c.native.methods[name];
         if (f) return f(this, o, args, line);
@@ -1997,7 +2314,7 @@ class Runtime {
       if (c.native) {
         const f = c.native.statics && c.native.statics[name];
         if (!f) this.rtError(`Methode '${name}' gibt es in ${c.name} nicht (oder sie wird nicht unterstützt)`, line);
-        { const r = f(this, args, line); return r instanceof Suspend ? yield r : r; }
+        { const r = f(this, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
       }
       if (c.isEnum && name === 'values' && !args.length) { this.ensureStaticInit(c); return new JArray(T(c.name), c.enumConsts.slice()); }
       if (c.isEnum && name === 'valueOf' && args.length === 1) { this.ensureStaticInit(c); const r = c.enumConsts.find(x => x.enumName === args[0]); if (!r) this.throwJava('IllegalArgumentException', `No enum constant ${c.name}.${args[0]}`); return r; }
@@ -2010,6 +2327,7 @@ class Runtime {
     }
     if (o === null) this.npe(`Methode ${name}() wurde auf null aufgerufen`);
     if (typeof o === 'string') return this.stringMethod(o, name, args, line);
+    if (this.kindOf(o)) return this.boxedMethod(o, name, args, line);
     if (o instanceof JArray) {
       if (name === 'clone' && !args.length) return new JArray(o.elemType, o.data.slice());
       if (name === 'length') this.rtError('Bei Arrays heißt es length ohne Klammern', line);
@@ -2017,16 +2335,17 @@ class Runtime {
       this.rtError(`Arrays haben keine Methode '${name}'`, line);
     }
     if (o instanceof JObject) {
+      if (o.lambda) return yield* this.lambdaMethodG(o, name, args, line);
       if (o.cls.native) {
         for (let c = o.cls; c; c = c.superClass) {
           const f = c.native && c.native.methods && c.native.methods[name];
-          if (f) { const r = f(this, o, args, line); return r instanceof Suspend ? yield r : r; }
+          if (f) { const r = f(this, o, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
         }
         if (['equals', 'hashCode', 'toString', 'getClass'].includes(name)) return this.objectMethod(o, name, args, line);
         this.rtError(`Methode '${name}' gibt es für ${o.cls.name} nicht (oder sie wird nicht unterstützt)`, line);
       }
       const ms = this.lookupMethods(o.cls, name);
-      if (!ms.length || !ms.some(m => m.params.length === args.length)) { const nf = this.nativeMethod(o.cls, name); if (nf) { const r = nf(this, o, args, line); return r instanceof Suspend ? yield r : r; } }
+      if (!ms.length || !ms.some(m => m.params.length === args.length)) { const nf = this.nativeMethod(o.cls, name); if (nf) { const r = nf(this, o, args, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; } }
       if (!ms.length) {
         if (['equals', 'hashCode', 'toString', 'getClass', 'name', 'ordinal', 'compareTo'].includes(name)) return this.objectMethod(o, name, args, line);
         this.rtError(`Klasse ${o.cls.name} hat keine Methode '${name}'`, line);
@@ -2037,6 +2356,23 @@ class Runtime {
       return yield* this.invokeVirtualG(o, m, args, line);
     }
     this.rtError(`Auf einem Wert vom Typ ${this.typeNameOf(o)} kann keine Methode aufgerufen werden`, line);
+  }
+  // Methoden von Integer, Double, Character, Boolean … (Werte sind hier ausgepackt)
+  boxedMethod(v, name, a, line) {
+    const k = this.kindOf(v);
+    switch (name) {
+      case 'compareTo': if (a.length === 1) return this.compareValues(v, a[0]); break;
+      case 'equals': if (a.length === 1) return this.kindOf(a[0]) === k && this.javaEquals(v, a[0]); break;
+      case 'hashCode': if (!a.length) return k === 'boolean' ? (v ? 1231 : 1237) : k === 'double' ? strHash(this.str(v)) : k === 'long' ? Number(BigInt.asIntN(32, v ^ (v >> 32n))) : this.num(v); break;
+      case 'toString': if (!a.length) return this.str(v); break;
+      case 'intValue': if (k !== 'boolean') return this.cast(v, INT, line); break;
+      case 'doubleValue': if (k !== 'boolean') return this.cast(v, DOUBLE, line); break;
+      case 'longValue': if (k !== 'boolean') return this.cast(v, LONG, line); break;
+      case 'charValue': if (k === 'char') return v; break;
+      case 'booleanValue': if (k === 'boolean') return v; break;
+      case 'isNaN': if (k === 'double') return Number.isNaN(v.v); break;
+    }
+    this.rtError(`Methode '${name}' gibt es für ${this.typeNameOf(v)}-Werte nicht`, line);
   }
   nativeMethod(cls, name) {
     for (let c = cls; c; c = c.superClass) { const f = c.native && c.native.methods && c.native.methods[name]; if (f) return f; }
@@ -2413,7 +2749,10 @@ class Runtime {
         getFirst(rt, o) { if (!o.native.list.length) ex('NoSuchElementException'); return o.native.list[0]; }, getLast(rt, o) { if (!o.native.list.length) ex('NoSuchElementException'); return o.native.list[o.native.list.length - 1]; },
         addFirst(rt, o, a, line) { o.native.list.unshift(elem(o, a[0], line)); }, addLast(rt, o, a, line) { o.native.list.push(elem(o, a[0], line)); },
         removeFirst(rt, o) { if (!o.native.list.length) ex('NoSuchElementException'); return o.native.list.shift(); }, removeLast(rt, o) { if (!o.native.list.length) ex('NoSuchElementException'); return o.native.list.pop(); },
-        sort(rt, o, a) { if (a[0] !== null && a[0] !== undefined) rt.rtError('sort mit Comparator wird nicht unterstützt – verwende sort(null) oder Collections.sort'); o.native.list.sort((x, y) => rt.compareValues(x, y)); },
+        sort(rt, o, a) { o.native.list.sort(rt.cmpOf(a[0])); },
+        forEach(rt, o, a, line) { const L = o.native.list; return new Delegate((function* () { const n = L.length; for (let i = 0; i < L.length; i++) { yield* rt.fnG(a[0], 'accept', [L[i]], line); if (L.length !== n) ex('ConcurrentModificationException'); } })()); },
+        removeIf(rt, o, a, line) { const L = o.native.list; return new Delegate((function* () { const keep = []; let any = false; for (const x of L.slice()) { if ((yield* rt.fnG(a[0], 'test', [x], line)) === true) any = true; else keep.push(x); } L.length = 0; L.push(...keep); return any; })()); },
+        replaceAll(rt, o, a, line) { const L = o.native.list; return new Delegate((function* () { for (let i = 0; i < L.length; i++) L[i] = elem(o, yield* rt.fnG(a[0], 'apply', [L[i]], line), line); })()); },
         toArray(rt, o) { return new JArray(T('Object'), o.native.list.slice()); },
         equals(rt, o, a) { return rt.javaEquals(o, a[0]); },
         subList(rt, o, a) { const n = rt.classes.get('ArrayList'); const r = new JObject(n); r.native = { list: o.native.list.slice(intArg(a[0]), intArg(a[1])), elemType: o.native.elemType }; return r; },
@@ -2427,13 +2766,14 @@ class Runtime {
     def('ArrayList', listSpec); def('LinkedList', listSpec);
     const setSpec = {
       pkg: 'java.util', interfaces: ['Set'],
-      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeSet' ? 'TreeSet' : 'HashSet')); o.native = { list: [], elemType: type && type.args && type.args[0] || null, sorted: type && type.name === 'TreeSet' }; if (args.length === 1 && isColl(args[0])) for (const x of args[0].native.list) setSpec.methods.add(rt, o, [x]); return o; },
+      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeSet' ? 'TreeSet' : 'HashSet')); o.native = { list: [], elemType: type && type.args && type.args[0] || null, sorted: type && type.name === 'TreeSet' }; if (args.length === 1 && isColl(args[0])) for (const x of args[0].native.list) setSpec.methods.add(rt, o, [x]); else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
       methods: {
-        add(rt, o, a, line) { const v = elem(o, a[0], line); if (o.native.list.some(x => rt.javaEquals(v, x))) return false; o.native.list.push(v); if (o.native.sorted) o.native.list.sort((x, y) => rt.compareValues(x, y)); return true; },
+        add(rt, o, a, line) { const v = elem(o, a[0], line); const c = o.native.cmp ? rt.cmpOf(o.native.cmp) : null; if (o.native.list.some(x => c ? c(v, x) === 0 : rt.javaEquals(v, x))) return false; o.native.list.push(v); if (o.native.sorted) o.native.list.sort(c || ((x, y) => rt.compareValues(x, y))); return true; },
         remove(rt, o, a) { const k = o.native.list.findIndex(x => rt.javaEquals(a[0], x)); if (k >= 0) { o.native.list.splice(k, 1); return true; } return false; },
         contains(rt, o, a) { return o.native.list.some(x => rt.javaEquals(a[0], x)); },
         size(rt, o) { return o.native.list.length; }, isEmpty(rt, o) { return !o.native.list.length; }, clear(rt, o) { o.native.list.length = 0; },
         addAll(rt, o, a) { let ch = false; for (const x of a[0].native.list) ch = setSpec.methods.add(rt, o, [x]) || ch; return ch; },
+        forEach: listSpec.methods.forEach, removeIf: listSpec.methods.removeIf,
       },
       toString: listSpec.toString,
       ui: [{ name: 'add', params: [{ type: T('Object'), name: 'element' }], ret: BOOL }, { name: 'contains', params: [{ type: T('Object'), name: 'o' }], ret: BOOL }, { name: 'size', params: [], ret: INT }],
@@ -2443,9 +2783,13 @@ class Runtime {
     const mapFind = (o, k) => o.native.keys.findIndex(x => rt.javaEquals(k, x));
     const mapSpec = {
       pkg: 'java.util', interfaces: ['Map'],
-      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeMap' ? 'TreeMap' : 'HashMap')); o.native = { keys: [], vals: [], kType: type && type.args && type.args[0] || null, vType: type && type.args && type.args[1] || null, sorted: type && type.name === 'TreeMap' }; return o; },
+      ctor(rt, args, line, type) { const o = new JObject(rt.classes.get(type && type.name === 'TreeMap' ? 'TreeMap' : 'HashMap')); o.native = { keys: [], vals: [], kType: type && type.args && type.args[0] || null, vType: type && type.args && type.args[1] || null, sorted: type && type.name === 'TreeMap' }; if (args.length === 1 && args[0] instanceof JObject && args[0].native && args[0].native.keys) { for (let i = 0; i < args[0].native.keys.length; i++) mapSpec.methods.put(rt, o, [args[0].native.keys[i], args[0].native.vals[i]]); } else if (args.length === 1 && args[0] instanceof JObject) o.native.cmp = args[0]; return o; },
       methods: {
-        put(rt, o, a, line) { const k = o.native.kType ? rt.coerce(a[0], o.native.kType, line) : a[0]; const v = o.native.vType ? rt.coerce(a[1], o.native.vType, line) : a[1]; const i = mapFind(o, k); if (i >= 0) { const old = o.native.vals[i]; o.native.vals[i] = v; return old; } o.native.keys.push(k); o.native.vals.push(v); if (o.native.sorted) { const idx = o.native.keys.map((_, j) => j).sort((x, y) => rt.compareValues(o.native.keys[x], o.native.keys[y])); o.native.keys = idx.map(j => o.native.keys[j]); o.native.vals = idx.map(j => o.native.vals[j]); } return null; },
+        put(rt, o, a, line) { const k = o.native.kType ? rt.coerce(a[0], o.native.kType, line) : a[0]; const v = o.native.vType ? rt.coerce(a[1], o.native.vType, line) : a[1]; const i = mapFind(o, k); if (i >= 0) { const old = o.native.vals[i]; o.native.vals[i] = v; return old; } o.native.keys.push(k); o.native.vals.push(v); if (o.native.sorted) { const c = rt.cmpOf(o.native.cmp); const idx = o.native.keys.map((_, j) => j).sort((x, y) => c(o.native.keys[x], o.native.keys[y])); o.native.keys = idx.map(j => o.native.keys[j]); o.native.vals = idx.map(j => o.native.vals[j]); } return null; },
+        putIfAbsent(rt, o, a, line) { const i = mapFind(o, a[0]); if (i >= 0 && o.native.vals[i] !== null) return o.native.vals[i]; mapSpec.methods.put(rt, o, a, line); return null; },
+        forEach(rt, o, a, line) { const K = o.native.keys.slice(), V = o.native.vals.slice(); return new Delegate((function* () { for (let i = 0; i < K.length; i++) yield* rt.fnG(a[0], 'accept', [K[i], V[i]], line); })()); },
+        computeIfAbsent(rt, o, a, line) { const i = mapFind(o, a[0]); if (i >= 0 && o.native.vals[i] !== null) return o.native.vals[i]; return new Delegate((function* () { const v = yield* rt.fnG(a[1], 'apply', [a[0]], line); if (v !== null) mapSpec.methods.put(rt, o, [a[0], v], line); return v; })()); },
+        merge(rt, o, a, line) { const i = mapFind(o, a[0]); if (i < 0 || o.native.vals[i] === null) { mapSpec.methods.put(rt, o, [a[0], a[1]], line); return a[1]; } return new Delegate((function* () { const v = yield* rt.fnG(a[2], 'apply', [o.native.vals[i], a[1]], line); if (v === null) mapSpec.methods.remove(rt, o, [a[0]]); else mapSpec.methods.put(rt, o, [a[0], v], line); return v; })()); },
         get(rt, o, a) { const i = mapFind(o, a[0]); return i >= 0 ? o.native.vals[i] : null; },
         getOrDefault(rt, o, a) { const i = mapFind(o, a[0]); return i >= 0 ? o.native.vals[i] : a[1]; },
         containsKey(rt, o, a) { return mapFind(o, a[0]) >= 0; }, containsValue(rt, o, a) { return o.native.vals.some(v => rt.javaEquals(a[0], v)); },
@@ -2500,7 +2844,7 @@ class Runtime {
     def('Arrays', { pkg: 'java.util', statics: {
       toString(rt, a) { if (a[0] === null) return 'null'; return '[' + arrArg(a[0]).data.map(x => rt.str(x)).join(', ') + ']'; },
       deepToString(rt, a) { const f = (x) => x instanceof JArray ? '[' + x.data.map(f).join(', ') + ']' : rt.str(x); return f(a[0]); },
-      sort(rt, a) { const arr = arrArg(a[0]); if (a.length === 3) { const s = intArg(a[1]), e = intArg(a[2]); const part = arr.data.slice(s, e).sort((x, y) => rt.compareValues(x, y)); arr.data.splice(s, e - s, ...part); } else arr.data.sort((x, y) => rt.compareValues(x, y)); },
+      sort(rt, a) { const arr = arrArg(a[0]); if (a.length === 2) { if (arr.elemType.dims === 0 && PRIMS.has(arr.elemType.name)) rt.rtError('Arrays.sort mit Comparator geht nur bei Arrays von Objekten (z. B. Integer[] statt int[])'); arr.data.sort(rt.cmpOf(a[1])); return; } if (a.length === 3) { const s = intArg(a[1]), e = intArg(a[2]); const part = arr.data.slice(s, e).sort((x, y) => rt.compareValues(x, y)); arr.data.splice(s, e - s, ...part); } else arr.data.sort((x, y) => rt.compareValues(x, y)); },
       fill(rt, a, line) { const arr = arrArg(a[0]); const v = rt.coerce(a[a.length - 1], arr.elemType, line); if (a.length === 4) { for (let i = intArg(a[1]); i < intArg(a[2]); i++) arr.data[i] = v; } else arr.data.fill(v); },
       copyOf(rt, a) { const arr = arrArg(a[0]); const n = intArg(a[1]); const d = arr.data.slice(0, n); while (d.length < n) d.push(defaultValue(arr.elemType)); return new JArray(arr.elemType, d); },
       copyOfRange(rt, a) { const arr = arrArg(a[0]); return new JArray(arr.elemType, arr.data.slice(intArg(a[1]), intArg(a[2]))); },
@@ -2510,11 +2854,12 @@ class Runtime {
     } });
     const collArg = (v) => { if (!isColl(v)) rt.rtError('Liste erwartet'); return v.native.list; };
     def('Collections', { pkg: 'java.util', statics: {
-      sort(rt, a) { if (a.length > 1) rt.rtError('sort mit Comparator wird nicht unterstützt'); collArg(a[0]).sort((x, y) => rt.compareValues(x, y)); },
+      sort(rt, a) { collArg(a[0]).sort(rt.cmpOf(a[1])); },
+      reverseOrder(rt, a) { if (a.length) { const c = a[0]; return rt.nativeLambda('Comparator', (rt, b) => rt.cmpOf(c)(b[1], b[0])); } return rt.nativeLambda('Comparator', (rt, b) => rt.compareValues(b[1], b[0])); },
       reverse(rt, a) { collArg(a[0]).reverse(); },
       shuffle(rt, a) { const L = collArg(a[0]); for (let i = L.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [L[i], L[j]] = [L[j], L[i]]; } },
-      max(rt, a) { const L = collArg(a[0]); if (!L.length) ex('NoSuchElementException'); return L.reduce((m, x) => rt.compareValues(x, m) > 0 ? x : m); },
-      min(rt, a) { const L = collArg(a[0]); if (!L.length) ex('NoSuchElementException'); return L.reduce((m, x) => rt.compareValues(x, m) < 0 ? x : m); },
+      max(rt, a) { const L = collArg(a[0]); if (!L.length) ex('NoSuchElementException'); const c = rt.cmpOf(a[1]); return L.reduce((m, x) => c(x, m) > 0 ? x : m); },
+      min(rt, a) { const L = collArg(a[0]); if (!L.length) ex('NoSuchElementException'); const c = rt.cmpOf(a[1]); return L.reduce((m, x) => c(x, m) < 0 ? x : m); },
       swap(rt, a) { const L = collArg(a[0]); const i = intArg(a[1]), j = intArg(a[2]); listIdx(null, i, L.length); listIdx(null, j, L.length); [L[i], L[j]] = [L[j], L[i]]; },
       frequency(rt, a) { return collArg(a[0]).filter(x => rt.javaEquals(a[1], x)).length; },
     } });
@@ -2535,7 +2880,7 @@ class Checker {
     try {
       for (const f of d.fields) {
         this.checkType(f.type, f.line);
-        if (f.init) { this.ctx = { isStatic: f.static, method: null, loops: 0, tps: c.typeParams }; const sc = new Scope(null); const t = f.init.k === 'ArrayInit' ? this.arrayInit(f.init, f.type, sc) : this.expr(f.init, sc); this.assignCheck(f.type, t, f.init, f.line); }
+        if (f.init) { this.ctx = { isStatic: f.static, method: null, loops: 0, tps: c.typeParams }; const sc = new Scope(null); const t = f.init.k === 'ArrayInit' ? this.arrayInit(f.init, f.type, sc) : this.expr(f.init, sc); this.assignCheck(f.type, t, f.init, f.line); this.flushLambdas(0); }
       }
       for (const ec of d.enumConsts) { this.ctx = { isStatic: true, loops: 0, tps: [] }; this.ctorArgsCheck(c, ec.args.map(a => this.expr(a, new Scope(null))), ec.line); }
       for (const m of d.methods) {
@@ -2545,7 +2890,7 @@ class Checker {
         if (m.body) this.body(m, false);
       }
       for (const k of d.ctors) { for (const p of k.params) this.checkType(p.type, k.line); this.body(k, true); }
-      if (!d.ctors.length && c.superClass && !c.isInterface && !c.isEnum) this.implicitSuper(d.line);
+      if (!d.ctors.length && c.superClass && !c.isInterface && !c.isEnum && !d.anonBase) this.implicitSuper(d.line);
       for (const b of d.inits) { this.ctx = { isStatic: b.static, loops: 0, tps: c.typeParams }; this.stmt(b.body, new Scope(null)); }
     } catch (e) { if (!(e instanceof StopCheck)) throw e; }
   }
@@ -2568,7 +2913,67 @@ class Checker {
     if (!s.ctors.some(k => k.params.length === 0)) this.err(line, `Die Oberklasse ${s.name} hat keinen Konstruktor ohne Parameter – rufe im Konstruktor zuerst super(…) mit passenden Werten auf`);
   }
   knownType(name, tps) {
-    return PRIMS.has(name) || name === 'var' || this.rt.classes.has(name) || (this.cls.typeParams || []).includes(name) || (tps || []).includes(name) || (this.ctx && this.ctx.tps || []).includes(name);
+    if (PRIMS.has(name) || name === 'var' || this.rt.classes.has(name) || (tps || []).includes(name) || (this.ctx && this.ctx.tps || []).includes(name)) return true;
+    for (let c = this.cls; c; c = c.outer) if ((c.typeParams || []).includes(name)) return true;
+    for (let en = this.encl; en; en = en.checker.encl) if ((en.checker.ctx && en.checker.ctx.tps || []).includes(name)) return true;
+    return false;
+  }
+  // ---- verschachtelte Klassen und eingefangene Variablen
+  // Lokale und anonyme Klassen werden an ihrer Stelle im umgebenden Code geprüft (encl),
+  // damit sie die lokalen Variablen dort sehen.
+  inlineCheck(c, sc) {
+    const sub = new Checker(this.rt, c, this.errors);
+    sub.encl = { checker: this, sc, isStatic: this.ctx.isStatic };
+    sub.run();
+    if (sub.count) throw new StopCheck();
+  }
+  // Schritt nach außen: von einer lokalen/anonymen Klasse zum umgebenden Code, von einer
+  // inneren Klasse zur äußeren. Liefert false am Ende.
+  outward(st) {
+    if (st.ch && st.ch.encl) { st.sc = st.ch.encl.sc; st.static = st.static || st.ch.encl.isStatic; st.ch = st.ch.encl.checker; st.cls = st.ch.cls; return true; }
+    st.sc = null;
+    if (st.cls.outer) { st.static = st.static || st.cls.staticNested; st.cls = st.cls.outer; st.ch = null; return true; }
+    return false;
+  }
+  effFinal(inf) { return inf.init ? inf.assigns === 0 : inf.assigns <= 1; }
+  capture(name, r, line) {
+    const inf = r.scope.info.get(name); if (!inf) return;
+    if (!this.effFinal(inf)) this.err(line, `Die lokale Variable '${name}' wird in einem Lambda-Ausdruck oder einer inneren Klasse verwendet und muss deshalb final oder effektiv final sein (sie wird an anderer Stelle verändert)`);
+    if (!inf.captured) inf.captured = line;
+  }
+  assignedVar(name, r, line) {
+    if (r.crossed) this.err(line, `Die lokale Variable '${name}' kann in einem Lambda-Ausdruck nicht verändert werden (sie muss final oder effektiv final sein)`);
+    const inf = r.scope.info.get(name); if (!inf) return;
+    inf.assigns++;
+    if (inf.captured && !this.effFinal(inf)) this.err(line, `Die Variable '${name}' wird in einem Lambda-Ausdruck oder einer inneren Klasse verwendet (Zeile ${inf.captured}) und darf deshalb nicht verändert werden`);
+  }
+  outerLookup(name, line) {
+    const st = { ch: this, cls: this.cls, static: !!this.ctx.isStatic };
+    while (this.outward(st)) {
+      if (st.sc) { const r = st.sc.find(name); if (r) { this.capture(name, r, line); return { t: r.t, local: true }; } }
+      const f = this.rt.findField(st.cls, name);
+      if (f) {
+        if (!f.field.static && st.static) this.err(line, `Auf das Attribut '${name}' von ${st.cls.name} kann hier nicht zugegriffen werden – es gibt kein Objekt von ${st.cls.name} (statische Klasse oder statische Methode)`);
+        return { t: f.field.type, f };
+      }
+    }
+    return null;
+  }
+  outerMethod(name, at, line) {
+    const st = { ch: this, cls: this.cls, static: !!this.ctx.isStatic };
+    while (this.outward(st)) {
+      const ms = this.rt.lookupMethods(st.cls, name);
+      if (!ms.length) continue;
+      const m = this.pick(ms, at, line, `Methode ${name}`, st.cls);
+      if (!m.static && st.static) this.err(line, `Die Methode ${name}() von ${st.cls.name} braucht ein Objekt – hier gibt es keins (statische Klasse oder statische Methode)`);
+      return this.retType(m, null);
+    }
+    return undefined;
+  }
+  hasOuterInstance(target) {
+    const st = { ch: this, cls: this.cls, static: !!this.ctx.isStatic };
+    do { if (!st.static && st.cls.isSubclassOf(target)) return true; } while (this.outward(st));
+    return false;
   }
   checkType(t, line, tps) {
     if (!t || t.name === 'void') return;
@@ -2644,6 +3049,12 @@ class Checker {
     if (t && t.dims > 0) this.err(e.line, 'Die Bedingung muss boolean sein');
   }
   stmt(s, sc) {
+    const d = this.depth || 0;
+    this.depth = d + 1;
+    try { this.stmt0(s, sc); } finally { this.depth = d; }
+    this.flushLambdas(d + 1);
+  }
+  stmt0(s, sc) {
     switch (s.k) {
       case 'Block': { const s2 = new Scope(sc); this.block(s.stmts, s2); return; }
       case 'Local':
@@ -2652,16 +3063,17 @@ class Checker {
           this.checkType(t, s.line);
           if (d.init) {
             const it = d.init.k === 'ArrayInit' ? (t.name === 'var' ? this.err(s.line, 'var kann nicht mit { … } verwendet werden') : this.arrayInit(d.init, t, sc)) : this.expr(d.init, sc);
-            if (t.name === 'var') { if (it && it.name === 'void') this.err(s.line, 'Die Methode liefert keinen Wert (void)'); t = it && it.name !== 'null' ? it : null; }
+            if (t.name === 'var') { if (it && it.name === 'void') this.err(s.line, 'Die Methode liefert keinen Wert (void)'); if (it && it.lambda) this.err(s.line, 'Bei var ist der Typ eines Lambda-Ausdrucks unbekannt – gib das Interface an, z. B. Runnable r = () -> …'); t = it && it.name !== 'null' ? it : null; }
             else this.assignCheck(t, it, d.init, s.line);
           } else if (t.name === 'var') this.err(s.line, 'var braucht einen Startwert');
-          sc.declare(d.name, t, s.line, this);
+          sc.declare(d.name, t, s.line, this, !!d.init);
         }
         return;
       case 'Expr':
         if (s.e.k === 'CtorCall') this.err(s.line, `${s.e.which}(…) ist nur als erste Anweisung in einem Konstruktor erlaubt`);
         this.expr(s.e, sc); return;
       case 'Empty': return;
+      case 'LocalClass': this.inlineCheck(this.rt.classes.get(s.name), sc); return;
       case 'If': this.condCheck(s.c, sc); this.stmt(s.a, new Scope(sc)); if (s.b) this.stmt(s.b, new Scope(sc)); return;
       case 'While': this.condCheck(s.c, sc); this.loop(s.body, sc); return;
       case 'DoWhile': this.loop(s.body, sc); this.condCheck(s.c, sc); return;
@@ -2681,6 +3093,12 @@ class Checker {
       case 'Return': {
         const m = this.ctx.method;
         if (!m) this.err(s.line, 'return ist hier nicht erlaubt');
+        if (m.lambda) {
+          if (!m.ret) { if (s.e) this.expr(s.e, sc); return; }
+          if (m.ret.name === 'void') { if (s.e) this.err(s.line, `Dieser Lambda-Ausdruck kann keinen Wert zurückgeben (${m.iface} ist void)`); return; }
+          if (!s.e) this.err(s.line, `return braucht hier einen Wert vom Typ ${typeStr(m.ret)}`);
+          this.assignCheck(m.ret, this.expr(s.e, sc), s.e, s.line); return;
+        }
         if (this.ctx.isCtor) { if (s.e) this.err(s.line, 'Ein Konstruktor kann keinen Wert zurückgeben'); return; }
         if (m.ret.name === 'void') { if (s.e) this.err(s.line, `Die Methode ${m.name} ist void und kann keinen Wert zurückgeben`); return; }
         if (!s.e) this.err(s.line, `return braucht hier einen Wert vom Typ ${typeStr(m.ret)}`);
@@ -2765,6 +3183,7 @@ class Checker {
   }
   isConst(e) { return e.k === 'Lit' || (e.k === 'Unary' && e.e.k === 'Lit') || (e.k === 'Paren' && this.isConst(e.e)); }
   assignCheck(to, from, expr, line) {
+    if (from && from.lambda) { this.lambdaCheck(from, to); return; }
     to = this.norm(to); from = this.norm(from);
     if (!to || !from) return;
     if (from.name === 'void') this.err(line, 'Die Methode liefert keinen Wert (void) – er kann nicht verwendet werden');
@@ -2785,7 +3204,7 @@ class Checker {
   }
   userClass(t) { if (!t || t.dims || PRIMS.has(t.name)) return null; return this.rt.classes.get(t.name) || null; }
   accessCheck(member, owner, line, what) {
-    if (member.vis === 'private' && owner !== this.cls) this.err(line, `${what} '${member.name}' ist private in ${owner.name} – Zugriff nur innerhalb dieser Klasse (verwende eine get-Methode)`);
+    if (member.vis === 'private' && owner !== this.cls && this.rt.topOf(owner) !== this.rt.topOf(this.cls)) this.err(line, `${what} '${member.name}' ist private in ${owner.name} – Zugriff nur innerhalb dieser Klasse (verwende eine get-Methode)`);
   }
   visibleNames(sc) { const s = sc.allNames(); for (const f of this.rt.allFieldNames(this.cls)) s.push(f); return s; }
   expr(e, sc) {
@@ -2793,18 +3212,26 @@ class Checker {
       case 'Lit': return this.litType(e.v);
       case 'Paren': return this.expr(e.e, sc);
       case 'Name': {
-        const v = sc.get(e.name);
-        if (v !== undefined) return v;
+        const r = sc.find(e.name);
+        if (r) { if (r.crossed) this.capture(e.name, r, e.line); return r.t; }
         const f = this.rt.findField(this.cls, e.name);
         if (f) {
           if (!f.field.static && this.ctx.isStatic) this.err(e.line, `Das Attribut '${e.name}' gehört zu einem Objekt und kann in einer statischen Methode nicht verwendet werden`);
-          if (f.owner !== this.cls && f.field.vis === 'private') this.err(e.line, `Attribut '${e.name}' ist private in ${f.owner.name} – Unterklassen können darauf nicht direkt zugreifen (protected oder get-Methode verwenden)`);
+          if (f.owner !== this.cls && f.field.vis === 'private' && this.rt.topOf(f.owner) !== this.rt.topOf(this.cls)) this.err(e.line, `Attribut '${e.name}' ist private in ${f.owner.name} – Unterklassen können darauf nicht direkt zugreifen (protected oder get-Methode verwenden)`);
           return f.field.type;
         }
+        const o = this.outerLookup(e.name, e.line);
+        if (o) return o.t;
         if (this.rt.classes.has(e.name)) return { classRef: e.name };
         this.err(e.line, `Variable '${e.name}' nicht gefunden` + suggest(e.name, [...this.visibleNames(sc), ...this.rt.classes.keys()]));
       }
       case 'This': if (this.ctx.isStatic) this.err(e.line, "'this' kann in einer statischen Methode nicht verwendet werden"); return T(this.cls.name);
+      case 'OuterThis': {
+        const c = this.rt.classes.get(e.name);
+        if (!c) this.err(e.line, `Klasse '${e.name}' nicht gefunden`);
+        if (!this.hasOuterInstance(c)) this.err(e.line, `${e.name}.this gibt es hier nicht (kein umgebendes Objekt von ${e.name})`);
+        return T(c.name);
+      }
       case 'Super': return this.cls.superClass ? T(this.cls.superClass.name) : null;
       case 'Field': {
         if (e.obj.k === 'Super') { const f = this.rt.findField(this.cls.superClass, e.name); if (!f) this.err(e.line, `Die Oberklasse hat kein Attribut '${e.name}'`); this.accessCheck(f.field, f.owner, e.line, 'Attribut'); return f.field.type; }
@@ -2813,6 +3240,7 @@ class Checker {
         if (t.classRef) {
           const c = this.rt.classes.get(t.classRef);
           const f = this.rt.findField(c, e.name);
+          if (!f && c.nestedMap && c.nestedMap.has(e.name)) return { classRef: c.nestedMap.get(e.name).name };
           if (!f) this.err(e.line, `${c.name} hat kein Attribut '${e.name}'` + suggest(e.name, this.rt.allFieldNames(c).concat(c.native && c.native.sfields ? Object.keys(c.native.sfields) : [])) + (c.native && c.native.statics && c.native.statics[e.name] ? ` – ${e.name} ist eine Methode, also ${e.name}(…)` : ''));
           if (!f.field.static) this.err(e.line, `'${e.name}' ist nicht statisch – Zugriff nur über ein Objekt`);
           this.accessCheck(f.field, f.owner, e.line, 'Attribut');
@@ -2844,10 +3272,24 @@ class Checker {
         if (!c) this.err(e.line, `Klasse '${n}' nicht gefunden` + suggest(n, [...this.rt.classes.keys()]));
         this.checkType(e.type, e.line);
         const at = e.args.map(a => this.expr(a, sc));
+        if (e.anon) {
+          if (c.isEnum) this.err(e.line, 'Von einem enum kann keine anonyme Klasse gebildet werden');
+          if (c.isInterface) { if (at.length) this.err(e.line, `${n} ist ein Interface und hat keinen Konstruktor – bei new ${n}() { … } bleiben die Klammern leer`); }
+          else if (c.decl) this.ctorArgsCheck(c, at, e.line);
+          this.inlineCheck(this.rt.classes.get(e.anon), sc);
+          return e.type;
+        }
+        if (c.nestKind === 'member' && !c.staticNested && !this.hasOuterInstance(c.outer)) this.err(e.line, `Für ein Objekt der inneren Klasse ${n} braucht man ein Objekt von ${c.outer.name} – erzeuge es in einer Objektmethode von ${c.outer.name} oder mache die Klasse ${n} static`);
         if (c.isInterface) this.err(e.line, `${n} ist ein Interface – davon können keine Objekte erzeugt werden`);
         if (c.isAbstract) this.err(e.line, `${n} ist abstrakt – davon können keine Objekte erzeugt werden`);
         if (c.isEnum) this.err(e.line, 'Von einem enum können keine Objekte mit new erzeugt werden');
         if (c.decl) this.ctorArgsCheck(c, at, e.line);
+        else at.forEach((a, i) => {
+          if (!a || !a.lambda) return;
+          const el = e.type.args && e.type.args[0];
+          const h = ['TreeMap', 'TreeSet', 'PriorityQueue'].includes(c.name) ? T('Comparator', 0, [el || T('Object')]) : (c.native && c.native.lambdaCtor ? c.native.lambdaCtor[i] : null);
+          this.lambdaCheck(a, h || null);
+        });
         return e.type;
       }
       case 'NewArray': {
@@ -2917,19 +3359,142 @@ class Checker {
         return e.type;
       }
       case 'InstanceOf': { this.expr(e.e, sc); this.checkType(e.type, e.line); if (e.bind) sc.declare(e.bind, e.type, e.line, this); return BOOL; }
+      case 'Lambda': case 'MethodRef': {
+        // Der Typ ergibt sich erst aus dem Ziel (Variable, Parameter …), siehe lambdaCheck
+        if (e.k === 'MethodRef') this.refTarget(e, sc);
+        const lt = { name: '$lambda', dims: 0, lambda: e, sc };
+        (this.pending || (this.pending = [])).push({ lt, depth: this.depth || 0 });
+        return lt;
+      }
       case 'CtorCall': this.err(e.line, `${e.which}(…) ist nur als erste Anweisung in einem Konstruktor erlaubt`);
     }
+    return null;
+  }
+  // Ziel einer Methodenreferenz prüfen; merkt die Zahl der Parameter, wenn sie feststeht
+  refTarget(e, sc) {
+    let cref = null, recv = null;
+    if (e.target.k === 'Name' && sc.get(e.target.name) === undefined && !this.rt.findField(this.cls, e.target.name) && this.rt.classes.has(e.target.name)) cref = this.rt.classes.get(e.target.name);
+    else { recv = this.norm(this.expr(e.target, sc)); if (recv && recv.classRef) { cref = this.rt.classes.get(recv.classRef); recv = null; } }
+    e.$arity = null;
+    if (cref) {
+      if (e.name === 'new') { if (cref.isAbstract) this.err(e.line, `${cref.name} ist abstrakt – ${cref.name}::new geht nicht`); if (cref.decl) { const ar = new Set(cref.ctors.length ? cref.ctors.map(k => k.params.length) : [0]); if (ar.size === 1) e.$arity = [...ar][0]; } return; }
+      if (cref.native) { if (!(cref.native.statics && cref.native.statics[e.name]) && !(cref.name === 'String' && e.name in STRING_RET) && !['Integer', 'Double', 'Character', 'Boolean', 'Long', 'Object'].includes(cref.name)) this.err(e.line, `Methode '${e.name}' gibt es in ${cref.name} nicht`); return; }
+      const ms = this.rt.lookupMethods(cref, e.name);
+      if (!ms.length && !['toString', 'equals', 'hashCode', 'compareTo', 'name', 'ordinal'].includes(e.name)) this.err(e.line, `Methode '${e.name}' gibt es in ${cref.name} nicht` + suggest(e.name, this.rt.allMethodNames(cref)));
+      const ar = new Set(ms.map(m => m.static ? m.params.length : m.params.length + 1));
+      if (ar.size === 1) e.$arity = [...ar][0];
+      return;
+    }
+    if (recv && recv.name === 'String' && !recv.dims) { if (!(e.name in STRING_RET)) this.err(e.line, `Methode '${e.name}' gibt es für String nicht`); return; }
+    const c = this.userClass(recv);
+    if (c && c.decl) {
+      const ms = this.rt.lookupMethods(c, e.name);
+      if (!ms.length && !['toString', 'equals', 'hashCode'].includes(e.name)) this.err(e.line, `Methode '${e.name}' gibt es in Klasse ${c.name} nicht` + suggest(e.name, this.rt.allMethodNames(c)));
+      const ar = new Set(ms.map(m => m.params.length)); if (ar.size === 1) e.$arity = [...ar][0];
+    }
+  }
+  // Lambda/Methodenreferenz gegen den Zieltyp prüfen (to = null: unbekannt)
+  lambdaCheck(lt, to) {
+    const e = lt.lambda, sc = lt.sc;
+    if (e.$chk) return; e.$chk = true;
+    let fm = null, tc = null; const subst = Object.create(null);
+    if (to && this.norm(to) && to.name !== 'null') {
+      tc = !to.dims ? this.rt.classes.get(to.name) : null;
+      const what = e.k === 'Lambda' ? 'Ein Lambda-Ausdruck' : 'Eine Methodenreferenz';
+      if (!tc || !tc.isInterface) this.err(e.line, `${what} passt nur zu einem funktionalen Interface (z. B. Runnable, Comparator, Consumer), nicht zu ${typeStr(to)}`);
+      fm = this.rt.functionalMethod(tc);
+      if (!fm) this.err(e.line, `${tc.name} ist kein funktionales Interface (es braucht genau eine abstrakte Methode) – ${what.toLowerCase()} passt nicht`);
+      e.$iface = tc.name;
+      (tc.typeParams || []).forEach((n, i) => { if (to.args && to.args[i]) subst[n] = to.args[i]; });
+    }
+    const tps = new Set([...(tc && tc.typeParams || []), ...(fm && fm.typeParams || []), ...(fm && fm.cls && fm.cls.typeParams || [])]);
+    const sub = (t) => { if (!t) return null; if (subst[t.name] && !t.dims) return subst[t.name]; if (tps.has(t.name)) return null; return t; };
+    if (e.k === 'MethodRef') {
+      if (fm && e.$arity != null && e.$arity !== fm.params.length) this.err(e.line, `Die Methodenreferenz passt nicht zu ${tc.name}.${fm.name}(…) mit ${fm.params.length} Parameter(n)`);
+      return;
+    }
+    if (fm && fm.params.length !== e.params.length) this.err(e.line, `Der Lambda-Ausdruck hat ${e.params.length} Parameter, ${tc.name}.${fm.name}(…) erwartet aber ${fm.params.length}`);
+    const s2 = new Scope(sc, true);
+    e.params.forEach((p, i) => {
+      let t = p.type;
+      if (t) this.checkType(t, e.line); else t = fm ? sub(fm.params[i].type) : null;
+      if (sc.get(p.name) !== undefined) this.err(e.line, `Variable '${p.name}' ist hier bereits definiert – Lambda-Parameter brauchen einen neuen Namen`);
+      s2.declare(p.name, t, e.line, this);
+    });
+    const ret = fm ? (fm.ret.name === 'void' ? VOID : sub(fm.ret)) : null;
+    const saved = this.ctx, depth = this.depth;
+    this.ctx = { ...saved, method: { name: 'Lambda', ret, lambda: true, iface: tc && fm ? tc.name + '.' + fm.name : null }, isCtor: false, loops: 0, switches: 0 };
+    try {
+      if (e.expr) {
+        const t = this.expr(e.body, s2);
+        if (ret && ret.name === 'void') { if (!EXPR_STMT.has(e.body.k)) this.err(e.line, `Hier wird kein Ergebnis erwartet (${tc.name}.${fm.name} ist void) – rechts vom Pfeil muss eine Anweisung stehen, z. B. ein Methodenaufruf`); }
+        else if (ret) { if (t && t.name === 'void') this.err(e.line, `Der Lambda-Ausdruck muss einen Wert vom Typ ${typeStr(ret)} liefern (${tc.name}.${fm.name})`); this.assignCheck(ret, t, e.body, e.line); }
+      } else {
+        this.block(e.body.stmts, new Scope(s2));
+        if (ret && ret.name !== 'void' && this.canComplete(e.body)) this.err(e.body.endLine, `return fehlt: Der Lambda-Ausdruck muss einen Wert vom Typ ${typeStr(ret)} zurückgeben`);
+      }
+      this.flushLambdas((depth || 0) + 1);
+    } finally { this.ctx = saved; this.depth = depth; }
+  }
+  // Noch nicht geprüfte Lambdas (Ziel unbekannt) am Ende der Anweisung prüfen
+  flushLambdas(depth) {
+    if (!this.pending) return;
+    const rest = [];
+    for (const p of this.pending.splice(0)) { if (p.lt.lambda.$chk) continue; if (p.depth >= depth) this.lambdaCheck(p.lt, null); else rest.push(p); }
+    this.pending.push(...rest);
+  }
+  // Zieltyp für Lambdas als Argument eingebauter Methoden
+  lambdaHint(e, i, at) {
+    const rtT = e.$recvT;
+    const name = e.name;
+    const fn = (n, ...args) => T(n, 0, args.map(a => a || T('Object')));
+    if (rtT && rtT.classRef) {
+      const cn = rtT.classRef, a0 = at[0];
+      const el0 = a0 && a0.args && a0.args[0];
+      if (cn === 'Collections' && ['sort', 'max', 'min'].includes(name) && i === 1) return fn('Comparator', el0);
+      if (cn === 'Arrays' && name === 'sort' && i === 1) return fn('Comparator', a0 && a0.dims ? { ...a0, dims: a0.dims - 1 } : null);
+      const c = this.rt.classes.get(cn);
+      const la = c && c.native && c.native.lambdaStatics && c.native.lambdaStatics[name];
+      return la ? la[i] || null : null;
+    }
+    if (!rtT || rtT.dims) return null;
+    const c = this.rt.classes.get(rtT.name);
+    if (!c) return null;
+    const el = rtT.args && rtT.args[0], v = rtT.args && rtT.args[1];
+    if (['Map', 'HashMap', 'TreeMap', 'LinkedHashMap'].includes(c.name)) {
+      if (name === 'forEach') return fn('BiConsumer', el, v);
+      if (name === 'computeIfAbsent' && i === 1) return fn('Function', el, v);
+      if (name === 'merge' && i === 2) return fn('BinaryOperator', v);
+      return null;
+    }
+    if (c.native && c.native.list || ['List', 'Collection', 'Set', 'Iterable', 'ArrayList', 'LinkedList', 'HashSet', 'TreeSet'].includes(c.name)) {
+      if (name === 'forEach') return fn('Consumer', el);
+      if (name === 'removeIf') return fn('Predicate', el);
+      if (name === 'sort') return fn('Comparator', el);
+      if (name === 'replaceAll') return fn('UnaryOperator', el);
+    }
+    for (let k = c; k; k = k.superClass) { const la = k.native && k.native.lambdaArgs && k.native.lambdaArgs[name]; if (la) return la[i] || null; }
+    // addXyzListener(…) erwartet einen XyzListener
+    const lm = /^(?:add|remove)(\w+Listener)$/.exec(name);
+    if (lm && i === 0 && this.rt.classes.has(lm[1]) && this.rt.classes.get(lm[1]).isInterface) return T(lm[1]);
     return null;
   }
   lval(t, sc) {
     const ty = this.expr(t, sc);
     if (ty && ty.classRef) this.err(t.line, 'Einer Klasse kann nichts zugewiesen werden');
     let f = null;
-    if (t.k === 'Name' && sc.get(t.name) === undefined) f = this.rt.findField(this.cls, t.name);
+    if (t.k === 'Name') {
+      const r = sc.find(t.name);
+      if (r) this.assignedVar(t.name, r, t.line);
+      else {
+        f = this.rt.findField(this.cls, t.name);
+        if (!f) { const o = this.outerLookup(t.name, t.line); if (o && o.local) this.err(t.line, `Die lokale Variable '${t.name}' der umgebenden Methode kann hier nicht verändert werden (sie muss final oder effektiv final sein)`); if (o && o.f) f = o.f; }
+      }
+    }
     if (t.k === 'Field' && (t.obj.k === 'This' || t.obj.k === 'Super')) f = this.rt.findField(t.obj.k === 'This' ? this.cls : this.cls.superClass, t.name);
     if (t.k === 'Field' && t.obj.k === 'Name' && sc.get(t.obj.name) === undefined && !this.rt.findField(this.cls, t.obj.name) && this.rt.classes.has(t.obj.name)) f = this.rt.findField(this.rt.classes.get(t.obj.name), t.name);
     if (f && (f.field.final || f.field.native)) {
-      const ok = f.owner === this.cls && ((this.ctx.isCtor && !f.field.static) || (!this.ctx.method && f.field.static && this.ctx.isStatic));
+      const ok = f.owner === this.cls && ((this.ctx.isCtor && !f.field.static && !this.encl) || (!this.ctx.method && f.field.static && this.ctx.isStatic));
       if (!ok) this.err(t.line, `'${t.name}' ist final (konstant) und kann nicht verändert werden`);
     }
     if (t.k === 'Field' && ty === INT && t.name === 'length') { const at = this.expr(t.obj, sc); if (at && at.dims) this.err(t.line, 'Die Länge eines Arrays kann nicht verändert werden'); }
@@ -2944,11 +3509,23 @@ class Checker {
     const cands = ms.filter(m => m.params.length === at.length);
     const sigs = () => ms.map(m => `${m.name}(${m.params.map(p => typeStr(p.type)).join(', ')})`).filter((v, i, a) => a.indexOf(v) === i).join(', ');
     if (!cands.length) this.err(line, `${label} erwartet ${[...new Set(ms.map(m => m.params.length))].join(' oder ')} Parameter, übergeben wurden ${at.length}. Vorhanden: ${sigs()}`);
-    const ok = cands.filter(m => m.params.every((p, i) => this.assignable(this.norm(p.type) && !(m.typeParams || []).includes(p.type.name) && !(m.cls && (m.cls.typeParams || []).includes(p.type.name)) ? p.type : null, this.norm(at[i]), null)));
+    const lamOk = (p, a) => {
+      if (!a || !a.lambda) return true;
+      const pc = !p.type.dims && this.rt.classes.get(p.type.name);
+      if (!pc) return true;
+      const fm = this.rt.functionalMethod(pc);
+      if (!fm) return false;
+      const n = a.lambda.k === 'Lambda' ? a.lambda.params.length : a.lambda.$arity;
+      return n == null || n === fm.params.length;
+    };
+    const ok = cands.filter(m => m.params.every((p, i) => lamOk(p, at[i]) && this.assignable(this.norm(p.type) && !(m.typeParams || []).includes(p.type.name) && !(m.cls && (m.cls.typeParams || []).includes(p.type.name)) ? p.type : null, this.norm(at[i]), null)));
+    if (!ok.length && at.some(a => a && a.lambda)) this.err(line, `${label}(${cands[0].params.map(p => typeStr(p.type)).join(', ')}): Der Lambda-Ausdruck bzw. die Methodenreferenz passt zu keinem Parameter`);
     if (!ok.length) this.err(line, `${label}(${cands[0].params.map(p => typeStr(p.type)).join(', ')}) passt nicht zu den Argumenten (${at.map(t => t ? (t.classRef ? t.classRef : typeStr(t)) : '?').join(', ')})`);
     const m = ok[0];
-    if (!isCtor && m.vis === 'private' && m.cls !== this.cls) this.err(line, `Methode ${m.name}() ist private in ${m.cls.name}`);
-    if (isCtor && m.vis === 'private' && owner !== this.cls) this.err(line, `Konstruktor ${owner.name}(…) ist private`);
+    at.forEach((a, i) => { if (a && a.lambda) this.lambdaCheck(a, m.params[i].type); });
+    const top = this.rt.topOf(this.cls);
+    if (!isCtor && m.vis === 'private' && m.cls !== this.cls && this.rt.topOf(m.cls) !== top) this.err(line, `Methode ${m.name}() ist private in ${m.cls.name}`);
+    if (isCtor && m.vis === 'private' && owner !== this.cls && this.rt.topOf(owner) !== top) this.err(line, `Konstruktor ${owner.name}(…) ist private`);
     return m;
   }
   retType(m, recvType) {
@@ -2963,6 +3540,11 @@ class Checker {
   }
   call(e, sc) {
     const at = e.args.map(a => this.expr(a, sc));
+    const r = this.call0(e, sc, at);
+    at.forEach((a, i) => { if (a && a.lambda && !a.lambda.$chk) this.lambdaCheck(a, this.lambdaHint(e, i, at)); });
+    return r;
+  }
+  call0(e, sc, at) {
     for (let i = 0; i < at.length; i++) { if (at[i] && at[i].name === 'void') this.err(e.line, 'Ein void-Methodenaufruf liefert keinen Wert und kann nicht als Argument verwendet werden'); if (at[i] && at[i].classRef) this.err(e.line, `${at[i].classRef} ist eine Klasse und kein Wert`); }
     const label = (c) => `Methode ${e.name}`;
     if (e.obj === null) {
@@ -2972,6 +3554,8 @@ class Checker {
       if (!ms.length) {
         if (['toString', 'equals', 'hashCode', 'getClass'].includes(e.name) && !this.ctx.isStatic) return e.name === 'toString' ? STRING : e.name === 'equals' ? BOOL : e.name === 'hashCode' ? INT : null;
         if (this.cls.isEnum && ['values', 'ordinal', 'name'].includes(e.name)) return e.name === 'values' ? T(this.cls.name, 1) : e.name === 'ordinal' ? INT : STRING;
+        const om = this.outerMethod(e.name, at, e.line);
+        if (om !== undefined) return om;
         const known = { println: 'System.out.println(…)', print: 'System.out.print(…)', sqrt: 'Math.sqrt(…)', random: 'Math.random()' };
         this.err(e.line, `Methode '${e.name}' nicht gefunden` + (known[e.name] ? ` (meinten Sie '${known[e.name]}'?)` : suggest(e.name, this.rt.allMethodNames(this.cls))));
       }
@@ -2987,6 +3571,7 @@ class Checker {
       return this.retType(this.pick(ms, at, e.line, label(), this.cls), null);
     }
     const t = this.norm(this.expr(e.obj, sc));
+    e.$recvT = t;
     if (!t) return null;
     if (t.classRef) {
       const c = this.rt.classes.get(t.classRef);
@@ -3019,7 +3604,7 @@ class Checker {
       return STRING_RET[e.name];
     }
     const c = this.userClass(t);
-    if (c && c.decl && !c.builtin) {
+    if (c && c.decl) {
       const ms = this.rt.lookupMethods(c, e.name);
       if ((!ms.length || !ms.some(m => m.params.length === at.length)) && this.rt.nativeMethod(c, e.name)) return nativeRet(this.rt, c, e.name);
       if (!ms.length) {
@@ -3065,9 +3650,11 @@ const NATIVE_RET = {
 };
 class StopCheck { }
 class Scope {
-  constructor(parent) { this.parent = parent; this.vars = new Map(); }
+  // boundary: Grenze eines Lambda-Rumpfs (Variablen von außen sind dort „eingefangen“)
+  constructor(parent, boundary) { this.parent = parent; this.vars = new Map(); this.info = new Map(); this.boundary = !!boundary; }
   get(n) { for (let s = this; s; s = s.parent) if (s.vars.has(n)) return s.vars.get(n); return undefined; }
-  declare(n, t, line, ch) { if (this.get(n) !== undefined) ch.err(line, `Variable '${n}' ist hier bereits definiert`); this.vars.set(n, t === undefined ? null : t); }
+  find(n) { let crossed = false; for (let s = this; s; s = s.parent) { if (s.vars.has(n)) return { t: s.vars.get(n), scope: s, crossed }; if (s.boundary) crossed = true; } return null; }
+  declare(n, t, line, ch, init = true) { if (this.get(n) !== undefined) ch.err(line, `Variable '${n}' ist hier bereits definiert`); this.vars.set(n, t === undefined ? null : t); this.info.set(n, { init, assigns: 0, captured: 0 }); }
   allNames() { const s = []; for (let x = this; x; x = x.parent) s.push(...x.vars.keys()); return s; }
 }
 
@@ -3087,5 +3674,55 @@ function quickInfo(code) {
 
 Runtime.extensions = [];
 Runtime.preludes = [];   // { pkg, code }: eingebaute Klassen als Java-Quelltext
-global.JavaRT = { Runtime, Suspend, TICK, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
+// Funktionale Interfaces (für Lambdas und Methodenreferenzen)
+Runtime.preludes.push({ pkg: 'java.util.function', code: `
+public interface Function<T, R> {
+  R apply(T t);
+  default <V> Function<T, V> andThen(Function<R, V> after) { return x -> after.apply(apply(x)); }
+  default <V> Function<V, R> compose(Function<V, T> before) { return x -> apply(before.apply(x)); }
+  static <T> Function<T, T> identity() { return x -> x; }
+}
+public interface BiFunction<T, U, R> { R apply(T t, U u); }
+public interface UnaryOperator<T> { T apply(T t); }
+public interface BinaryOperator<T> { T apply(T a, T b); }
+public interface Consumer<T> {
+  void accept(T t);
+  default Consumer<T> andThen(Consumer<T> after) { return x -> { accept(x); after.accept(x); }; }
+}
+public interface BiConsumer<T, U> { void accept(T t, U u); }
+public interface Supplier<T> { T get(); }
+public interface Predicate<T> {
+  boolean test(T t);
+  default Predicate<T> negate() { return x -> !test(x); }
+  default Predicate<T> and(Predicate<T> other) { return x -> test(x) && other.test(x); }
+  default Predicate<T> or(Predicate<T> other) { return x -> test(x) || other.test(x); }
+}
+public interface BiPredicate<T, U> { boolean test(T t, U u); }
+public interface ToIntFunction<T> { int applyAsInt(T t); }
+public interface ToDoubleFunction<T> { double applyAsDouble(T t); }
+public interface IntFunction<R> { R apply(int value); }
+public interface IntPredicate { boolean test(int value); }
+public interface IntUnaryOperator { int applyAsInt(int operand); }
+public interface IntBinaryOperator { int applyAsInt(int left, int right); }
+public interface IntConsumer { void accept(int value); }
+public interface DoubleUnaryOperator { double applyAsDouble(double operand); }
+public interface DoubleBinaryOperator { double applyAsDouble(double left, double right); }
+` });
+Runtime.preludes.push({ pkg: 'java.util', code: `
+public interface Comparator<T> {
+  int compare(T a, T b);
+  default Comparator<T> reversed() { return (a, b) -> compare(b, a); }
+  default Comparator<T> thenComparing(Comparator<T> other) { return (a, b) -> { int r = compare(a, b); return r != 0 ? r : other.compare(a, b); }; }
+  default Comparator<T> thenComparing(Function<T, Comparable> key) { return thenComparing(Comparator.comparing(key)); }
+  default Comparator<T> thenComparingInt(ToIntFunction<T> key) { return thenComparing(Comparator.comparingInt(key)); }
+  default Comparator<T> thenComparingDouble(ToDoubleFunction<T> key) { return thenComparing(Comparator.comparingDouble(key)); }
+  static <T> Comparator<T> comparing(Function<T, Comparable> key) { return (a, b) -> ((Comparable) key.apply(a)).compareTo(key.apply(b)); }
+  static <T> Comparator<T> comparing(Function<T, Object> key, Comparator<Object> cmp) { return (a, b) -> cmp.compare(key.apply(a), key.apply(b)); }
+  static <T> Comparator<T> comparingInt(ToIntFunction<T> key) { return (a, b) -> Integer.compare(key.applyAsInt(a), key.applyAsInt(b)); }
+  static <T> Comparator<T> comparingDouble(ToDoubleFunction<T> key) { return (a, b) -> Double.compare(key.applyAsDouble(a), key.applyAsDouble(b)); }
+  static <T> Comparator<T> naturalOrder() { return (a, b) -> ((Comparable) a).compareTo(b); }
+  static <T> Comparator<T> reverseOrder() { return (a, b) -> ((Comparable) b).compareTo(a); }
+}
+` });
+global.JavaRT = { Runtime, Suspend, Delegate, TICK, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
 })(typeof window !== 'undefined' ? window : globalThis);

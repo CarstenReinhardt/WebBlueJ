@@ -90,4 +90,142 @@ public class G { public static void main(String[] args) { GPanel p = new GPanel(
   { System.out.println("init " + id); }
   public static void main(String[] args) { System.out.println(tab[4]); new S(); new S(); System.out.println(calls); }
 }` }] },
+{ name: 'Innere Klassen', classes: [
+ { name: 'Main', code: `import java.util.*;
+public class Main {
+  private int zahl = 10;
+  private static int zaehler = 0;
+  private String name = "Haupt";
+  // statische geschachtelte Klasse
+  public static class Punkt {
+    int x, y;
+    Punkt(int x, int y) { this.x = x; this.y = y; zaehler++; }
+    public String toString() { return "(" + x + "|" + y + ")"; }
+  }
+  // innere Klasse
+  class Zaehler {
+    int schritt;
+    Zaehler(int s) { schritt = s; }
+    void weiter() { zahl += schritt; }
+    String info() { return name + ":" + zahl + " " + Main.this.name; }
+  }
+  interface Rechner { int rechne(int a, int b); }
+  enum Farbe { ROT, GRUEN }
+  private int doppelt(int a) { return 2 * a; }
+  void test() {
+    Zaehler z = new Zaehler(5);
+    z.weiter(); z.weiter();
+    System.out.println(z.info());
+    final int faktor = 3;
+    int basis = 100;
+    Rechner r = new Rechner() {
+      int aufrufe = 0;
+      public int rechne(int a, int b) { aufrufe++; return basis + faktor * (a + b) + doppelt(zahl) + aufrufe; }
+    };
+    System.out.println(r.rechne(1, 2) + " " + r.rechne(1, 2));
+    class Lokal { String sag() { return "lokal " + basis + " " + name; } }
+    System.out.println(new Lokal().sag());
+    Runnable lauf = new Runnable() { public void run() { System.out.println("run " + zahl); } };
+    lauf.run();
+    System.out.println(r instanceof Rechner);
+    System.out.println(r.getClass().getName());
+  }
+  public static void main(String[] args) {
+    Punkt p = new Punkt(1, 2);
+    Main.Punkt q = new Main.Punkt(3, 4);
+    System.out.println(p + " " + q + " " + zaehler);
+    new Main().test();
+    Farbe f = Farbe.GRUEN; System.out.println(f + " " + Main.Farbe.ROT);
+    ArrayList<String> liste = new ArrayList<>();
+    liste.add("b"); liste.add("a"); liste.add("c");
+    Collections.sort(liste);
+    System.out.println(liste);
+    Object o = new Object() { public String toString() { return "anonym"; } };
+    System.out.println(o);
+    Runnable t = new Runnable() { public void run() { System.out.println("thread"); } };
+    t.run();
+  }
+}` },
+ { name: 'Liste', code: `public class Liste {
+  private class Knoten { int wert; Knoten next; Knoten(int w) { wert = w; } }
+  private Knoten kopf;
+  public void add(int w) { Knoten k = new Knoten(w); k.next = kopf; kopf = k; }
+  public String toString() { String s = ""; for (Knoten k = kopf; k != null; k = k.next) s += k.wert + " "; return s; }
+}` },
+ { name: 'Baum', code: `public class Baum {
+  private static class Knoten { String w; Knoten(String w) { this.w = w; } }
+  Knoten wurzel = new Knoten("w");
+  public String toString() { return wurzel.w; }
+}` }] },
+{ name: 'Lambdas', classes: [{ name: 'Main', code: `import java.util.*;
+import java.util.function.*;
+public class Main {
+  private int basis = 7;
+  interface Op { int rechne(int a, int b); }
+  static int anwenden(Op op, int x, int y) { return op.rechne(x, y); }
+  static String gross(String s) { return s.toUpperCase(); }
+  int plusBasis(int x) { return x + basis; }
+  void test() {
+    Function<Integer, Integer> f = x -> x + basis;
+    System.out.println(f.apply(3));
+    Function<Integer, Integer> g = this::plusBasis;
+    System.out.println(g.apply(1) + " " + f.andThen(g).apply(0));
+  }
+  public static void main(String[] args) {
+    Runnable r = () -> System.out.println("Hallo Lambda");
+    r.run();
+    Op plus = (a, b) -> a + b;
+    Op mal = (int a, int b) -> { return a * b; };
+    System.out.println(anwenden(plus, 3, 4) + " " + anwenden(mal, 3, 4) + " " + anwenden((a, b) -> a - b, 10, 3));
+    List<String> namen = new ArrayList<>(Arrays.asList("Clara", "anton", "Bert", "Dora"));
+    namen.sort((a, b) -> a.compareToIgnoreCase(b));
+    System.out.println(namen);
+    namen.sort(Comparator.comparing(String::length).thenComparing(Comparator.naturalOrder()));
+    System.out.println(namen);
+    namen.forEach(n -> System.out.print(n + ";"));
+    System.out.println();
+    namen.forEach(System.out::println);
+    namen.removeIf(n -> n.length() > 4);
+    System.out.println(namen);
+    ArrayList<Integer> zahlen = new ArrayList<>();
+    for (int i = 1; i <= 10; i++) zahlen.add(i);
+    zahlen.removeIf(z -> z % 3 == 0);
+    zahlen.replaceAll(z -> z * z);
+    System.out.println(zahlen);
+    Collections.sort(zahlen, (a, b) -> b - a);
+    System.out.println(zahlen + " max=" + Collections.max(zahlen, Comparator.reverseOrder()));
+    Collections.sort(zahlen, Collections.reverseOrder());
+    System.out.println(zahlen);
+    Predicate<String> kurz = s -> s.length() < 5;
+    System.out.println(kurz.test("abc") + " " + kurz.negate().test("abc"));
+    Supplier<List<String>> neu = ArrayList::new;
+    List<String> l2 = neu.get(); l2.add("x"); System.out.println(l2);
+    Function<String, String> gr = Main::gross;
+    UnaryOperator<String> gr2 = String::toUpperCase;
+    BiFunction<Integer, Integer, Integer> summe = Integer::sum;
+    System.out.println(gr.apply("abc") + gr2.apply("def") + summe.apply(2, 3));
+    Map<String, Integer> m = new TreeMap<>();
+    for (String w : "a b a c b a".split(" ")) m.merge(w, 1, Integer::sum);
+    m.forEach((k, v) -> System.out.println(k + "=" + v));
+    Map<String, List<Integer>> gruppen = new HashMap<>();
+    gruppen.computeIfAbsent("g", k -> new ArrayList<>()).add(5);
+    System.out.println(gruppen);
+    final int faktor = 3;
+    IntBinaryOperator ib = (a, b) -> a * b * faktor;
+    System.out.println(ib.applyAsInt(2, 5));
+    new Main().test();
+    Comparator<String> c = (a, b) -> a.length() - b.length();
+    TreeSet<String> ts = new TreeSet<>(c.reversed());
+    ts.add("aa"); ts.add("b"); ts.add("cccc"); ts.add("dd");
+    System.out.println(ts);
+    Integer[] arr = { 5, 1, 4 };
+    Arrays.sort(arr, (a, b) -> b - a);
+    System.out.println(Arrays.toString(arr));
+    Runnable[] tasks = new Runnable[3];
+    for (int i = 0; i < 3; i++) { int k = i; tasks[i] = () -> System.out.print(k); }
+    for (Runnable t : tasks) t.run();
+    System.out.println();
+    System.out.println(r instanceof Runnable);
+  }
+}` }] },
 ];
