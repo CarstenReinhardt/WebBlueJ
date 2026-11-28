@@ -7,6 +7,26 @@ const { JObject, JArray, JDouble, JChar, T } = R;
 const INT = T('int'), DOUBLE = T('double'), BOOL = T('boolean'), STRING = T('String'), VOID = T('void');
 const NOGFX = { win: 1, newWindow() { return this.win++; }, op() { }, input() { return null; }, message() { }, lastLine() { return ''; } };
 
+// Listener-Interfaces und Adapter wie in java.awt.event und ch.aplu.turtle (als Java-Quelltext,
+// damit „implements MouseListener“ wie in echtem Java geprüft wird)
+R.Runtime.preludes.push({ pkg: 'java.awt.event', code: `
+public interface MouseListener { void mouseClicked(MouseEvent e); void mousePressed(MouseEvent e); void mouseReleased(MouseEvent e); void mouseEntered(MouseEvent e); void mouseExited(MouseEvent e); }
+public interface MouseMotionListener { void mouseDragged(MouseEvent e); void mouseMoved(MouseEvent e); }
+public interface KeyListener { void keyPressed(KeyEvent e); void keyReleased(KeyEvent e); void keyTyped(KeyEvent e); }
+public abstract class MouseAdapter implements MouseListener, MouseMotionListener {
+  public void mouseClicked(MouseEvent e) { } public void mousePressed(MouseEvent e) { } public void mouseReleased(MouseEvent e) { }
+  public void mouseEntered(MouseEvent e) { } public void mouseExited(MouseEvent e) { } public void mouseDragged(MouseEvent e) { } public void mouseMoved(MouseEvent e) { }
+}
+public abstract class MouseMotionAdapter implements MouseMotionListener { public void mouseDragged(MouseEvent e) { } public void mouseMoved(MouseEvent e) { } }
+public abstract class KeyAdapter implements KeyListener { public void keyPressed(KeyEvent e) { } public void keyReleased(KeyEvent e) { } public void keyTyped(KeyEvent e) { } }
+` }, { pkg: 'ch.aplu.turtle', code: `
+public interface MouseHitListener { void mouseHit(double x, double y); }
+public interface MouseHitXListener { void mouseHitX(double x, double y); }
+public interface TurtleHitListener { void turtleHit(Turtle t, double x, double y); }
+public interface MouseDoubleClickListener { void notifyClick(MouseEvent e); void notifyDoubleClick(MouseEvent e); }
+public interface ExitListener { void notifyExit(); }
+` });
+
 R.Runtime.extensions.push(function (rt) {
   const def = (name, spec) => rt._def(name, { lib: true, ...spec });
   const gfx = () => rt.io.gfx || NOGFX;
@@ -95,20 +115,162 @@ R.Runtime.extensions.push(function (rt) {
     rt.throwJava('InputMismatchException', 'Kein Wahrheitswert eingegeben');
   }
 
+  // ------------------------------------------------------------ Projektdateien (Bilder, Klänge)
+  const asset = (name) => (rt.io.assets ? rt.io.assets(name) : null);
+  function needAsset(name, kind, line) {
+    const a = asset(name);
+    if (a && a.kind === kind) return a;
+    rt.rtError(`${kind === 'image' ? 'Bild' : 'Klang'} „${name}“ nicht gefunden. Füge die Datei über „Projekt ▾ → Bilder und Klänge …“ zum Projekt hinzu.`, line);
+  }
+  const isImageName = (s) => typeof s === 'string' && (/\.(png|gif|jpe?g|bmp|webp|svg)$/i.test(s) || !!(asset(s) && asset(s).kind === 'image'));
+
+  // ------------------------------------------------------------ Töne
+  // Der Ton wird wie ein Zeichenbefehl abgespielt, also passend zur Animation.
+  function tone(freq, ms, vol, blocking, value) {
+    push(0, { t: 'tone', freq: num(freq), ms: Math.max(0, num(ms)), vol: vol });
+    return blocking ? rt.sleep(num(ms), value) : value;
+  }
+
+  // ------------------------------------------------------------ Maus- und Tastaturereignisse
+  // Jedes Grafikfenster hat einen Zustand: letzte Taste (für kbhit/getKey) und Listener.
+  const KEYNAMES = { 8: 'Backspace', 9: 'Tab', 10: 'Enter', 16: 'Shift', 17: 'Ctrl', 18: 'Alt', 20: 'Caps Lock', 27: 'Escape', 32: 'Space', 33: 'Page Up', 34: 'Page Down', 35: 'End', 36: 'Home', 37: 'Left', 38: 'Up', 39: 'Right', 40: 'Down', 127: 'Delete', 155: 'Insert' };
+  const evs = new Map();
+  function winState(win, src) {
+    let s = evs.get(win);
+    if (!s) {
+      s = { win, got: false, ch: 65535, code: 65535, mods: 0, waiters: [], src: src || null, pg: null, dblTimer: 0, L: { mouse: [], motion: [], key: [], hit: [], hitX: [], turtleHit: [], dbl: [], exit: [] } };
+      evs.set(win, s);
+      const g = gfx(); if (g.listen) g.listen(win, (ev) => onWinEvent(s, ev));
+    }
+    if (src && !s.src) s.src = src;
+    return s;
+  }
+  const modMask = (ev) => (ev.shift ? 1 : 0) | (ev.ctrl ? 2 : 0) | (ev.meta ? 4 : 0) | (ev.alt ? 8 : 0);
+  function mouseEvent(s, ev) { const o = new JObject(rt.cls('MouseEvent')); o.native = { x: ev.x, y: ev.y, button: ev.button || 0, clicks: ev.clicks || 0, mods: modMask(ev), src: s.src, when: Date.now() }; return o; }
+  function keyEvent(s, ev, typed) { const o = new JObject(rt.cls('KeyEvent')); o.native = { code: typed ? 0 : ev.code, ch: ev.ch, mods: modMask(ev), src: s.src, when: Date.now() }; return o; }
+  const fire = (list, name, args) => { for (const l of list.slice()) rt.fireEvent(l, name, args); };
+  function onWinEvent(s, ev) {
+    const L = s.L;
+    switch (ev.type) {
+      case 'keydown': {
+        s.got = true; s.ch = ev.ch; s.code = ev.code; s.mods = modMask(ev);
+        const ws = s.waiters.splice(0); for (const f of ws) f();
+        if (L.key.length) fire(L.key, 'keyPressed', [keyEvent(s, ev)]);
+        return;
+      }
+      case 'keyup': if (L.key.length) fire(L.key, 'keyReleased', [keyEvent(s, ev)]); return;
+      case 'typed': if (L.key.length) fire(L.key, 'keyTyped', [keyEvent(s, ev, true)]); return;
+      case 'press': {
+        if (L.mouse.length) fire(L.mouse, 'mousePressed', [mouseEvent(s, ev)]);
+        if (s.pg && ev.button === 1) {
+          const pg = s.pg, tx = D(ev.x - pg.w / 2), ty = D(pg.h / 2 - ev.y);
+          if (L.hit.length) fire(L.hit, 'mouseHit', [tx, ty]);
+          if (L.hitX.length) fire(L.hitX, 'mouseHitX', [tx, ty]);
+          if (L.turtleHit.length) {
+            const hitT = pg.turtles.filter(t => !t.hidden && t.obj && Math.hypot(t.x - tx.v, t.y - ty.v) <= 14);
+            for (const t of hitT) fire(L.turtleHit, 'turtleHit', [t.obj, tx, ty]);
+          }
+        }
+        return;
+      }
+      case 'release': if (L.mouse.length) fire(L.mouse, 'mouseReleased', [mouseEvent(s, ev)]); return;
+      case 'click':
+        if (L.mouse.length) fire(L.mouse, 'mouseClicked', [mouseEvent(s, ev)]);
+        if (L.dbl.length && ev.clicks === 1) { clearTimeout(s.dblTimer); const me = mouseEvent(s, ev); s.dblTimer = setTimeout(() => fire(L.dbl, 'notifyClick', [me]), 260); }
+        return;
+      case 'dblclick': if (L.dbl.length) { clearTimeout(s.dblTimer); fire(L.dbl, 'notifyDoubleClick', [mouseEvent(s, ev)]); } return;
+      case 'move': if (L.motion.length) fire(L.motion, 'mouseMoved', [mouseEvent(s, ev)]); return;
+      case 'drag': if (L.motion.length) fire(L.motion, 'mouseDragged', [mouseEvent(s, ev)]); return;
+      case 'enter': if (L.mouse.length) fire(L.mouse, 'mouseEntered', [mouseEvent(s, ev)]); return;
+      case 'exit': if (L.mouse.length) fire(L.mouse, 'mouseExited', [mouseEvent(s, ev)]); return;
+      case 'closing': if (L.exit.length) { fire(L.exit, 'notifyExit', []); return true; } return false;
+      case 'closed': evs.delete(s.win); clearTimeout(s.dblTimer); { const ws = s.waiters.splice(0); for (const f of ws) f(); } return;
+    }
+  }
+  const LISTENER = { mouse: 'MouseListener', motion: 'MouseMotionListener', key: 'KeyListener', hit: 'MouseHitListener', hitX: 'MouseHitXListener', turtleHit: 'TurtleHitListener', dbl: 'MouseDoubleClickListener', exit: 'ExitListener' };
+  function addListener(s, kind, v, line) {
+    const iface = rt.cls(LISTENER[kind]);
+    if (v === null || v === undefined) rt.npe('Listener ist null');
+    if (!(v instanceof JObject) || !v.cls.isSubclassOf(iface)) rt.rtError(`Hier wird ein Objekt erwartet, das ${LISTENER[kind]} implementiert (z. B. „implements ${LISTENER[kind]}“ und dann „this“ übergeben)`, line);
+    if (!s.L[kind].includes(v)) s.L[kind].push(v);
+  }
+  // getKey()/getKeyCode(): letzte Taste abholen (65535, wenn seit dem letzten Abholen keine gedrückt wurde)
+  const takeKey = (s) => { if (!s.got) return new JChar(65535); s.got = false; return new JChar(s.ch); };
+  const takeCode = (s) => { if (!s.got) return 65535; s.got = false; return s.code; };
+  // ...Wait(): auf die nächste Taste warten (das Programm pausiert, die Oberfläche bleibt bedienbar)
+  const waitKey = (s, take) => new R.Suspend(
+    () => rt.whenGfxIdle().then(() => new Promise((res) => { s.got = false; s.waiters.push(res); })).then(() => take(s)),
+    () => rt.rtError('Hier kann nicht auf eine Taste gewartet werden (das geht nur in einem normal gestarteten Programm)'));
+  const keyMethods = (S) => ({
+    kbhit(rt, o) { return S(o).got; },
+    getKey(rt, o) { return takeKey(S(o)); }, getKeyInt(rt, o) { return takeKey(S(o)).c; }, getKeyCode(rt, o) { return takeCode(S(o)); },
+    getKeyWait(rt, o) { return waitKey(S(o), takeKey); }, getKeyWaitInt(rt, o) { return waitKey(S(o), (s) => takeKey(s).c); }, getKeyCodeWait(rt, o) { return waitKey(S(o), takeCode); },
+    getModifiers(rt, o) { return S(o).mods; },
+    getModifiersText(rt, o) { const m = S(o).mods; return [m & 1 ? 'Shift' : '', m & 2 ? 'Ctrl' : '', m & 4 ? 'Meta' : '', m & 8 ? 'Alt' : ''].filter(Boolean).join('+'); },
+  });
+  const keyRet = { kbhit: BOOL, getKey: T('char'), getKeyInt: INT, getKeyCode: INT, getKeyWait: T('char'), getKeyWaitInt: INT, getKeyCodeWait: INT, getModifiers: INT, getModifiersText: STRING };
+  const listenerMethods = (S, kinds) => {
+    const m = {};
+    const names = { mouse: 'addMouseListener', motion: 'addMouseMotionListener', key: 'addKeyListener', hit: 'addMouseHitListener', hitX: 'addMouseHitXListener', turtleHit: 'addTurtleHitListener', dbl: 'addMouseDoubleClickListener', exit: 'addExitListener' };
+    for (const k of kinds) m[names[k]] = (rt, o, a, line) => { addListener(S(o), k, a[0], line); };
+    return m;
+  };
+
+  // MouseEvent / KeyEvent (java.awt.event)
+  const inputMethods = {
+    getModifiers(rt, o) { return o.native.mods; }, getModifiersEx(rt, o) { const m = o.native.mods; return (m & 1 ? 64 : 0) | (m & 2 ? 128 : 0) | (m & 4 ? 256 : 0) | (m & 8 ? 512 : 0); },
+    isShiftDown(rt, o) { return !!(o.native.mods & 1); }, isControlDown(rt, o) { return !!(o.native.mods & 2); }, isMetaDown(rt, o) { return !!(o.native.mods & 4); }, isAltDown(rt, o) { return !!(o.native.mods & 8); },
+    getWhen(rt, o) { return BigInt(o.native.when); }, getSource(rt, o) { return o.native.src; }, consume() { }, isConsumed() { return false; },
+  };
+  const inputRet = { getModifiers: INT, getModifiersEx: INT, isShiftDown: BOOL, isControlDown: BOOL, isMetaDown: BOOL, isAltDown: BOOL, getWhen: T('long'), getSource: T('Object'), isConsumed: BOOL };
+  const maskF = { SHIFT_MASK: 1, CTRL_MASK: 2, META_MASK: 4, ALT_MASK: 8, SHIFT_DOWN_MASK: 64, CTRL_DOWN_MASK: 128, META_DOWN_MASK: 256, ALT_DOWN_MASK: 512, BUTTON1_DOWN_MASK: 1024, BUTTON2_DOWN_MASK: 2048, BUTTON3_DOWN_MASK: 4096 };
+  const mouseF = { ...maskF, NOBUTTON: 0, BUTTON1: 1, BUTTON2: 2, BUTTON3: 3, MOUSE_CLICKED: 500, MOUSE_PRESSED: 501, MOUSE_RELEASED: 502, MOUSE_MOVED: 503, MOUSE_ENTERED: 504, MOUSE_EXITED: 505, MOUSE_DRAGGED: 506 };
+  const intTypes = (o) => { const t = {}; for (const k of Object.keys(o)) t[k] = INT; return t; };
+  def('MouseEvent', { pkg: 'java.awt.event', sfields: mouseF, sfieldTypes: intTypes(mouseF),
+    methods: { ...inputMethods, getX(rt, o) { return o.native.x; }, getY(rt, o) { return o.native.y; }, getButton(rt, o) { return o.native.button; }, getClickCount(rt, o) { return o.native.clicks; }, isPopupTrigger(rt, o) { return o.native.button === 3; } },
+    retTypes: { ...inputRet, getX: INT, getY: INT, getButton: INT, getClickCount: INT, isPopupTrigger: BOOL },
+    toString(rt, o) { return `java.awt.event.MouseEvent[x=${o.native.x},y=${o.native.y},button=${o.native.button},clickCount=${o.native.clicks}]`; } });
+  const VK = { VK_ENTER: 10, VK_BACK_SPACE: 8, VK_TAB: 9, VK_SHIFT: 16, VK_CONTROL: 17, VK_ALT: 18, VK_PAUSE: 19, VK_CAPS_LOCK: 20, VK_ESCAPE: 27, VK_SPACE: 32, VK_PAGE_UP: 33, VK_PAGE_DOWN: 34, VK_END: 35, VK_HOME: 36, VK_LEFT: 37, VK_UP: 38, VK_RIGHT: 39, VK_DOWN: 40, VK_COMMA: 44, VK_MINUS: 45, VK_PERIOD: 46, VK_SLASH: 47, VK_SEMICOLON: 59, VK_EQUALS: 61, VK_DELETE: 127, VK_INSERT: 155, VK_PLUS: 521, VK_UNDEFINED: 0 };
+  for (let i = 0; i < 10; i++) VK['VK_' + i] = 48 + i;
+  for (let i = 0; i < 26; i++) VK['VK_' + String.fromCharCode(65 + i)] = 65 + i;
+  for (let i = 1; i <= 12; i++) VK['VK_F' + i] = 111 + i;
+  for (let i = 0; i < 10; i++) VK['VK_NUMPAD' + i] = 96 + i;
+  def('KeyEvent', { pkg: 'java.awt.event', sfields: { ...VK, ...maskF, CHAR_UNDEFINED: new JChar(65535), KEY_PRESSED: 401, KEY_RELEASED: 402, KEY_TYPED: 400 }, sfieldTypes: { ...intTypes(VK), ...intTypes(maskF), CHAR_UNDEFINED: T('char'), KEY_PRESSED: INT, KEY_RELEASED: INT, KEY_TYPED: INT },
+    methods: { ...inputMethods, getKeyCode(rt, o) { return o.native.code; }, getKeyChar(rt, o) { return new JChar(o.native.ch); }, isActionKey(rt, o) { return o.native.ch === 65535; } },
+    retTypes: { ...inputRet, getKeyCode: INT, getKeyChar: T('char'), isActionKey: BOOL },
+    statics: { getKeyText(rt, a) { const c = int(a[0]); if (KEYNAMES[c]) return KEYNAMES[c]; if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90)) return String.fromCharCode(c); if (c >= 112 && c <= 123) return 'F' + (c - 111); return 'Unknown keyCode: 0x' + c.toString(16); } },
+    staticRet: { getKeyText: STRING },
+    toString(rt, o) { return `java.awt.event.KeyEvent[keyCode=${o.native.code},keyChar='${o.native.ch === 65535 ? 'Undefined keyChar' : String.fromCharCode(o.native.ch)}']`; } });
+  rt._def('InputEvent', { lib: true, pkg: 'java.awt.event', sfields: maskF, sfieldTypes: intTypes(maskF) });
+
+  // Monitor.putSleep()/wakeUp(): Hauptprogramm schlafen legen, bis ein Ereignis es weckt (APLU)
+  const sleepers = [];
+  const monitorStatics = {
+    putSleep() { return new R.Suspend(() => new Promise((res) => sleepers.push(res)), () => rt.rtError('Monitor.putSleep() kann hier nicht warten (das geht nur in einem normal gestarteten Programm)')); },
+    wakeUp() { const ws = sleepers.splice(0); for (const f of ws) f(); },
+  };
+
   // ------------------------------------------------------------ Turtle
   const TURTLE_COLORS = ['cyan', 'yellow', 'magenta', 'lime', 'orange', 'deeppink', 'deepskyblue', 'gold'];
   let pgCount = 0;
-  function newPlayground(rt) {
-    const pg = { w: 400, h: 400, bg: 'white', turtles: [], n: 0 };
-    pg.win = gfx().newWindow({ kind: 'turtle', title: 'Java Playground', w: pg.w, h: pg.h, bg: pg.bg });
+  function newPlayground(rt, opt = {}) {
+    const pg = { w: opt.w || 400, h: opt.h || 400, bg: opt.bg || 'white', turtles: [], n: 0, frameObj: null };
+    pg.win = gfx().newWindow({ kind: 'turtle', title: opt.title || 'Java Playground', w: pg.w, h: pg.h, bg: pg.bg });
+    winState(pg.win).pg = pg;
     pgCount++;
     return pg;
+  }
+  // Das TurtleFrame-Objekt eines Turtle-Fensters (für getFrame() und MouseEvent.getSource())
+  function frameOf(pg) {
+    if (!pg.frameObj) { const f = new JObject(rt.cls('TurtleFrame')); f.native = { pg, frame: true }; pg.frameObj = f; }
+    const s = winState(pg.win); if (!s.src) s.src = pg.frameObj;
+    return pg.frameObj;
   }
   const P = (t, x, y) => ({ x: t.pg.w / 2 + x, y: t.pg.h / 2 - y });
   // Zeichenbefehl abgeben; hängt die Grafik hinterher, pausiert das Programm bald (live statt Aufzeichnung)
   const push = (win, op) => { const g = gfx(); g.op(win, op); if (g.busy && g.busy()) rt.yieldSoon(); };
   const emit = (t, op) => push(t.pg.win, op);
-  function pose(t) { const p = P(t, t.x, t.y); emit(t, { t: 'pose', tid: t.id, x: p.x, y: p.y, h: t.h, color: t.color, hidden: t.hidden }); }
+  function pose(t) { const p = P(t, t.x, t.y); emit(t, { t: 'pose', tid: t.id, x: p.x, y: p.y, h: t.h, color: t.color, hidden: t.hidden, ...(t.sprite ? { sprite: t.sprite } : {}) }); }
   function turtleState(rt, a, line) {
     let pg = null, colorArg = null;
     for (const v of a) {
@@ -117,8 +279,11 @@ R.Runtime.extensions.push(function (rt) {
     }
     if (!pg) pg = newPlayground(rt);
     const id = (pg.win * 1000) + (++pg.n);
+    // new Turtle("hase.gif"): Bild aus dem Projekt statt der Schildkröte (Sprite)
+    let sprite = null;
+    if (isImageName(colorArg)) { sprite = needAsset(colorArg, 'image', line).url; colorArg = null; }
     const c = colorArg !== null ? toColor(colorArg, line) : { css: TURTLE_COLORS[(pg.n - 1) % TURTLE_COLORS.length], obj: null };
-    const t = { pg, id, x: 0, y: 0, h: 0, pen: true, erase: false, penColor: 'blue', penObj: sf.blue, color: c.css, colorObj: c.obj, width: 1, hidden: false, speed: 200, fillColor: null, fillObj: null, path: null, fan: null, states: [], font: { family: 'SansSerif', style: 0, size: 12 } };
+    const t = { pg, id, sprite, x: 0, y: 0, h: 0, pen: true, erase: false, penColor: 'blue', penObj: sf.blue, color: c.css, colorObj: c.obj, width: 1, hidden: false, speed: 200, fillColor: null, fillObj: null, path: null, fan: null, states: [], font: { family: 'SansSerif', style: 0, size: 12 } };
     pg.turtles.push(t);
     return t;
   }
@@ -199,7 +364,13 @@ R.Runtime.extensions.push(function (rt) {
     fillPath(rt, o, a, line) { const t = self(o); if (!t.path) rt.rtError('fillPath() ohne vorheriges startPath()', line); const c = a.length ? toColor(a[0], line).css : (t.fillColor || t.penColor); emit(t, { t: 'poly', pts: t.path.map(([x, y]) => P(t, x, y)), fill: true, color: c }); t.path = null; return ret(o); },
     leftArc(rt, o, a) { arc(self(o), num(a[0]), num(a[1]), true); return ret(o); }, rightArc(rt, o, a) { arc(self(o), num(a[0]), num(a[1]), false); return ret(o); },
     leftCircle(rt, o, a) { arc(self(o), num(a[0]), 360, true); return ret(o); }, rightCircle(rt, o, a) { arc(self(o), num(a[0]), 360, false); return ret(o); },
-    stampTurtle(rt, o) { const t = self(o); const p = P(t, t.x, t.y); emit(t, { t: 'stamp', x: p.x, y: p.y, h: t.h, color: t.color }); return ret(o); },
+    stampTurtle(rt, o, a, line) { const t = self(o); const p = P(t, t.x, t.y); const c = a.length ? toColor(a[0], line).css : t.color; emit(t, { t: 'stamp', x: p.x, y: p.y, h: t.h, color: c, ...(!a.length && t.sprite ? { sprite: t.sprite } : {}) }); return ret(o); },
+    drawImage(rt, o, a, line) { const t = self(o); const im = needAsset(str(a[0]), 'image', line); const p = P(t, t.x, t.y); emit(t, { t: 'image', url: im.url, x: p.x, y: p.y, w: im.w, h: im.h, rot: t.h, anchor: 'center' }); return ret(o); },
+    drawBkImage(rt, o, a, line) { const t = self(o); const im = needAsset(str(a[0]), 'image', line); emit(t, { t: 'bkimage', url: im.url }); return ret(o); },
+    sound(rt, o, a) { return a.length >= 4 ? tone(a[1], a[2], num(a[0]) / 100, !!a[3]) : tone(a[0], a[1], 1, true); },
+    beep(rt, o) { push(0, { t: 'tone', freq: 880, ms: 120, vol: 0.8 }); return ret(o); },
+    ...keyMethods((o) => winState(self(o).pg.win)),
+    ...listenerMethods((o) => { frameOf(self(o).pg); return winState(self(o).pg.win); }, ['mouse', 'motion', 'key', 'hit', 'hitX', 'turtleHit', 'dbl', 'exit']),
     pushState(rt, o) { const t = self(o); t.states.push({ x: t.x, y: t.y, h: t.h, pen: t.pen, penColor: t.penColor, penObj: t.penObj, width: t.width }); return ret(o); },
     popState(rt, o) { const t = self(o); const s = t.states.pop(); if (s) { Object.assign(t, s); pose(t); } return ret(o); },
     clearStates(rt, o) { self(o).states = []; return ret(o); },
@@ -208,25 +379,28 @@ R.Runtime.extensions.push(function (rt) {
     setStatusText(rt, o, a) { const t = self(o); emit(t, { t: 'status', s: str(a[0]) }); return ret(o); },
     addStatusBar(rt, o) { return ret(o); }, showStatusBar(rt, o) { return ret(o); },
     isInPlayground(rt, o) { const t = self(o); return Math.abs(t.x) <= t.pg.w / 2 && Math.abs(t.y) <= t.pg.h / 2; },
-    wrap: ret, clip: ret, isClip() { return false; }, isWrap() { return false; }, antiAliasing: ret, enableRepaint: ret, repaint: ret, toTop: ret, toBottom: ret, setCursor: ret, setCustomCursor: ret, setAngleResolution: ret, beep: ret, print: ret, printScreen: ret,
+    wrap: ret, clip: ret, isClip() { return false; }, isWrap() { return false; }, antiAliasing: ret, enableRepaint: ret, repaint: ret, toTop: ret, toBottom: ret, setCursor: ret, setCustomCursor: ret, setAngleResolution: ret, print: ret, printScreen: ret,
     savePlayground() { return false; },
     viewingMoveTo(rt, o, a) { return tm.moveTo(rt, o, a); }, viewingSetPos(rt, o, a) { return tm.setPos(rt, o, a); },
     toTurtlePos(rt, o, a) { rt.rtError('toTurtlePos() wird nicht unterstützt'); },
     toTurtleX(rt, o, a) { return D(num(a[0]) - self(o).pg.w / 2); }, toTurtleY(rt, o, a) { return D(self(o).pg.h / 2 - num(a[0])); },
-    clone(rt, o) { const t = self(o); const c = new JObject(rt.cls('Turtle')); c.native = turtleState(rt, [o], 0); Object.assign(c.native, { x: t.x, y: t.y, h: t.h, pen: t.pen, penColor: t.penColor, penObj: t.penObj, color: t.color, colorObj: t.colorObj, width: t.width, speed: t.speed }); pose(c.native); return c; },
-    dispose(rt, o) { emit(self(o), { t: 'close' }); }, getFrame() { return null; }, getPlayground() { return null; }, getPen() { return null; },
+    clone(rt, o) { const t = self(o); const c = new JObject(rt.cls('Turtle')); c.native = turtleState(rt, [o], 0); Object.assign(c.native, { x: t.x, y: t.y, h: t.h, pen: t.pen, penColor: t.penColor, penObj: t.penObj, color: t.color, colorObj: t.colorObj, width: t.width, speed: t.speed, sprite: t.sprite, obj: c }); pose(c.native); return c; },
+    dispose(rt, o) { emit(self(o), { t: 'close' }); }, getFrame(rt, o) { return frameOf(self(o).pg); }, getPlayground() { return null; }, getPen() { return null; },
     getPixelColor() { rt.rtError('getPixelColor() wird in der Web-Version nicht unterstützt'); }, getPixelColorStr() { rt.rtError('getPixelColorStr() wird in der Web-Version nicht unterstützt'); },
   };
-  for (const n of ['addMouseListener', 'addMouseMotionListener', 'addKeyListener', 'addMouseHitListener', 'addMouseHitXListener', 'addMouseDoubleClickListener', 'addTurtleHitListener', 'addExitListener', 'addFocusListener', 'addComponentListener', 'addWindowListener', 'addWindowFocusListener', 'sound', 'drawImage', 'drawBkImage', 'getTurtleImage', 'getTurtleFactory'])
-    tm[n] = () => rt.rtError(`Turtle.${n}() wird in der Web-Version nicht unterstützt (Maus-/Tastatur-Ereignisse, Bilder und Sound fehlen)`);
+  for (const n of ['addFocusListener', 'addComponentListener', 'addWindowListener', 'addWindowFocusListener', 'getTurtleImage', 'getTurtleFactory'])
+    tm[n] = () => rt.rtError(`Turtle.${n}() wird in der Web-Version nicht unterstützt`);
+  // Tastaturabfragen gibt es in APLU nur bei TurtleFrame (tf.getKeyCodeWait()), nicht bei Turtle
+  for (const n of Object.keys(keyRet)) delete tm[n];
   const TT = T('Turtle');
   const tRet = {};
   for (const k of Object.keys(tm)) tRet[k] = TT;
-  Object.assign(tRet, { getX: DOUBLE, getY: DOUBLE, towards: DOUBLE, distance: DOUBLE, isPenUp: BOOL, isHidden: BOOL, getSpeed: INT, getColor: T('Color'), getPenColor: T('Color'), getFillColor: T('Color'), getColorStr: STRING, getPenColorStr: STRING, getFillColorStr: STRING, getPenWidth: INT, isInPlayground: BOOL, isClip: BOOL, isWrap: BOOL, getFont: T('Font'), getTextWidth: INT, getTextHeight: INT, getTextAscent: INT, getTextDescent: INT, toTurtleX: DOUBLE, toTurtleY: DOUBLE, savePlayground: BOOL, dispose: VOID, heading: null, penWidth: null });
+  for (const n of [...Object.keys(tm)].filter(n => /^add\w+Listener$/.test(n))) tRet[n] = VOID;
+  Object.assign(tRet, { sound: VOID, getFrame: T('TurtleFrame'), getX: DOUBLE, getY: DOUBLE, towards: DOUBLE, distance: DOUBLE, isPenUp: BOOL, isHidden: BOOL, getSpeed: INT, getColor: T('Color'), getPenColor: T('Color'), getFillColor: T('Color'), getColorStr: STRING, getPenColorStr: STRING, getFillColorStr: STRING, getPenWidth: INT, isInPlayground: BOOL, isClip: BOOL, isWrap: BOOL, getFont: T('Font'), getTextWidth: INT, getTextHeight: INT, getTextAscent: INT, getTextDescent: INT, toTurtleX: DOUBLE, toTurtleY: DOUBLE, savePlayground: BOOL, dispose: VOID, heading: null, penWidth: null });
   const p = (type, name) => ({ type: T(type), name });
   def('Turtle', { pkg: 'ch.aplu.turtle', extendable: true,
     ctor(rt, a, line, type) { const o = new JObject(rt.cls('Turtle')); this.initInstance(rt, o, a, line); return o; },
-    initInstance(rt, o, a, line) { o.native = turtleState(rt, a, line); pose(o.native); },
+    initInstance(rt, o, a, line) { o.native = turtleState(rt, a, line); o.native.obj = o; pose(o.native); },
     methods: tm, retTypes: tRet,
     statics: { sleep(rt, a) { return rt.sleep(num(a[0])); }, setFramePosition: noop, setPlaygroundSize: noop, clear: noop },
     toString(rt, o) { const t = o.native; return `Turtle(x=${+t.x.toFixed(2)}, y=${+t.y.toFixed(2)}, Richtung=${+t.h.toFixed(2)})`; },
@@ -241,7 +415,39 @@ R.Runtime.extensions.push(function (rt) {
       { name: 'fill', params: [], ret: TT }, { name: 'label', params: [p('String', 'text')], ret: TT }, { name: 'speed', params: [p('double', 'speed')], ret: TT }, { name: 'hideTurtle', params: [], ret: TT }, { name: 'showTurtle', params: [], ret: TT },
       { name: 'clear', params: [], ret: TT }, { name: 'getX', params: [], ret: DOUBLE }, { name: 'getY', params: [], ret: DOUBLE }, { name: 'heading', params: [], ret: DOUBLE }],
   });
-  rt._def('TurtleFrame', { lib: true, pkg: 'ch.aplu.turtle' }); rt._def('Playground', { lib: true, pkg: 'ch.aplu.turtle' }); rt._def('Pen', { lib: true, pkg: 'ch.aplu.turtle' });
+  // TurtleFrame: eigenes Turtle-Fenster, in das mehrere Turtles gesetzt werden (new Turtle(tf)); hat die Tastaturabfragen
+  const F = (o) => { if (!o.native || !o.native.pg) rt.rtError('TurtleFrame wurde nicht richtig erzeugt'); return o.native.pg; };
+  const FS = (o) => winState(F(o).win, o);
+  def('TurtleFrame', { pkg: 'ch.aplu.turtle', extendable: true,
+    ctor(rt, a, line) { const o = new JObject(rt.cls('TurtleFrame')); this.initInstance(rt, o, a, line); return o; },
+    initInstance(rt, o, a, line) {
+      const opt = {};
+      const strs = a.filter(v => typeof v === 'string'), ints = a.filter(v => typeof v === 'number');
+      const col = a.find(v => v instanceof JObject && v.native && v.native.r !== undefined);
+      if (strs.length) opt.title = strs[0];
+      if (col) opt.bg = toColor(col, line).css;
+      // (titel, breite, höhe) bzw. (x, y, titel, breite, höhe …): die Größe steht hinter dem Titel
+      const si = a.findIndex(v => typeof v === 'string');
+      if (si >= 0 && typeof a[si + 1] === 'number' && typeof a[si + 2] === 'number') { opt.w = Math.max(50, Math.min(1600, int(a[si + 1]))); opt.h = Math.max(50, Math.min(1200, int(a[si + 2]))); }
+      else if (ints.length === 1 && a.length === 1) { /* Modus – ohne Bedeutung im Browser */ }
+      o.native = { pg: newPlayground(rt, opt), frame: true };
+      o.native.pg.frameObj = o; winState(o.native.pg.win, o);
+    },
+    methods: {
+      ...keyMethods(FS),
+      ...listenerMethods(FS, ['mouse', 'motion', 'key', 'hit', 'hitX', 'dbl', 'exit']),
+      addMouseWheelListener() { rt.rtError('addMouseWheelListener() wird in der Web-Version nicht unterstützt'); },
+      setStatusText(rt, o, a) { push(F(o).win, { t: 'status', s: str(a[0]) }); }, addStatusBar: noop, showStatusBar: noop,
+      setTitle(rt, o, a) { push(F(o).win, { t: 'title', s: str(a[0]) }); },
+      drawBkImage(rt, o, a, line) { const im = needAsset(str(a[0]), 'image', line); push(F(o).win, { t: 'bkimage', url: im.url }); },
+      dispose(rt, o) { push(F(o).win, { t: 'close' }); }, getPlayground() { return null; }, setCursor: noop, setClosingMode: noop, setDoubleClickDelay: noop, getDoubleClickDelay() { return 260; }, getMouseHitButton() { return 1; },
+      setVisible: noop, toFront: noop, repaint: noop,
+    },
+    retTypes: { ...keyRet, getDoubleClickDelay: INT, getMouseHitButton: INT },
+    statics: { isDisposed() { return false; }, getLastFrame() { return null; } }, staticRet: { isDisposed: BOOL },
+    toString(rt, o) { return 'TurtleFrame'; },
+  });
+  rt._def('Playground', { lib: true, pkg: 'ch.aplu.turtle' }); rt._def('Pen', { lib: true, pkg: 'ch.aplu.turtle' });
 
   // ------------------------------------------------------------ GPanel
   function gpState(rt, a, line) {
@@ -252,9 +458,11 @@ R.Runtime.extensions.push(function (rt) {
     if (nums.length >= 4) [g.xmin, g.xmax, g.ymin, g.ymax] = nums.slice(0, 4).map(num);
     if (g.xmax === g.xmin || g.ymax === g.ymin) rt.rtError('GPanel: Koordinatenbereich darf nicht leer sein', line);
     g.win = gfx().newWindow({ kind: 'gpanel', title: g.title, w: g.w, h: g.h, bg: g.bg });
+    winState(g.win);
     return g;
   }
   const G = (o) => { if (!o.native || o.native.xmin === undefined) rt.rtError('GPanel wurde nicht richtig erzeugt'); return o.native; };
+  const GS = (o) => winState(G(o).win, o);
   const gx = (g, x) => (num(x) - g.xmin) / (g.xmax - g.xmin) * (g.w - 1);
   const gy = (g, y) => (g.ymax - num(y)) / (g.ymax - g.ymin) * (g.h - 1);
   const sx = (g, d) => Math.abs(num(d) / (g.xmax - g.xmin) * (g.w - 1));
@@ -298,16 +506,23 @@ R.Runtime.extensions.push(function (rt) {
     getPosX(rt, o) { return D(G(o).px); }, getPosY(rt, o) { return D(G(o).py); },
     toWindowX(rt, o, a) { const g = G(o); return D(g.xmin + num(a[0]) / (g.w - 1) * (g.xmax - g.xmin)); }, toWindowY(rt, o, a) { const g = G(o); return D(g.ymax - num(a[0]) / (g.h - 1) * (g.ymax - g.ymin)); },
     toPixelX(rt, o, a) { return Math.round(gx(G(o), a[0])); }, toPixelY(rt, o, a) { return Math.round(gy(G(o), a[0])); },
-    kbhit() { return false; }, enableRepaint: noop, repaint: noop, refresh: noop, setPaintMode: noop, setXORMode: noop, visible: noop, dispose(rt, o) { gop(G(o), { t: 'close' }); }, showStatusBar: noop, setStatusText(rt, o, a) { gop(G(o), { t: 'status', s: str(a[0]) }); },
-    windowPosition: noop, windowCenter: noop, image: () => rt.rtError('GPanel.image() wird in der Web-Version nicht unterstützt'),
+    enableRepaint: noop, repaint: noop, refresh: noop, setPaintMode: noop, setXORMode: noop, visible: noop, dispose(rt, o) { gop(G(o), { t: 'close' }); }, showStatusBar: noop, setStatusText(rt, o, a) { gop(G(o), { t: 'status', s: str(a[0]) }); },
+    windowPosition: noop, windowCenter: noop,
+    // Bild aus dem Projekt; (x, y) ist die linke untere Ecke (wie in APLU)
+    image(rt, o, a, line) { const g = G(o); const im = needAsset(str(a[0]), 'image', line); const [x, y] = xy(a, 1); gop(g, { t: 'image', url: im.url, x: gx(g, x), y: gy(g, y) - im.h + 1, w: im.w, h: im.h }); return true; },
+    imageWidth(rt, o, a, line) { const g = G(o); const im = needAsset(str(a[0]), 'image', line); return D(im.w / (g.w - 1) * Math.abs(g.xmax - g.xmin)); },
+    imageHeight(rt, o, a, line) { const g = G(o); const im = needAsset(str(a[0]), 'image', line); return D(im.h / (g.h - 1) * Math.abs(g.ymax - g.ymin)); },
+    ...keyMethods(GS),
+    ...listenerMethods(GS, ['mouse', 'motion', 'key', 'dbl', 'exit']),
+    addMouseWheelListener() { rt.rtError('addMouseWheelListener() wird in der Web-Version nicht unterstützt'); },
   };
-  for (const n of ['getKey', 'getKeyWait', 'getKeyCode', 'getKeyCodeWait', 'addMouseListener', 'addMouseMotionListener', 'addKeyListener', 'addExitListener', 'getPixelColor', 'print', 'saveGraphics', 'restoreGraphics'])
-    gm[n] = () => rt.rtError(`GPanel.${n}() wird in der Web-Version nicht unterstützt (Tastatur-/Mausereignisse und Drucken fehlen)`);
+  for (const n of ['getPixelColor', 'print', 'saveGraphics', 'restoreGraphics'])
+    gm[n] = () => rt.rtError(`GPanel.${n}() wird in der Web-Version nicht unterstützt`);
   def('GPanel', { pkg: 'ch.aplu.util', extendable: true,
     ctor(rt, a, line) { const o = new JObject(rt.cls('GPanel')); this.initInstance(rt, o, a, line); return o; },
-    initInstance(rt, o, a, line) { o.native = gpState(rt, a, line); },
+    initInstance(rt, o, a, line) { o.native = gpState(rt, a, line); winState(o.native.win, o); },
     methods: gm,
-    retTypes: { color: T('Color'), setColor: T('Color'), lineWidth: INT, getPosX: DOUBLE, getPosY: DOUBLE, toWindowX: DOUBLE, toWindowY: DOUBLE, toPixelX: INT, toPixelY: INT, kbhit: BOOL },
+    retTypes: { ...keyRet, color: T('Color'), setColor: T('Color'), lineWidth: INT, getPosX: DOUBLE, getPosY: DOUBLE, toWindowX: DOUBLE, toWindowY: DOUBLE, toPixelX: INT, toPixelY: INT, image: BOOL, imageWidth: DOUBLE, imageHeight: DOUBLE },
     statics: { delay(rt, a) { return rt.sleep(num(a[0])); } },
     toString(rt, o) { return 'GPanel[' + o.native.title + ']'; },
     inspectRows(rt, o) { const g = o.native; return [{ name: 'x-Bereich', type: '', value: `${g.xmin} … ${g.xmax}` }, { name: 'y-Bereich', type: '', value: `${g.ymin} … ${g.ymax}` }, { name: 'Position', type: '', value: `(${+g.px.toFixed(3)}, ${+g.py.toFixed(3)})` }, { name: 'Farbe', type: '', value: g.color }]; },
@@ -366,7 +581,34 @@ R.Runtime.extensions.push(function (rt) {
     statics: { show(rt, a) { return showMsg('Meldung', str(a[a.length - 1])); } },
   });
   def('ModelessOptionPane', { pkg: 'ch.aplu.util', ctor(rt, a) { const s = a.filter(v => typeof v === 'string'); gfx().message(s.length ? s[s.length - 1] : '', 'Meldung'); const o = new JObject(rt.cls('ModelessOptionPane')); o.native = {}; return o; }, methods: { setText(rt, o, a) { return showMsg('Meldung', str(a[0])); }, dispose() { } } });
-  def('Monitor', { pkg: 'ch.aplu.util', statics: { putSleep() { rt.rtError('Monitor.putSleep() wartet auf Ereignisse und wird in der Web-Version nicht unterstützt'); }, wakeUp() { } } });
+  def('Monitor', { pkg: 'ch.aplu.util', statics: monitorStatics });
+
+  // ------------------------------------------------------------ SoundPlayer (ch.aplu.util): Klangdatei aus dem Projekt
+  let sndId = 0;
+  const SP = (o) => { if (!o.native || !o.native.sid) rt.rtError('SoundPlayer wurde nicht richtig erzeugt'); return o.native; };
+  const sndOp = (p, act) => push(0, { t: 'sound', id: p.sid, url: p.url, act, vol: p.muted ? 0 : p.vol / 1000 });
+  def('SoundPlayer', { pkg: 'ch.aplu.util',
+    ctor(rt, a, line) {
+      const name = a.find(v => typeof v === 'string');
+      if (name === undefined) rt.rtError('new SoundPlayer("datei.wav") erwartet', line);
+      const f = needAsset(name, 'audio', line);
+      const o = new JObject(rt.cls('SoundPlayer')); o.native = { sid: ++sndId, url: f.url, name, vol: 1000, muted: false }; return o;
+    },
+    methods: {
+      play(rt, o) { sndOp(SP(o), 'play'); return 0; }, replay(rt, o) { sndOp(SP(o), 'replay'); }, playLoop(rt, o) { sndOp(SP(o), 'loop'); },
+      blockingPlay(rt, o) { const p = SP(o); sndOp(p, 'play'); return new R.Suspend(() => rt.whenGfxIdle().then(() => new Promise((res) => { const g = gfx(); if (g.whenSoundEnds) g.whenSoundEnds(p.sid, res); else res(); })), () => undefined); },
+      stop(rt, o) { sndOp(SP(o), 'stop'); }, pause(rt, o) { sndOp(SP(o), 'pause'); }, release() { },
+      isPlaying(rt, o) { const g = gfx(); return g.soundPlaying ? g.soundPlaying(SP(o).sid) : false; },
+      setVolume(rt, o, a) { const p = SP(o); p.vol = Math.max(0, Math.min(1000, int(a[0]))); sndOp(p, 'volume'); }, getVolume(rt, o) { return SP(o).vol; },
+      mute(rt, o, a) { const p = SP(o); p.muted = !!a[0]; sndOp(p, 'volume'); },
+    },
+    retTypes: { play: INT, isPlaying: BOOL, getVolume: INT },
+    statics: {
+      playSine(rt, a) { return a.length >= 4 ? tone(a[1], a[2], num(a[0]) / 100, !!a[3]) : tone(a[0], a[1], 1, true); },
+      delay(rt, a) { return rt.sleep(num(a[0])); },
+    },
+    toString(rt, o) { return 'SoundPlayer[' + o.native.name + ']'; },
+  });
 
   // ------------------------------------------------------------ Scanner (java.util) über Eingabedialog
   def('Scanner', { pkg: 'java.util', lib: false,
