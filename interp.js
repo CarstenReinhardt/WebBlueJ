@@ -722,6 +722,8 @@ class Runtime {
     this.installNatives();
     for (const ext of Runtime.extensions) ext(this);
     const decls = new Parser(PRELUDE).parseUnit();
+    // Weitere eingebaute Klassen als Java-Quelltext (z. B. Listener-Interfaces aus aplu.js)
+    for (const p of Runtime.preludes) for (const d of new Parser(p.code).parseUnit()) { d.pkg = p.pkg; decls.push(d); }
     this.buildClasses(decls, true);
     this.builtinClasses = new Map(this.classes);
     this.padClass = new ClassInfo('Direkteingabe', null, { builtin: true });
@@ -761,7 +763,7 @@ class Runtime {
       const prev = this.classes.get(d.name);
       if (prev && !builtin && prev.native && prev.native.lib) this.classes.delete(d.name);
       if (this.classes.has(d.name)) fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : `Klasse '${d.name}' gibt es doppelt`);
-      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (UTIL_EXC.has(d.name) ? 'java.util' : 'java.lang') : null });
+      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : 'java.lang')) : null });
       c.fileId = d.fileId;
       this.classes.set(d.name, c); made.push(c);
     }
@@ -965,6 +967,22 @@ class Runtime {
     });
   }
   get running() { return !!this.task; }
+  // Ereignis aus der Oberfläche (Maus, Tastatur, Fenster schließen): die passende Methode
+  // des Listener-Objekts aufrufen. Läuft gerade kein Programm, startet der Aufruf als eigener
+  // unterbrechbarer Lauf (io.runEvent). Läuft eines (es ist zwischen zwei Zeitscheiben
+  // pausiert), wird der Aufruf sofort dazwischen ausgeführt – wie im Java-Ereignis-Thread.
+  fireEvent(obj, name, args, label) {
+    const m = this.lookupMethods(obj.cls, name).find(x => !x.abstract && !x.static && x.params.length === args.length);
+    if (!m) return;
+    const io = this.io;
+    if (this.task) {
+      const r = this.run(() => this.callMethod(obj, m, args));
+      if (io.onEvent) { try { io.onEvent(r, label || name); } catch (e) { } }
+      return;
+    }
+    if (io.runEvent) { io.runEvent(() => this.callMethodG(obj, m, args), label || name); return; }
+    this.runAsync(() => this.callMethodG(obj, m, args));
+  }
   // Laufendes Programm beenden (Knopf „Beenden“). Der Generator wird einfach
   // nicht weiter ausgeführt; der Aufrufstapel wird zurückgesetzt.
   stop() {
@@ -3068,5 +3086,6 @@ function quickInfo(code) {
 }
 
 Runtime.extensions = [];
+Runtime.preludes = [];   // { pkg, code }: eingebaute Klassen als Java-Quelltext
 global.JavaRT = { Runtime, Suspend, TICK, Parser, lex, JavaError, JObject, JArray, JDouble, JChar, JClassRef, Env, typeStr, fmtDouble, quickInfo, T };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -393,5 +393,95 @@ public class Blume {
   bench: [{ name: 'zeichnerin1', expr: 'new Zeichnerin()' }],
 };
 
-global.WB_EXAMPLES = [bank, formen, wuerfel, turtle];
+const interaktiv = {
+  name: 'Maus und Tastatur',
+  classes: [
+    { name: 'Malprogramm', x: 80, y: 60, code: `import ch.aplu.util.*;
+import java.awt.Color;
+import java.awt.event.*;
+
+/**
+ * Ein kleines Malprogramm: Mit gedrückter Maustaste malen.
+ * Tasten r, g, b, s wählen die Farbe, c löscht das Bild.
+ * (Zuerst in das Fenster klicken, damit es die Tasten bekommt.)
+ */
+public class Malprogramm implements MouseListener, MouseMotionListener, KeyListener {
+    private GPanel p;
+
+    public Malprogramm() {
+        p = new GPanel("Malprogramm", 0, 100, 0, 100);
+        p.lineWidth(3);
+        p.addMouseListener(this);
+        p.addMouseMotionListener(this);
+        p.addKeyListener(this);
+        p.text(2, 96, "Maustaste gedrückt halten: malen   r g b s: Farbe   c: löschen");
+    }
+
+    public void mousePressed(MouseEvent e) {
+        p.move(p.toWindowX(e.getX()), p.toWindowY(e.getY()));
+    }
+
+    public void mouseDragged(MouseEvent e) {
+        p.draw(p.toWindowX(e.getX()), p.toWindowY(e.getY()));
+    }
+
+    public void keyPressed(KeyEvent e) {
+        char c = e.getKeyChar();
+        if (c == 'r') p.color(Color.red);
+        else if (c == 'g') p.color(Color.green);
+        else if (c == 'b') p.color(Color.blue);
+        else if (c == 's') p.color(Color.black);
+        else if (c == 'c') p.clear();
+    }
+
+    // Diese Methoden verlangen die Interfaces, sie werden hier nicht gebraucht.
+    public void mouseReleased(MouseEvent e) { }
+    public void mouseClicked(MouseEvent e) { }
+    public void mouseEntered(MouseEvent e) { }
+    public void mouseExited(MouseEvent e) { }
+    public void mouseMoved(MouseEvent e) { }
+    public void keyReleased(KeyEvent e) { }
+    public void keyTyped(KeyEvent e) { }
+
+    public static void main(String[] args) {
+        new Malprogramm();
+    }
+}` },
+    { name: 'Steuerung', x: 380, y: 60, code: `import ch.aplu.turtle.*;
+import java.awt.event.KeyEvent;
+
+/**
+ * Steuert eine Turtle mit den Pfeiltasten, Escape beendet.
+ * Erzeuge ein Objekt und rufe starten() auf.
+ */
+public class Steuerung {
+    private TurtleFrame fenster;
+    private Turtle t;
+
+    public Steuerung() {
+        fenster = new TurtleFrame("Pfeiltasten steuern die Turtle");
+        t = new Turtle(fenster);
+    }
+
+    public void starten() {
+        while (true) {
+            int taste = fenster.getKeyCodeWait();
+            switch (taste) {
+                case KeyEvent.VK_LEFT:  t.left(90); break;
+                case KeyEvent.VK_RIGHT: t.right(90); break;
+                case KeyEvent.VK_UP:    t.forward(20); break;
+                case KeyEvent.VK_DOWN:  t.back(20); break;
+                case KeyEvent.VK_ESCAPE:
+                    t.sound(660, 200);
+                    System.out.println("Steuerung beendet");
+                    return;
+            }
+        }
+    }
+}` },
+  ],
+  bench: [],
+};
+
+global.WB_EXAMPLES = [bank, formen, wuerfel, turtle, interaktiv];
 })(typeof window !== 'undefined' ? window : globalThis);

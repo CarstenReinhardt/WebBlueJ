@@ -16,7 +16,16 @@ const gfx = window.WBGfx.create({
 });
 // Während ein Programm läuft, wird die Ausgabe zwischen den Zeitscheiben angezeigt
 let liveOut = null;
-const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx, onSlice: () => { if (liveOut) liveOut(); else flushOutput(); } });
+const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx, onSlice: () => { if (liveOut) liveOut(); else flushOutput(); },
+  assets: (name) => findAsset(name),
+  // Maus-/Tastaturereignis, während kein Programm läuft: als eigener Lauf
+  runEvent: (makeGen, label) => {
+    setRunning(true);
+    rt.runAsync(makeGen).then((r) => { setRunning(false); flushOutput(); eventResult(r, label); });
+  },
+  // Ereignis, das zwischen zwei Zeitscheiben eines laufenden Programms ausgeführt wurde
+  onEvent: (r, label) => { flushOutput(); eventResult(r, label); },
+});
 const S = {
   project: null,        // { name, classes: [{ id, name, code, x, y }] }
   status: {},           // id -> { dirty, error: {line, message} }
@@ -32,13 +41,18 @@ S.padEnv = new Env(S.benchEnv);
 let uid = 1; const newId = () => 'c' + Date.now().toString(36) + (uid++);
 
 const LIB = 'javawerkbank.library.v1';
-function projectData() { return { id: S.project.id, name: S.project.name, savedAt: Date.now(), classes: S.project.classes.map(c => ({ id: c.id, name: c.name, code: c.code, x: c.x, y: c.y })) }; }
+function projectData() { return { id: S.project.id, name: S.project.name, savedAt: Date.now(), classes: S.project.classes.map(c => ({ id: c.id, name: c.name, code: c.code, x: c.x, y: c.y })), files: (S.project.files || []).map(f => ({ ...f })) }; }
 function readLib() { try { const l = JSON.parse(localStorage.getItem(LIB) || 'null'); if (l && l.projects) return l; } catch (e) { } return { projects: {} }; }
 function writeLib(l) { try { localStorage.setItem(LIB, JSON.stringify(l)); return true; } catch (e) { return false; } }
+let quotaWarned = false;
 function save() {
   const d = projectData();
   try { localStorage.setItem(STORE, JSON.stringify(d)); } catch (e) { }
-  const l = readLib(); l.projects[d.id] = d; l.current = d.id; writeLib(l);
+  const l = readLib(); l.projects[d.id] = d; l.current = d.id;
+  const ok = writeLib(l);
+  if (!ok && !quotaWarned) { quotaWarned = true; toast('Der Browser-Speicher ist voll – das Projekt konnte nicht gespeichert werden. Lösche große Bilder/Klänge oder alte Projekte und sichere als ZIP.', true); }
+  if (ok) quotaWarned = false;
+  return ok;
 }
 function loadSaved() {
   try { const p = JSON.parse(localStorage.getItem(STORE) || 'null'); if (p && Array.isArray(p.classes)) return p; } catch (e) { }
@@ -392,11 +406,22 @@ function inspectorModal(data, value, title) {
   actions.push({ label: 'Schließen', primary: true });
   openModal({ title: 'Inspektor: ' + title + (data.title && !title.includes(data.title) ? '  ·  ' + data.title : ''), body: wrap, actions, wide: true });
 }
-function showRuntimeError(r, callText) {
+// Fehler in einem Maus-/Tastatur-Ereignis: wie in Java nur in der Konsole melden
+// (sonst käme z. B. bei mouseMoved ein Dialog nach dem anderen)
+let lastEventErr = 0;
+function eventResult(r, label) {
+  if (!r || r.ok || r.stopped || r.busy) return;
+  if (r.exited !== undefined) { writeConsole(`[Programm mit System.exit(${r.exited}) beendet]\n`, 'note'); gfx.closeAll(); return; }
+  showRuntimeError(r, `Fehler beim Ereignis ${label}()`, { quiet: true });
+  if (Date.now() - lastEventErr > 4000) toast(`Fehler beim Ereignis ${label}() – siehe Konsole`, true);
+  lastEventErr = Date.now();
+}
+function showRuntimeError(r, callText, opts = {}) {
   const isEx = r.exception;
   writeConsole((callText ? callText + '\n' : '') + (isEx ? 'Exception: ' : 'Fehler: ') + r.message + '\n', 'err');
   if (r.trace) for (const f of r.trace.slice(0, 8)) writeConsole(`    bei ${f.cls}.${f.method === '<clinit>' ? '<Klasseninitialisierung>' : f.method}  (Zeile ${f.line})\n`, 'err');
   showTab('console');
+  if (opts.quiet) return;
   const cls = r.className && classByName(r.className);
   const wrap = document.createElement('div'); wrap.style.display = 'contents';
   const p = document.createElement('div'); p.className = 'formerr'; p.style.fontFamily = 'var(--mono)'; p.textContent = r.message; wrap.appendChild(p);
@@ -429,7 +454,7 @@ async function runProgram(makeGen, opts = {}) {
 }
 function stopProgram() {
   if (!rt.running) return;
-  rt.stop(); gfx.cancel();
+  rt.stop(); gfx.cancel(); gfx.detach();
 }
 function runUI(fn, ok) { const r = rt.run(fn); flushOutput(); if (!r.ok) showRuntimeError(r); else ok(r.value); }
 
@@ -895,7 +920,8 @@ function removeClass(id) {
 
 // ------------------------------------------------------------ Projekte
 function loadProject(p, { benchFrom } = {}) {
-  S.project = { id: p.id || ('p' + newId()), name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, code: c.code, x: c.x ?? 40, y: c.y ?? 40 })) };
+  S.project = { id: p.id || ('p' + newId()), name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, code: c.code, x: c.x ?? 40, y: c.y ?? 40 })), files: (p.files || []).map(f => ({ ...f })) };
+  preloadAssets();
   S.status = {}; S.info = {}; S.editing = null; $('editorPane').hidden = true;
   for (const c of S.project.classes) { refreshInfo(c); S.status[c.id] = { dirty: true }; }
   clearBench();
@@ -919,6 +945,7 @@ function projectMenu() {
   items.push({ label: 'Als ZIP herunterladen', plain: true, action: exportZip });
   items.push({ label: 'ZIP- oder .java-Dateien importieren …', plain: true, action: () => $('fileInput').click() });
   items.push({ label: 'Quelltext anzeigen (kopieren)', plain: true, action: exportDialog });
+  items.push({ label: `Bilder und Klänge … ${S.project.files && S.project.files.length ? '(' + S.project.files.length + ')' : ''}`, plain: true, action: assetsDialog });
   items.push({ header: 'Beispiel öffnen' });
   for (const ex of window.WB_EXAMPLES) items.push({ label: ex.name, plain: true, action: () => { syncEditor(); save(); loadProject({ ...ex, name: uniqueProjectName(ex.name), classes: ex.classes.map(c => ({ ...c })) }, { benchFrom: ex.bench }); toast(`Beispiel „${ex.name}“ geöffnet. Dein vorheriges Projekt liegt unter „Meine Projekte“.`); } });
   showMenu(r.left, r.bottom + 4, items);
@@ -962,7 +989,7 @@ function saveAsDialog() {
   const form = document.createElement('form'); form.className = 'field';
   form.innerHTML = '<label for="saName">Name der Kopie</label><input id="saName" autocomplete="off">';
   form.querySelector('input').value = uniqueProjectName(S.project.name + ' Kopie');
-  const ok = () => { const v = form.querySelector('input').value.trim(); if (!v) return true; const d = projectData(); loadProject({ name: uniqueProjectName(v), classes: d.classes.map(c => ({ ...c, id: undefined })) }); toast(`Kopie „${S.project.name}“ gespeichert und geöffnet.`); };
+  const ok = () => { const v = form.querySelector('input').value.trim(); if (!v) return true; const d = projectData(); loadProject({ name: uniqueProjectName(v), classes: d.classes.map(c => ({ ...c, id: undefined })), files: d.files }); toast(`Kopie „${S.project.name}“ gespeichert und geöffnet.`); };
   form.addEventListener('submit', (e) => { e.preventDefault(); if (ok() !== true) modals[modals.length - 1].close(); });
   openModal({ title: 'Kopie speichern unter', body: form, actions: [{ label: 'Abbrechen' }, { label: 'Speichern', primary: true, action: ok }] });
 }
@@ -980,7 +1007,8 @@ function libraryDialog() {
     for (const pr of projects) {
       const row = document.createElement('div'); row.className = 'prow' + (pr.id === S.project.id ? ' current' : '');
       const when = pr.savedAt ? new Date(pr.savedAt).toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' }) : '';
-      row.innerHTML = `<div class="pinfo"><b>${esc(pr.name)}</b><span>${pr.classes.length} Klasse${pr.classes.length === 1 ? '' : 'n'} · ${esc(when)}${pr.id === S.project.id ? ' · geöffnet' : ''}</span></div>`;
+      const nf = (pr.files || []).length;
+      row.innerHTML = `<div class="pinfo"><b>${esc(pr.name)}</b><span>${pr.classes.length} Klasse${pr.classes.length === 1 ? '' : 'n'}${nf ? ` · ${nf} Datei${nf === 1 ? '' : 'en'}` : ''} · ${esc(when)}${pr.id === S.project.id ? ' · geöffnet' : ''}</span></div>`;
       const open = document.createElement('button'); open.type = 'button'; open.className = 'btn small' + (pr.id === S.project.id ? '' : ' primary'); open.textContent = 'Öffnen';
       open.disabled = pr.id === S.project.id;
       open.addEventListener('click', () => { ctl.close(); loadProject(pr); toast(`Projekt „${pr.name}“ geöffnet.`); });
@@ -996,6 +1024,78 @@ function libraryDialog() {
   };
   render();
   ctl = openModal({ title: 'Meine Projekte', body: wrap, wide: true, actions: [{ label: 'Neues Projekt', action: () => { newProjectDialog(); } }, { label: 'Schließen', primary: true }] });
+}
+
+// ---- Bilder und Klänge im Projekt (als data:-URL gespeichert, im ZIP als Dateien)
+const IMG_EXT = /\.(png|gif|jpe?g|bmp|webp|svg)$/i, SND_EXT = /\.(wav|mp3|ogg|oga|m4a|aac|flac)$/i;
+const assetKind = (n) => IMG_EXT.test(n) ? 'image' : SND_EXT.test(n) ? 'audio' : null;
+function mimeOf(n) {
+  const e = n.split('.').pop().toLowerCase();
+  return { png: 'image/png', gif: 'image/gif', jpg: 'image/jpeg', jpeg: 'image/jpeg', bmp: 'image/bmp', webp: 'image/webp', svg: 'image/svg+xml', wav: 'audio/wav', mp3: 'audio/mpeg', ogg: 'audio/ogg', oga: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac' }[e] || 'application/octet-stream';
+}
+const normPath = (n) => String(n).replace(/\\/g, '/').replace(/^(\.\/)+/, '').replace(/^\/+/, '').toLowerCase();
+// Sucht eine Datei wie Java relativ zum Projektordner; der Ordner darf auch fehlen ("sprites/ball.gif" findet "ball.gif")
+function findAsset(name) {
+  const files = (S.project && S.project.files) || []; if (!files.length) return null;
+  const n = normPath(name), base = n.split('/').pop();
+  const f = files.find(x => normPath(x.name) === n) || files.find(x => normPath(x.name).split('/').pop() === base);
+  return f ? { kind: assetKind(f.name), url: f.data, w: f.w || 0, h: f.h || 0, name: f.name } : null;
+}
+function preloadAssets() { for (const f of (S.project && S.project.files) || []) if (assetKind(f.name) === 'image' && gfx.image) gfx.image(f.data); }
+function imageSize(url) { return new Promise((res) => { const im = new Image(); im.onload = () => res({ w: im.naturalWidth, h: im.naturalHeight }); im.onerror = () => res({ w: 0, h: 0 }); im.src = url; }); }
+async function assetFromData(name, data) {
+  const f = { name, data, size: Math.round((data.length - data.indexOf(',') - 1) * 0.75) };
+  if (assetKind(name) === 'image') Object.assign(f, await imageSize(data));
+  return f;
+}
+const readDataUrl = (file) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
+const MAX_ASSET = 2 * 1024 * 1024;
+async function addAssetFiles(list) {
+  let n = 0;
+  for (const file of list) {
+    if (!assetKind(file.name)) { toast(`„${file.name}“ ist kein Bild oder Klang (png, gif, jpg, wav, mp3, ogg …).`, true); continue; }
+    if (file.size > MAX_ASSET) { toast(`„${file.name}“ ist zu groß (${Math.round(file.size / 1024)} KB, höchstens 2 MB). Bitte verkleinern.`, true); continue; }
+    let data; try { data = await readDataUrl(file); } catch (e) { toast(`„${file.name}“ konnte nicht gelesen werden.`, true); continue; }
+    if (!data.startsWith('data:' + mimeOf(file.name))) data = 'data:' + mimeOf(file.name) + data.slice(data.indexOf(';'));
+    const f = await assetFromData(file.name, data);
+    const files = S.project.files || (S.project.files = []);
+    const i = files.findIndex(x => x.name.toLowerCase() === file.name.toLowerCase());
+    if (i >= 0) files[i] = f; else files.push(f);
+    n++;
+  }
+  if (n) { preloadAssets(); if (save()) toast(`${n} Datei${n === 1 ? '' : 'en'} zum Projekt hinzugefügt.`); }
+  return n;
+}
+function assetsDialog() {
+  const wrap = document.createElement('div'); wrap.style.display = 'contents';
+  const p = document.createElement('p'); p.className = 'doc'; p.style.margin = '0';
+  p.innerHTML = 'Bilder und Klänge werden mit dem Projekt gespeichert und im ZIP mitexportiert. Im Programm nennst du sie beim Dateinamen, z. B. <code>p.image("ball.png", 0.5, 0.5)</code>, <code>new Turtle("hase.gif")</code> oder <code>new SoundPlayer("ton.wav").play()</code>.';
+  const list = document.createElement('div'); list.className = 'plist';
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*,audio/*,.wav,.mp3,.ogg,.gif,.png,.jpg'; inp.multiple = true; inp.hidden = true;
+  inp.addEventListener('change', async () => { const fs = [...inp.files]; inp.value = ''; await addAssetFiles(fs); render(); });
+  wrap.append(p, list, inp);
+  const render = () => {
+    const files = S.project.files || [];
+    list.innerHTML = '';
+    if (!files.length) { const e = document.createElement('div'); e.className = 'prow'; e.innerHTML = '<div class="pinfo"><span>Noch keine Dateien. Mit „Datei hinzufügen …“ wählst du Bilder (png, gif, jpg) oder Klänge (wav, mp3, ogg) aus.</span></div>'; list.appendChild(e); }
+    for (const f of files) {
+      const row = document.createElement('div'); row.className = 'prow';
+      const kind = assetKind(f.name);
+      const prev = document.createElement(kind === 'image' ? 'img' : 'button');
+      if (kind === 'image') { prev.src = f.data; prev.alt = ''; prev.className = 'athumb'; }
+      else { prev.type = 'button'; prev.className = 'btn small'; prev.textContent = '▶'; prev.title = 'Anhören'; prev.setAttribute('aria-label', 'Anhören'); prev.addEventListener('click', () => { const a = new Audio(f.data); a.play().catch(() => { }); }); }
+      const info = document.createElement('div'); info.className = 'pinfo';
+      info.innerHTML = `<b>${esc(f.name)}</b><span>${kind === 'image' ? `Bild ${f.w || '?'} × ${f.h || '?'} px` : 'Klang'} · ${Math.max(1, Math.round((f.size || 0) / 1024))} KB</span>`;
+      const del = document.createElement('button'); del.type = 'button'; del.className = 'btn small ghost'; del.textContent = 'Löschen';
+      del.addEventListener('click', () => {
+        if (del.dataset.confirm !== '1') { del.dataset.confirm = '1'; del.textContent = 'Wirklich löschen?'; del.style.color = 'var(--err)'; return; }
+        S.project.files = files.filter(x => x !== f); save(); render();
+      });
+      row.append(prev, info, del); list.appendChild(row);
+    }
+  };
+  render();
+  openModal({ title: 'Bilder und Klänge im Projekt', body: wrap, wide: true, actions: [{ label: 'Datei hinzufügen …', action: () => { inp.click(); return true; } }, { label: 'Schließen', primary: true }] });
 }
 
 // ---- ZIP (BlueJ-kompatibel: .java-Dateien + package.bluej)
@@ -1016,6 +1116,7 @@ async function exportZip() {
   const zip = new Z(); const dir = safeFileName(S.project.name);
   const folder = zip.folder(dir);
   for (const c of S.project.classes) folder.file(`${c.name}.java`, c.code);
+  for (const f of S.project.files || []) { const i = f.data.indexOf(','); folder.file(f.name, f.data.slice(i + 1), { base64: true }); }
   folder.file('package.bluej', packageBluej());
   folder.file('README.TXT', `Projekt: ${S.project.name}\nErstellt mit der Java-Werkbank (WebBlueJ).\nDiese ZIP-Datei kann in der Java-Werkbank über „Projekt ▾ → ZIP- oder .java-Dateien importieren“ wieder geöffnet werden.\nDer Ordner lässt sich nach dem Entpacken auch in BlueJ öffnen.\n`);
   try {
@@ -1055,18 +1156,26 @@ async function importZip(file) {
     const p = pos[name] || { x: 40 + (i % 4) * 200, y: 40 + Math.floor(i / 4) * 140 };
     classes.push({ name, code, x: Math.max(0, p.x), y: Math.max(0, p.y) }); i++;
   }
+  const files = [];
+  for (const e of entries.filter(f => f.name.startsWith(root) && assetKind(f.name))) {
+    const nm = e.name.slice(root.length);
+    if (files.some(f => f.name === nm)) continue;
+    files.push(await assetFromData(nm, `data:${mimeOf(nm)};base64,` + await e.async('base64')));
+  }
   const folderName = root.replace(/\/$/, '').split('/').pop();
   const name = uniqueProjectName(folderName || file.name.replace(/\.zip$/i, ''));
   syncEditor(); save();
-  loadProject({ name, classes });
-  toast(`Projekt „${name}“ mit ${classes.length} Klasse${classes.length === 1 ? '' : 'n'} importiert.` + (skipped ? ` ${skipped} Datei(en) aus Unterordnern wurden übersprungen.` : ''));
+  loadProject({ name, classes, files });
+  toast(`Projekt „${name}“ mit ${classes.length} Klasse${classes.length === 1 ? '' : 'n'}${files.length ? ` und ${files.length} Bild-/Klangdatei${files.length === 1 ? '' : 'en'}` : ''} importiert.` + (skipped ? ` ${skipped} Datei(en) aus Unterordnern wurden übersprungen.` : ''));
   if (!S.compiledOnce && classes.length) toast('Hinweis: Das Projekt enthält Fehler oder nicht unterstützte Java-Teile. Klicke auf „Übersetzen“, um sie zu sehen.', true);
 }
 
 $('fileInput').addEventListener('change', async (ev) => {
   const all = [...ev.target.files]; ev.target.value = '';
   for (const z of all.filter(f => /\.zip$/i.test(f.name))) await importZip(z);
-  const files = all.filter(f => !/\.zip$/i.test(f.name));
+  const media = all.filter(f => assetKind(f.name));
+  if (media.length) await addAssetFiles(media);
+  const files = all.filter(f => !/\.zip$/i.test(f.name) && !assetKind(f.name));
   let added = 0;
   for (const f of files) {
     const code = await f.text();
@@ -1087,7 +1196,9 @@ function helpDialog() {
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
   <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Eingaben mit <code>Scanner</code> erscheinen als Eingabedialog. Nicht unterstützt: Lambdas, innere Klassen.</p>
-  <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. <code>Thread.sleep</code>, <code>delay</code> und Endlos-Animationen laufen live. Maus-, Tastatur-Ereignisse und Sound gibt es in der Web-Version nicht.</p>
+  <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. <code>Thread.sleep</code>, <code>delay</code> und Endlos-Animationen laufen live.</p>
+  <p><b>Maus und Tastatur:</b> Klicke in ein Grafikfenster, damit es die Tasten bekommt. Abfragen ohne Listener: <code>p.kbhit()</code>, <code>p.getKey()</code>, <code>p.getKeyCode()</code>, <code>p.getKeyCodeWait()</code> (bei Turtles über <code>TurtleFrame</code>). Listener wie in Java: eine Klasse schreibt <code>implements MouseListener</code> (oder <code>KeyListener</code>, <code>MouseMotionListener</code>, <code>MouseHitListener</code>) bzw. <code>extends MouseAdapter</code> und meldet sich mit <code>p.addMouseListener(this)</code> an. <code>Monitor.putSleep()</code> wartet, bis ein Ereignis <code>Monitor.wakeUp()</code> aufruft.</p>
+  <p><b>Bilder und Klänge:</b> Über „Projekt ▾ → Bilder und Klänge …“ kommen Dateien ins Projekt (auch im ZIP). Dann z. B. <code>p.image("ball.png", x, y)</code>, <code>new Turtle("hase.gif")</code>, <code>t.drawImage("stern.png")</code>, Töne mit <code>t.sound(440, 500)</code> oder <code>SoundPlayer.playSine(440, 500)</code>, Klangdateien mit <code>new SoundPlayer("ton.wav").play()</code>.</p>
   <p><b>Laufende Programme:</b> Dauert ein Aufruf länger, erscheint oben „Programm läuft …“. Die Oberfläche bleibt bedienbar, die Ausgabe erscheint sofort. Mit <b>■ Beenden</b> brichst du das Programm ab, z. B. bei einer Endlosschleife.</p>
   <p><b>Speichern:</b> Alle Projekte werden automatisch in diesem Browser gespeichert („Projekt ▾ → Meine Projekte“). Zum Sichern, Weitergeben oder für BlueJ: „Projekt ▾ → Als ZIP herunterladen“. ZIP-Dateien (auch BlueJ-Projektordner) öffnest du mit „ZIP- oder .java-Dateien importieren“.</p>`;
   openModal({ title: 'So funktioniert die Java-Werkbank', body: d, wide: true, actions: [{ label: 'Alles klar', primary: true }] });

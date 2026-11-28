@@ -26,7 +26,7 @@ function create(hooks) {
   function newWindow(o) {
     const id = nextId++;
     const w = { id, kind: o.kind, w: o.w, h: o.h, bg: o.bg || 'white', turtles: new Map(), closed: false };
-    const el = document.createElement('section'); el.className = 'gfx-win'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', o.title);
+    const el = document.createElement('section'); el.className = 'gfx-win'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', o.title); el.tabIndex = -1;
     el.style.setProperty('--gw', o.w + 'px');
     el.innerHTML = `<header class="gfx-head"><span class="gfx-title"></span><button type="button" class="gfx-btn gfx-fast" title="Animation überspringen" aria-label="Animation überspringen">⏩</button><button type="button" class="gfx-btn gfx-close" title="Fenster schließen" aria-label="Fenster schließen">✕</button></header>
       <div class="gfx-stage" style="aspect-ratio:${o.w}/${o.h}"><canvas class="gfx-base"></canvas><canvas class="gfx-top"></canvas></div><div class="gfx-status" hidden></div>`;
@@ -39,10 +39,15 @@ function create(hooks) {
     w.t = w.top.getContext('2d'); w.t.setTransform(dpr, 0, 0, dpr, 0, 0);
     w.g.fillStyle = w.bg; w.g.fillRect(0, 0, o.w, o.h);
     w.g.lineCap = 'round'; w.g.lineJoin = 'round';
-    el.querySelector('.gfx-close').addEventListener('click', () => closeWin(w));
+    el.querySelector('.gfx-close').addEventListener('click', () => {
+      // Mit ExitListener entscheidet das Programm (wie in APLU); beim zweiten Klick wird trotzdem geschlossen
+      if (w.listener && !w.dead && !w.exitAsked && w.listener({ type: 'closing' }) === true) { w.exitAsked = true; return; }
+      closeWin(w);
+    });
     el.querySelector('.gfx-fast').addEventListener('click', () => { fast = true; finish(); });
     el.addEventListener('pointerdown', () => { el.style.zIndex = ++z; });
     dragHandle(el, el.querySelector('.gfx-head'));
+    inputEvents(w, el.querySelector('.gfx-stage'));
     ensureLayer().appendChild(el);
     // gestaffelt oben rechts platzieren
     const n = [...wins.values()].filter(x => !x.closed).length;
@@ -51,8 +56,52 @@ function create(hooks) {
     const left = Math.max(12, vw - shown - 24 - n * 28), top = Math.max(12, Math.min(64 + n * 28, vh - 120));
     el.style.left = left + 'px'; el.style.top = top + 'px'; el.style.zIndex = ++z;
     wins.set(id, w);
+    // Neues Fenster bekommt den Tastaturfokus (wie ein neues Java-Fenster)
+    try { el.focus({ preventScroll: true }); } catch (e) { }
     return id;
   }
+  // Maus- und Tastaturereignisse an das Programm weitergeben (listen(win, fn))
+  const JAVA_KEY = { 13: 10, 46: 127, 45: 155, 91: 524, 93: 525, 173: 45, 189: 45, 187: 61, 188: 44, 190: 46, 191: 47, 186: 59, 219: 91, 221: 93, 220: 92, 222: 222, 192: 192 };
+  function inputEvents(w, stage) {
+    const el = w.el;
+    const send = (ev) => { if (w.listener && !w.closed && !w.dead) { try { w.listener(ev); } catch (e) { setTimeout(() => { throw e; }); } } };
+    const pos = (ev) => { const r = stage.getBoundingClientRect(); return { x: Math.round((ev.clientX - r.left) / r.width * w.w), y: Math.round((ev.clientY - r.top) / r.height * w.h) }; };
+    const mods = (ev) => ({ shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey });
+    const btn = (ev) => ev.button === 2 ? 3 : ev.button === 1 ? 2 : 1;
+    let down = 0;
+    stage.addEventListener('pointerdown', (ev) => {
+      try { el.focus({ preventScroll: true }); } catch (e) { }
+      down = btn(ev); try { stage.setPointerCapture(ev.pointerId); } catch (e) { }
+      ev.preventDefault();
+      send({ type: 'press', ...pos(ev), button: down, clicks: Math.max(1, ev.detail || 1), ...mods(ev) });
+    });
+    stage.addEventListener('pointermove', (ev) => send({ type: down ? 'drag' : 'move', ...pos(ev), button: down, clicks: 0, ...mods(ev) }));
+    const up = (ev) => { if (!down) return; const b = down; down = 0; send({ type: 'release', ...pos(ev), button: b, clicks: Math.max(1, ev.detail || 1), ...mods(ev) }); };
+    stage.addEventListener('pointerup', up); stage.addEventListener('pointercancel', up);
+    stage.addEventListener('click', (ev) => send({ type: 'click', ...pos(ev), button: btn(ev), clicks: Math.max(1, ev.detail || 1), ...mods(ev) }));
+    stage.addEventListener('auxclick', (ev) => send({ type: 'click', ...pos(ev), button: btn(ev), clicks: 1, ...mods(ev) }));
+    stage.addEventListener('dblclick', (ev) => send({ type: 'dblclick', ...pos(ev), button: 1, clicks: 2, ...mods(ev) }));
+    stage.addEventListener('pointerenter', (ev) => send({ type: 'enter', ...pos(ev), button: 0, clicks: 0, ...mods(ev) }));
+    stage.addEventListener('pointerleave', (ev) => send({ type: 'exit', ...pos(ev), button: 0, clicks: 0, ...mods(ev) }));
+    stage.addEventListener('contextmenu', (ev) => ev.preventDefault());
+    const key = (type) => (ev) => {
+      if (ev.target.closest && ev.target.closest('button')) { if (ev.key === 'Enter' || ev.key === ' ') return; }
+      if (ev.ctrlKey && /^[a-z]$/i.test(ev.key) && type === 'keydown' && 'cvxsaz'.includes(ev.key.toLowerCase())) return; // Kopieren usw. nicht abfangen
+      const code = JAVA_KEY[ev.keyCode] !== undefined ? JAVA_KEY[ev.keyCode] : ev.keyCode;
+      let ch = 65535;
+      if (ev.key.length === 1) ch = ev.key.charCodeAt(0);
+      else if (ev.key === 'Enter') ch = 10; else if (ev.key === 'Backspace') ch = 8; else if (ev.key === 'Tab') ch = 9; else if (ev.key === 'Escape') ch = 27; else if (ev.key === 'Delete') ch = 127;
+      if (type === 'keydown' && (ev.key.startsWith('Arrow') || ev.key === ' ' || ev.key === 'Tab' || ev.key === 'Backspace' || ev.key.length === 1 || ev.key === 'Enter')) ev.preventDefault();
+      ev.stopPropagation();
+      send({ type, code, ch, repeat: ev.repeat, ...mods(ev) });
+      if (type === 'keydown' && ch !== 65535) send({ type: 'typed', code: 0, ch, ...mods(ev) });
+    };
+    el.addEventListener('keydown', key('keydown'));
+    el.addEventListener('keyup', key('keyup'));
+  }
+  function listen(id, fn) { const w = wins.get(id); if (w) w.listener = fn; }
+  // Nach „Beenden“: Fenster bleiben sichtbar, melden aber keine Ereignisse mehr
+  function detach() { for (const w of wins.values()) w.dead = true; }
   function dragHandle(el, handle) {
     let sx = 0, sy = 0, ox = 0, oy = 0, on = false;
     handle.addEventListener('pointerdown', (ev) => {
@@ -68,10 +117,72 @@ function create(hooks) {
     const end = () => { on = false; };
     handle.addEventListener('pointerup', end); handle.addEventListener('pointercancel', end);
   }
-  function closeWin(w) { if (w.closed) return; w.closed = true; w.el.remove(); }
+  function closeWin(w) { if (w.closed) return; w.closed = true; w.el.remove(); if (w.listener) { try { w.listener({ type: 'closed' }); } catch (e) { } } }
   function closeAll() { for (const w of wins.values()) closeWin(w); wins.clear(); cancel(); }
   // Noch nicht abgespielte Befehle verwerfen (Programm beendet)
-  function cancel() { queue.length = 0; qi = 0; cur = null; timed = 0; if (raf) cancelAnimationFrame(raf); raf = 0; lastT = 0; idle(); }
+  function cancel() { queue.length = 0; qi = 0; cur = null; timed = 0; if (raf) cancelAnimationFrame(raf); raf = 0; lastT = 0; stopSounds(); idle(); }
+
+  // ---------------------------------------------------------------- Bilder (aus dem Projekt, als data:-URL)
+  const imgs = new Map();
+  function image(url) {
+    let im = imgs.get(url);
+    if (!im) { im = new Image(); im.decoding = 'async'; im.src = url; imgs.set(url, im); }
+    return im;
+  }
+  const imgReady = (im) => im.complete;
+  function drawImg(g, op) {
+    const im = image(op.url); if (!im.complete || !im.naturalWidth) return;
+    const w = op.w || im.naturalWidth, h = op.h || im.naturalHeight;
+    g.save(); g.translate(op.x, op.y); if (op.rot) g.rotate(op.rot * Math.PI / 180);
+    if (op.anchor === 'center') g.drawImage(im, -w / 2, -h / 2, w, h); else g.drawImage(im, 0, 0, w, h);
+    g.restore();
+  }
+
+  // ---------------------------------------------------------------- Töne und Klänge (Web Audio / <audio>)
+  let actx = null;
+  const voices = new Set();
+  function audio() {
+    if (!actx) { const AC = global.AudioContext || global.webkitAudioContext; if (!AC) return null; try { actx = new AC(); } catch (e) { return null; } }
+    if (actx.state === 'suspended') actx.resume().catch(() => { });
+    return actx;
+  }
+  function tone(freq, ms, vol) {
+    const ac = audio(); if (!ac || !(freq > 0) || !(ms > 0)) return;
+    const t0 = ac.currentTime, dur = ms / 1000, v = Math.max(0, Math.min(1, vol)) * 0.25;
+    const osc = ac.createOscillator(), gain = ac.createGain();
+    osc.type = 'sine'; osc.frequency.value = freq;
+    const ramp = Math.min(0.02, dur / 4);
+    gain.gain.setValueAtTime(0, t0); gain.gain.linearRampToValueAtTime(v, t0 + ramp);
+    gain.gain.setValueAtTime(v, t0 + dur - ramp); gain.gain.linearRampToValueAtTime(0, t0 + dur);
+    osc.connect(gain).connect(ac.destination); osc.start(t0); osc.stop(t0 + dur + 0.02);
+    voices.add(osc); osc.onended = () => voices.delete(osc);
+  }
+  const players = new Map();   // id → { el, waiters }
+  function player(id) { let p = players.get(id); if (!p) { p = { el: null, waiters: [] }; players.set(id, p); } return p; }
+  function sound(op) {
+    const p = player(op.id);
+    if (op.act === 'play' || op.act === 'loop' || op.act === 'replay') {
+      if (!p.el || p.el.dataset.url !== op.url) {
+        if (p.el) p.el.pause();
+        p.el = new Audio(op.url); p.el.dataset.url = op.url;
+        p.el.addEventListener('ended', () => { if (!p.el.loop) { const ws = p.waiters.splice(0); ws.forEach(f => f()); } });
+        p.el.addEventListener('error', () => { const ws = p.waiters.splice(0); ws.forEach(f => f()); });
+      }
+      p.el.loop = op.act === 'loop';
+      p.el.volume = Math.max(0, Math.min(1, op.vol));
+      if (op.act === 'replay') p.el.currentTime = 0;
+      const pr = p.el.play(); if (pr && pr.catch) pr.catch(() => { const ws = p.waiters.splice(0); ws.forEach(f => f()); });
+    } else if (op.act === 'stop') { if (p.el) { p.el.pause(); p.el.currentTime = 0; } const ws = p.waiters.splice(0); ws.forEach(f => f()); }
+    else if (op.act === 'pause') { if (p.el) p.el.pause(); }
+    else if (op.act === 'volume') { if (p.el) p.el.volume = Math.max(0, Math.min(1, op.vol)); }
+  }
+  function soundPlaying(id) { const p = players.get(id); return !!(p && p.el && !p.el.paused && !p.el.ended); }
+  function whenSoundEnds(id, cb) { if (!soundPlaying(id) && !(qi < queue.length)) { cb(); return; } player(id).waiters.push(cb); }
+  function stopSounds() {
+    for (const o of voices) { try { o.stop(); } catch (e) { } } voices.clear();
+    for (const p of players.values()) { if (p.el) p.el.pause(); const ws = p.waiters.splice(0); ws.forEach(f => f()); }
+    players.clear();
+  }
 
   // ---------------------------------------------------------------- Turtle-Figur (eigene Zeichnung)
   function drawTurtle(ctx, x, y, h, color, s = 1) {
@@ -92,7 +203,7 @@ function create(hooks) {
   }
   function drawTurtles(w) {
     const c = w.t; c.clearRect(0, 0, w.w, w.h);
-    for (const t of w.turtles.values()) if (!t.hidden) drawTurtle(c, t.x, t.y, t.h, t.color);
+    for (const t of w.turtles.values()) if (!t.hidden) { if (t.sprite) drawImg(c, { url: t.sprite, x: t.x, y: t.y, rot: t.h, anchor: 'center' }); else drawTurtle(c, t.x, t.y, t.h, t.color); }
   }
 
   // ---------------------------------------------------------------- Zeichenbefehle
@@ -100,7 +211,7 @@ function create(hooks) {
   function instant(w, op) {
     const g = w.g;
     switch (op.t) {
-      case 'pose': { const t = tur(w, op.tid); Object.assign(t, { x: op.x, y: op.y, h: op.h, color: op.color, hidden: op.hidden }); return true; }
+      case 'pose': { const t = tur(w, op.tid); Object.assign(t, { x: op.x, y: op.y, h: op.h, color: op.color, hidden: op.hidden, sprite: op.sprite || null }); return true; }
       case 'line': g.beginPath(); g.moveTo(op.x1, op.y1); g.lineTo(op.x2, op.y2); stroke(g, op); g.stroke(); return false;
       case 'poly': {
         if (!op.pts.length) return false;
@@ -119,7 +230,9 @@ function create(hooks) {
       case 'text': g.font = op.font; g.fillStyle = op.color; g.textBaseline = 'alphabetic'; g.fillText(op.s, op.x, op.y); return false;
       case 'clear': w.bg = op.bg; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = op.bg; g.fillRect(0, 0, w.base.width, w.base.height); g.restore(); return false;
       case 'flood': flood(w, op.x, op.y, op.color); return false;
-      case 'stamp': drawTurtle(g, op.x, op.y, op.h, op.color); return false;
+      case 'stamp': if (op.sprite) drawImg(g, { url: op.sprite, x: op.x, y: op.y, rot: op.h, anchor: 'center' }); else drawTurtle(g, op.x, op.y, op.h, op.color); return false;
+      case 'image': drawImg(g, op); return false;
+      case 'bkimage': { const im = image(op.url); if (im.naturalWidth) g.drawImage(im, (w.w - im.naturalWidth) / 2, (w.h - im.naturalHeight) / 2); return false; }
       case 'title': w.titleEl.textContent = op.s; w.el.setAttribute('aria-label', op.s); return false;
       case 'status': w.statusEl.hidden = false; w.statusEl.textContent = op.s; return false;
       case 'close': closeWin(w); return false;
@@ -173,7 +286,12 @@ function create(hooks) {
   function start(winId, o) {
     if (fast && isTimed(o)) { if (o.t === 'sleep') return false; o = { ...o, speed: Infinity }; }
     if (o.t === 'sleep') { cur = { kind: 'sleep', left: Math.max(0, o.ms) }; return true; }
+    if (o.t === 'tone') { if (!fast) tone(o.freq, o.ms, o.vol); return false; }
+    if (o.t === 'sound') { sound(o); return false; }
     const w = wins.get(winId); if (!w || w.closed) return false;
+    // Bild noch nicht geladen: Abspielen kurz anhalten (data:-URLs laden sehr schnell)
+    const url = o.t === 'image' || o.t === 'bkimage' ? o.url : (o.t === 'pose' || o.t === 'stamp') ? o.sprite : null;
+    if (url && !imgReady(image(url)) && !o.waited) { o.waited = true; qi--; if (isTimed(o)) timed++; cur = { kind: 'img', im: image(url), el: 0 }; return true; }
     if (o.t === 'move') {
       const t = tur(w, o.tid); t.color = o.tcolor; t.hidden = o.hidden; t.h = o.h;
       const len = Math.hypot(o.x2 - o.x1, o.y2 - o.y1);
@@ -198,6 +316,7 @@ function create(hooks) {
   function advance(c, dt) { // gibt übrige Zeit zurück, wenn fertig; sonst -1
     c.el += dt;
     if (c.kind === 'sleep') { c.left -= dt; return c.left <= 0 ? -c.left : -1; }
+    if (c.kind === 'img') return (c.im.complete || c.el > 3000) ? 0 : -1;
     const f = Math.min(1, c.el / c.dur);
     if (c.kind === 'move') {
       segment(c.w, c.o, c.done, f); c.done = f;
@@ -226,7 +345,7 @@ function create(hooks) {
   // Alles sofort zeichnen (Knopf ⏩ und vor Eingabedialogen)
   function finish() {
     if (cur) { if (cur.kind !== 'sleep') advance(cur, Infinity); cur = null; }
-    while (qi < queue.length) { const [id, o] = queue[qi++]; if (o.t === 'sleep') continue; if (start(id, o)) { advance(cur, Infinity); cur = null; } }
+    while (qi < queue.length) { const [id, o] = queue[qi++]; if (o.t === 'sleep' || o.t === 'tone') continue; o.waited = true; if (start(id, o)) { advance(cur, Infinity); cur = null; } }
     queue.length = 0; qi = 0; timed = 0;
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
     redraw();
@@ -251,6 +370,7 @@ function create(hooks) {
   }
   return {
     newWindow, op, input, message, closeAll, finish, cancel, busy, whenIdle,
+    listen, detach, image, soundPlaying, whenSoundEnds, stopSounds,
     skipping: () => fast, resetFast: () => { fast = false; },
     inputBlocked: () => blocked,
     lastLine: () => (hooks.lastLine ? hooks.lastLine() : ''),

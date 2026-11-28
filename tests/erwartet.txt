@@ -364,6 +364,20 @@ OUT 0
 OUT 1
 OUT 2
 snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":false}
+=== Maus und Tastatur
+compile {"ok":true,"errors":[]}
+call Malprogramm.main
+WIN {"kind":"gpanel","title":"Malprogramm","w":501,"h":501,"bg":"white"}
+OP 3 {"t":"text","x":10,"y":20,"s":"Maustaste gedrückt halten: malen   r g b s: Farbe   c: löschen","color":"black","font":"12px system-ui, sans-serif"}
+{"ok":true}
+snip 1 + 2 * 3 {"ok":true,"hasValue":true,"value":"7"}
+snip int q = 5; q * q {"ok":false,"message":"Keine gültige Anweisung: Der Ausdruck wird nicht verwendet (fehlt eine Zuweisung oder ein Methodenaufruf?)","kind":"compile"}
+snip "a".length() + Math.abs(-3) {"ok":true,"hasValue":true,"value":"4"}
+snip new java.util.ArrayList<String>() {"ok":true,"hasValue":true,"value":"<ArrayList>"}
+OUT 0
+OUT 1
+OUT 2
+snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":false}
 === Grundlagen
 compile {"ok":true,"errors":[]}
 call Main.main
@@ -517,19 +531,19 @@ snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":fals
 compile {"ok":true,"errors":[]}
 call T.main
 WIN {"kind":"turtle","title":"Java Playground","w":400,"h":400,"bg":"white"}
-OP 3 {"t":"pose","tid":3001,"x":200,"y":200,"h":0,"color":"cyan","hidden":false}
-OP 3 {"t":"pose","tid":3001,"x":200,"y":200,"h":0,"color":"rgb(255,0,0)","hidden":false}
-OP 3 {"t":"move","tid":3001,"x1":200,"y1":200,"x2":200,"y2":150,"h":0,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
-OP 3 {"t":"turn","tid":3001,"h":270,"speed":200}
-OP 3 {"t":"move","tid":3001,"x1":200,"y1":150,"x2":150,"y2":150,"h":270,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
-OP 3 {"t":"turn","tid":3001,"h":180,"speed":200}
-OP 3 {"t":"move","tid":3001,"x1":150,"y1":150,"x2":150,"y2":200,"h":180,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
-OP 3 {"t":"turn","tid":3001,"h":90,"speed":200}
-OP 3 {"t":"move","tid":3001,"x1":150,"y1":200,"x2":200,"y2":200,"h":90,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
-OP 3 {"t":"turn","tid":3001,"h":0,"speed":200}
-OP 3 {"t":"text","x":200,"y":200,"s":"hi","color":"blue","font":"12px system-ui, sans-serif"}
+OP 4 {"t":"pose","tid":4001,"x":200,"y":200,"h":0,"color":"cyan","hidden":false}
+OP 4 {"t":"pose","tid":4001,"x":200,"y":200,"h":0,"color":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"move","tid":4001,"x1":200,"y1":200,"x2":200,"y2":150,"h":0,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"turn","tid":4001,"h":270,"speed":200}
+OP 4 {"t":"move","tid":4001,"x1":200,"y1":150,"x2":150,"y2":150,"h":270,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"turn","tid":4001,"h":180,"speed":200}
+OP 4 {"t":"move","tid":4001,"x1":150,"y1":150,"x2":150,"y2":200,"h":180,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"turn","tid":4001,"h":90,"speed":200}
+OP 4 {"t":"move","tid":4001,"x1":150,"y1":200,"x2":200,"y2":200,"h":90,"pen":true,"color":"blue","width":1,"speed":200,"tcolor":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"turn","tid":4001,"h":0,"speed":200}
+OP 4 {"t":"text","x":200,"y":200,"s":"hi","color":"blue","font":"12px system-ui, sans-serif"}
 OP 0 {"t":"sleep","ms":100}
-OP 3 {"t":"pose","tid":3001,"x":200,"y":200,"h":0,"color":"rgb(255,0,0)","hidden":false}
+OP 4 {"t":"pose","tid":4001,"x":200,"y":200,"h":0,"color":"rgb(255,0,0)","hidden":false}
 {"ok":true}
 snip 1 + 2 * 3 {"ok":true,"hasValue":true,"value":"7"}
 snip int q = 5; q * q {"ok":false,"message":"Keine gültige Anweisung: Der Ausdruck wird nicht verwendet (fehlt eine Zuweisung oder ein Methodenaufruf?)","kind":"compile"}
@@ -543,12 +557,12 @@ snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":fals
 compile {"ok":true,"errors":[]}
 call G.main
 WIN {"kind":"gpanel","title":"GPanel","w":501,"h":501,"bg":"white"}
-OP 4 {"t":"line","x1":50,"y1":450,"x2":450,"y2":50,"color":"black","width":1}
-OP 4 {"t":"circle","x":450,"y":50,"rx":100,"ry":100,"fill":false,"color":"black","width":1}
-OP 4 {"t":"poly","pts":[{"x":375,"y":125},{"x":525,"y":125},{"x":525,"y":-25},{"x":375,"y":-25}],"fill":true,"color":"black","width":1}
-OP 4 {"t":"text","x":450,"y":50,"s":"x","color":"black","font":"12px system-ui, sans-serif"}
+OP 5 {"t":"line","x1":50,"y1":450,"x2":450,"y2":50,"color":"black","width":1}
+OP 5 {"t":"circle","x":450,"y":50,"rx":100,"ry":100,"fill":false,"color":"black","width":1}
+OP 5 {"t":"poly","pts":[{"x":375,"y":125},{"x":525,"y":125},{"x":525,"y":-25},{"x":375,"y":-25}],"fill":true,"color":"black","width":1}
+OP 5 {"t":"text","x":450,"y":50,"s":"x","color":"black","font":"12px system-ui, sans-serif"}
 OP 0 {"t":"sleep","ms":50}
-OP 4 {"t":"line","x1":0,"y1":500,"x2":500,"y2":500,"color":"rgb(0,0,255)","width":1}
+OP 5 {"t":"line","x1":0,"y1":500,"x2":500,"y2":500,"color":"rgb(0,0,255)","width":1}
 {"ok":true}
 snip 1 + 2 * 3 {"ok":true,"hasValue":true,"value":"7"}
 snip int q = 5; q * q {"ok":false,"message":"Keine gültige Anweisung: Der Ausdruck wird nicht verwendet (fehlt eine Zuweisung oder ein Methodenaufruf?)","kind":"compile"}
