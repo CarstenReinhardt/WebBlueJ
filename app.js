@@ -39,12 +39,13 @@ const S = {
   padEnv: null,
   editing: null,
   selected: null,
+  curPkg: '',           // angezeigtes Paket ('' = Standardpaket / oberste Ebene)
 };
 S.padEnv = new Env(S.benchEnv);
 let uid = 1; const newId = () => 'c' + Date.now().toString(36) + (uid++);
 
 const LIB = 'javawerkbank.library.v1';
-function projectData() { return { id: S.project.id, name: S.project.name, savedAt: Date.now(), classes: S.project.classes.map(c => ({ id: c.id, name: c.name, code: c.code, x: c.x, y: c.y })), files: (S.project.files || []).map(f => ({ ...f })) }; }
+function projectData() { return { id: S.project.id, name: S.project.name, savedAt: Date.now(), classes: S.project.classes.map(c => ({ id: c.id, name: c.name, pkg: c.pkg || '', code: c.code, x: c.x, y: c.y })), pkgs: { ...(S.project.pkgs || {}) }, files: (S.project.files || []).map(f => ({ ...f })) }; }
 function readLib() { try { const l = JSON.parse(localStorage.getItem(LIB) || 'null'); if (l && l.projects) return l; } catch (e) { } return { projects: {} }; }
 function writeLib(l) { try { localStorage.setItem(LIB, JSON.stringify(l)); return true; } catch (e) { return false; } }
 let quotaWarned = false;
@@ -194,10 +195,47 @@ $('termInput').addEventListener('keydown', (ev) => {
 
 // ------------------------------------------------------------ Diagramm
 function refreshInfo(c) { S.info[c.id] = quickInfo(c.code); const n = S.info[c.id].name; if (n && n !== c.name) c.name = n; }
+// Pakete: Klassen liegen in c.pkg ('' = Standardpaket); S.project.pkgs merkt sich (auch leere) Pakete mit Position
+const parentPkg = (p) => p.includes('.') ? p.slice(0, p.lastIndexOf('.')) : '';
+const simplePkg = (p) => p.slice(p.lastIndexOf('.') + 1);
+function allPackages() {
+  const set = new Set(Object.keys(S.project.pkgs || {}).filter(k => k[0] !== '$'));
+  for (const c of S.project.classes) if (c.pkg) set.add(c.pkg);
+  for (const p of [...set]) for (let q = parentPkg(p); q; q = parentPkg(q)) set.add(q);
+  return [...set].sort();
+}
+function visibleClasses() { return S.project.classes.filter(c => (c.pkg || '') === S.curPkg); }
+function pkgPos(p) {
+  const pk = S.project.pkgs || (S.project.pkgs = {});
+  if (!pk[p] || pk[p].x === undefined) { const f = freeSpot(); pk[p] = { x: f.x, y: f.y }; }
+  return pk[p];
+}
+function showPackage(p) { syncEditor(); S.curPkg = p; S.selected = null; renderDiagram(); }
+function renderPkgBar() {
+  const bar = $('pkgBar'); const pk = allPackages();
+  bar.hidden = !pk.length && !S.curPkg; bar.innerHTML = '';
+  if (bar.hidden) return;
+  const parts = S.curPkg ? S.curPkg.split('.') : [];
+  const crumb = (label, target, cur) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'crumb' + (cur ? ' cur' : ''); b.textContent = label; if (!cur) b.addEventListener('click', () => showPackage(target)); else b.setAttribute('aria-current', 'page'); bar.appendChild(b); };
+  crumb(S.project.name || 'Projekt', '', !parts.length);
+  parts.forEach((x, i) => { const sep = document.createElement('span'); sep.className = 'sep'; sep.textContent = '›'; bar.appendChild(sep); crumb(x, parts.slice(0, i + 1).join('.'), i === parts.length - 1); });
+}
 function renderDiagram() {
   const boxes = $('boxes'); boxes.innerHTML = '';
   let maxX = 600, maxY = 400;
-  for (const c of S.project.classes) {
+  if (!allPackages().includes(S.curPkg)) S.curPkg = '';
+  renderPkgBar();
+  if (S.curPkg) {
+    const up = S.project.pkgs.$up || (S.project.pkgs.$up = { x: 8, y: 8 });
+    const el = pkgBox('<zurück>', up, () => showPackage(parentPkg(S.curPkg)), true);
+    boxes.appendChild(el);
+  }
+  for (const p of allPackages().filter(q => q && parentPkg(q) === S.curPkg)) {
+    const pos = pkgPos(p);
+    boxes.appendChild(pkgBox(simplePkg(p), pos, () => showPackage(p), false, p));
+    maxX = Math.max(maxX, pos.x + BOX_W + 80); maxY = Math.max(maxY, pos.y + BOX_H + 80);
+  }
+  for (const c of visibleClasses()) {
     const info = S.info[c.id] || {}; const st = S.status[c.id] || {};
     const el = document.createElement('div');
     el.className = 'cbox' + (st.dirty ? ' dirty' : '') + (st.error ? ' has-error' : '') + (info.abstract ? ' abstract' : '') + (S.selected === c.id ? ' selected' : '');
@@ -212,8 +250,66 @@ function renderDiagram() {
   }
   const canvas = $('canvas'); canvas.style.width = maxX + 'px'; canvas.style.height = maxY + 'px';
   $('arrows').setAttribute('width', maxX); $('arrows').setAttribute('height', maxY);
-  if (!S.project.classes.length) boxes.innerHTML = '<p class="hint-empty">Noch keine Klassen. Lege mit „+ Neue Klasse“ die erste an.</p>';
+  if (!S.project.classes.length && !allPackages().length) boxes.innerHTML = '<p class="hint-empty">Noch keine Klassen. Lege mit „+ Neue Klasse“ die erste an.</p>';
+  else if (S.curPkg && !boxes.querySelector('.cbox, .pbox:not(.up)')) { const h = document.createElement('p'); h.className = 'hint-empty'; h.style.top = '96px'; h.textContent = `Das Paket ${S.curPkg} ist noch leer. „+ Neue Klasse“ legt hier eine Klasse an.`; boxes.appendChild(h); }
   renderArrows();
+}
+// Paket-Symbol im Diagramm (Ordner wie in BlueJ): Doppelklick öffnet, Ziehen verschiebt
+function pkgBox(label, pos, open, isUp, full) {
+  const el = document.createElement('div');
+  el.className = 'pbox' + (isUp ? ' up' : '');
+  el.style.left = pos.x + 'px'; el.style.top = pos.y + 'px';
+  el.tabIndex = 0; el.setAttribute('role', 'button');
+  el.setAttribute('aria-label', isUp ? 'Zurück zum übergeordneten Paket' : `Paket ${full}`);
+  el.innerHTML = `<div class="ptab"></div><div class="pbody"><div class="chead">${isUp ? '' : 'paket'}</div><div class="cname">${esc(label)}</div></div>`;
+  el.title = isUp ? 'Doppelklick: zurück zum übergeordneten Paket' : 'Doppelklick öffnet das Paket';
+  let start = null, moved = false;
+  el.addEventListener('pointerdown', (ev) => { if (ev.button !== 0) return; start = { x: ev.clientX, y: ev.clientY, cx: pos.x, cy: pos.y }; moved = false; el.setPointerCapture(ev.pointerId); });
+  el.addEventListener('pointermove', (ev) => {
+    if (!start) return; const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
+    if (!moved && Math.hypot(dx, dy) < 5) return;
+    moved = true; hideMenu();
+    pos.x = Math.max(0, Math.round((start.cx + dx) / 4) * 4); pos.y = Math.max(0, Math.round((start.cy + dy) / 4) * 4);
+    el.style.left = pos.x + 'px'; el.style.top = pos.y + 'px';
+  });
+  el.addEventListener('pointerup', (ev) => {
+    if (!start) return; const wasMoved = moved; start = null;
+    if (wasMoved) { save(); renderDiagram(); return; }
+    if (isUp) { open(); return; }
+    showMenu(ev.clientX, ev.clientY, [{ header: 'Paket ' + full }, { label: 'Öffnen', plain: true, action: open }, { label: 'Neue Klasse darin …', plain: true, action: () => { showPackage(full); newClassDialog(); } }, { label: 'Paket entfernen', plain: true, danger: true, action: () => removePackageDialog(full) }]);
+  });
+  el.addEventListener('dblclick', (ev) => { ev.preventDefault(); hideMenu(); open(); });
+  el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); open(); } });
+  return el;
+}
+function newPackageDialog() {
+  const form = document.createElement('form'); form.className = 'field';
+  form.innerHTML = `<label for="npName">Paketname${S.curPkg ? ` (innerhalb von ${esc(S.curPkg)})` : ''}</label><input id="npName" placeholder="z. B. geometrie" spellcheck="false" autocomplete="off">`;
+  const err = document.createElement('div'); err.className = 'formerr'; err.hidden = true;
+  const wrap = document.createElement('div'); wrap.style.display = 'contents'; wrap.append(form, err);
+  const ok = () => {
+    const v = form.querySelector('#npName').value.trim();
+    let msg = '';
+    if (!/^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)*$/.test(v)) msg = 'Bitte einen gültigen Paketnamen eingeben: Buchstaben, Ziffern und _ (Teile mit Punkt getrennt), ohne Umlaute.';
+    const full = S.curPkg ? S.curPkg + '.' + v : v;
+    if (!msg && allPackages().includes(full)) msg = `Das Paket ${full} gibt es schon.`;
+    if (!msg && /^(java|javax)(\.|$)/.test(full)) msg = 'Pakete mit java oder javax am Anfang sind für Java reserviert.';
+    if (msg) { err.textContent = msg; err.hidden = false; return true; }
+    pkgPos(full); save(); renderDiagram();
+    if (/[A-Z]/.test(v)) toast('Tipp: Paketnamen schreibt man in Java klein.');
+  };
+  form.addEventListener('submit', (e) => { e.preventDefault(); const ctl = modals[modals.length - 1]; if (ok() !== true) ctl.close(); });
+  openModal({ title: 'Neues Paket', body: wrap, actions: [{ label: 'Abbrechen' }, { label: 'Anlegen', primary: true, action: ok }] });
+}
+function removePackageDialog(p) {
+  const inside = S.project.classes.filter(c => c.pkg === p || (c.pkg || '').startsWith(p + '.'));
+  confirmModal(`Paket ${p} entfernen?`, inside.length ? `Dabei werden ${inside.length} Klasse${inside.length === 1 ? '' : 'n'} gelöscht: ${inside.map(c => c.name).join(', ')}.` : 'Das Paket ist leer.', 'Entfernen', () => {
+    for (const c of inside) { if (S.editing === c.id) { S.editing = null; $('editorPane').hidden = true; } delete S.status[c.id]; delete S.info[c.id]; }
+    S.project.classes = S.project.classes.filter(c => !inside.includes(c));
+    for (const k of Object.keys(S.project.pkgs || {})) if (k === p || k.startsWith(p + '.')) delete S.project.pkgs[k];
+    for (const c of S.project.classes) S.status[c.id] = { ...(S.status[c.id] || {}), dirty: true };
+    S.compiledOnce = false; save(); renderDiagram();
+  });
 }
 function boxRect(c) { const el = document.querySelector(`.cbox[data-id="${c.id}"]`); const h = el ? el.offsetHeight : BOX_H; return { x: c.x, y: c.y, w: BOX_W, h }; }
 function edgePoint(r, tx, ty) {
@@ -224,7 +320,8 @@ function edgePoint(r, tx, ty) {
 }
 function renderArrows() {
   const layer = $('arrowLayer'); layer.innerHTML = '';
-  const names = new Map(S.project.classes.map(c => [c.name, c]));
+  const vis = visibleClasses();
+  const names = new Map(vis.map(c => [c.name, c]));
   const drawn = new Set();
   const line = (from, to, kind) => {
     const a = boxRect(from), b = boxRect(to);
@@ -237,12 +334,12 @@ function renderArrows() {
     l.setAttribute('marker-end', kind === 'uses' ? 'url(#mUses)' : 'url(#mInherit)');
     layer.appendChild(l);
   };
-  for (const c of S.project.classes) {
+  for (const c of vis) {
     const info = S.info[c.id]; if (!info) continue;
     if (info.superName && names.has(info.superName)) { line(c, names.get(info.superName), 'extends'); drawn.add(c.name + '>' + info.superName); }
     for (const i of info.interfaces || []) if (names.has(i)) { line(c, names.get(i), 'implements'); drawn.add(c.name + '>' + i); }
   }
-  for (const c of S.project.classes) {
+  for (const c of vis) {
     const info = S.info[c.id]; if (!info || !info.ids) continue;
     for (const n of info.ids) {
       if (n === c.name || !names.has(n) || drawn.has(c.name + '>' + n)) continue;
@@ -583,7 +680,7 @@ function compileAll(opts = {}) {
   syncEditor();
   if (rt.running) { stopProgram(); flushOutput(); writeConsole('[Laufendes Programm wurde zum Übersetzen beendet]\n', 'note'); }
   for (const c of S.project.classes) refreshInfo(c);
-  const res = rt.compile(S.project.classes.map(c => ({ id: c.id, code: c.code })));
+  const res = rt.compile(S.project.classes.map(c => ({ id: c.id, code: c.code, pkg: c.pkg || '' })));
   const hadBench = S.bench.length > 0;
   for (const c of S.project.classes) S.status[c.id] = { dirty: !res.ok, error: null };
   if (!res.ok) {
@@ -730,9 +827,10 @@ function setStatus(text, kind, lineBtn) {
 function openEditor(id) {
   syncEditor();
   const c = classById(id); if (!c) return;
+  if ((c.pkg || '') !== S.curPkg) { S.curPkg = c.pkg || ''; renderDiagram(); }
   S.editing = id; errLine = 0;
   $('editorPane').hidden = false;
-  $('edTitle').innerHTML = `${esc(c.name)}<small>Quelltext</small>`;
+  $('edTitle').innerHTML = `${esc(c.name)}<small>${c.pkg ? 'Paket ' + esc(c.pkg) + ' · ' : ''}Quelltext</small>`;
   edText.value = c.code;
   const st = S.status[id] || {};
   if (st.error) { errLine = st.error.line; setStatus(`Zeile ${st.error.line}: ${st.error.message}`, 'err', st.error.line); }
@@ -969,7 +1067,11 @@ $('fdRepOne').addEventListener('click', replaceOne);
 $('fdRepAll').addEventListener('click', replaceAll);
 
 // ------------------------------------------------------------ Klassen anlegen/entfernen
-function template(name, kind) {
+function template(name, kind, pkg) {
+  const t = template0(name, kind);
+  return pkg ? `package ${pkg};\n\n` + t : t;
+}
+function template0(name, kind) {
   if (kind === 'interface') return `/**\n * Beschreibe hier das Interface ${name}.\n */\npublic interface ${name} {\n    /**\n     * Jede Klasse, die ${name} implementiert, muss diese Methode haben.\n     */\n    void beispielMethode();\n}\n`;
   if (kind === 'enum') return `/**\n * Aufzählung ${name}.\n */\npublic enum ${name} {\n    ERSTER, ZWEITER, DRITTER\n}\n`;
   if (kind === 'abstract') return `/**\n * Beschreibe hier die abstrakte Klasse ${name}.\n */\npublic abstract class ${name} {\n    protected String name;\n\n    public ${name}(String name) {\n        this.name = name;\n    }\n\n    /**\n     * Unterklassen müssen diese Methode implementieren.\n     */\n    public abstract void beispielMethode();\n}\n`;
@@ -977,7 +1079,7 @@ function template(name, kind) {
   return `/**\n * Beschreibe hier die Klasse ${name}.\n *\n * @author (dein Name)\n */\npublic class ${name} {\n    // Attribute\n    private int x;\n\n    /**\n     * Konstruktor für Objekte der Klasse ${name}.\n     */\n    public ${name}() {\n        x = 0;\n    }\n\n    /**\n     * Ein Beispiel für eine Methode.\n     *\n     * @param y ein Parameter\n     * @return die Summe aus x und y\n     */\n    public int beispielMethode(int y) {\n        return x + y;\n    }\n}\n`;
 }
 function freeSpot() {
-  const taken = S.project.classes;
+  const taken = [...visibleClasses(), ...Object.entries(S.project.pkgs || {}).filter(([k]) => k === '$up' ? S.curPkg : parentPkg(k) === S.curPkg).map(([, v]) => v)];
   for (let row = 0; row < 30; row++) for (let col = 0; col < 6; col++) {
     const x = 40 + col * 200, y = 40 + row * 140;
     if (!taken.some(c => Math.abs(c.x - x) < 170 && Math.abs(c.y - y) < 100)) return { x, y };
@@ -998,13 +1100,13 @@ function newClassDialog() {
     else if (rt.builtinClasses.has(name)) msg = `${name} ist schon von Java belegt. Wähle einen anderen Namen.`;
     if (msg) { err.textContent = msg; err.hidden = false; return true; }
     const p = freeSpot();
-    const c = { id: newId(), name, code: template(name, kind), x: p.x, y: p.y };
+    const c = { id: newId(), name, pkg: S.curPkg, code: template(name, kind, S.curPkg), x: p.x, y: p.y };
     S.project.classes.push(c); refreshInfo(c); S.status[c.id] = { dirty: true };
     save(); renderDiagram();
     if (!/^[A-ZÄÖÜ]/.test(name)) toast('Tipp: Klassennamen beginnen in Java mit einem Großbuchstaben.');
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); const ctl = modals[modals.length - 1]; if (ok(ctl) !== true) ctl.close(); });
-  openModal({ title: 'Neue Klasse', body: wrap, actions: [{ label: 'Abbrechen' }, { label: 'Anlegen', primary: true, action: ok }] });
+  openModal({ title: S.curPkg ? `Neue Klasse im Paket ${S.curPkg}` : 'Neue Klasse', body: wrap, actions: [{ label: 'Abbrechen' }, { label: 'Anlegen', primary: true, action: ok }] });
 }
 function removeClass(id) {
   if (S.editing === id) { S.editing = null; $('editorPane').hidden = true; }
@@ -1017,7 +1119,8 @@ function removeClass(id) {
 
 // ------------------------------------------------------------ Projekte
 function loadProject(p, { benchFrom } = {}) {
-  S.project = { id: p.id || ('p' + newId()), name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, code: c.code, x: c.x ?? 40, y: c.y ?? 40 })), files: (p.files || []).map(f => ({ ...f })) };
+  S.project = { id: p.id || ('p' + newId()), name: p.name, classes: p.classes.map(c => ({ id: c.id || newId(), name: c.name, pkg: c.pkg ?? (quickInfo(c.code).pkg || ''), code: c.code, x: c.x ?? 40, y: c.y ?? 40 })), pkgs: { ...(p.pkgs || {}) }, files: (p.files || []).map(f => ({ ...f })) };
+  S.curPkg = '';
   preloadAssets();
   S.status = {}; S.info = {}; S.editing = null; $('editorPane').hidden = true;
   for (const c of S.project.classes) { refreshInfo(c); S.status[c.id] = { dirty: true }; }
@@ -1038,6 +1141,7 @@ function projectMenu() {
   items.push({ label: 'Neues leeres Projekt', plain: true, action: () => { syncEditor(); save(); newProjectDialog(); } });
   items.push({ label: 'Projekt umbenennen', plain: true, action: renameProjectDialog });
   items.push({ label: 'Kopie speichern unter …', plain: true, action: saveAsDialog });
+  items.push({ label: S.curPkg ? `Neues Paket in ${S.curPkg} …` : 'Neues Paket …', plain: true, action: newPackageDialog });
   items.push({ header: 'Datei' });
   items.push({ label: 'Als ZIP herunterladen', plain: true, action: exportZip });
   items.push({ label: 'ZIP- oder .java-Dateien importieren …', plain: true, action: () => $('fileInput').click() });
@@ -1051,7 +1155,7 @@ function renameProjectDialog() {
   const form = document.createElement('form'); form.className = 'field';
   form.innerHTML = '<label for="pjName">Projektname</label><input id="pjName" autocomplete="off">';
   form.querySelector('input').value = S.project.name;
-  const ok = () => { const v = form.querySelector('input').value.trim(); if (v) { S.project.name = v; $('projName').textContent = '· ' + v; save(); } };
+  const ok = () => { const v = form.querySelector('input').value.trim(); if (v) { S.project.name = v; $('projName').textContent = '· ' + v; save(); renderPkgBar(); } };
   form.addEventListener('submit', (e) => { e.preventDefault(); ok(); modals[modals.length - 1].close(); });
   openModal({ title: 'Projekt umbenennen', body: form, actions: [{ label: 'Abbrechen' }, { label: 'Speichern', primary: true, action: ok }] });
 }
@@ -1198,13 +1302,14 @@ function assetsDialog() {
 // ---- ZIP (BlueJ-kompatibel: .java-Dateien + package.bluej)
 function zipLib() { if (!window.JSZip) { toast('ZIP-Funktion konnte nicht geladen werden (Internetverbindung?).', true); return null; } return window.JSZip; }
 function safeFileName(s) { return (s || 'Projekt').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'Projekt'; }
-function packageBluej() {
+function packageBluej(pkg = '') {
   const typeOf = (c) => { const i = S.info[c.id] || {}; return i.kind === 'interface' ? 'InterfaceTarget' : i.kind === 'enum' ? 'EnumTarget' : i.abstract ? 'AbstractTarget' : 'ClassTarget'; };
-  const lines = ['#BlueJ package file', '#Erstellt mit der Java-Werkbank', 'package.editor.height=600', 'package.editor.width=900', 'package.numDependencies=0', `package.numTargets=${S.project.classes.length}`, 'package.showExtends=true', 'package.showUses=true'];
-  S.project.classes.forEach((c, i) => {
-    const n = i + 1;
-    lines.push(`target${n}.height=${BOX_H}`, `target${n}.name=${c.name}`, `target${n}.showInterface=false`, `target${n}.type=${typeOf(c)}`, `target${n}.width=${BOX_W}`, `target${n}.x=${Math.round(c.x)}`, `target${n}.y=${Math.round(c.y)}`);
-  });
+  const cls = S.project.classes.filter(c => (c.pkg || '') === pkg);
+  const subs = allPackages().filter(p => p && parentPkg(p) === pkg);
+  const lines = ['#BlueJ package file', '#Erstellt mit der Java-Werkbank', 'package.editor.height=600', 'package.editor.width=900', 'package.numDependencies=0', `package.numTargets=${cls.length + subs.length}`, 'package.showExtends=true', 'package.showUses=true'];
+  const t = (n, name, type, x, y) => lines.push(`target${n}.height=${BOX_H}`, `target${n}.name=${name}`, ...(type === 'PackageTarget' ? [] : [`target${n}.showInterface=false`]), `target${n}.type=${type}`, `target${n}.width=${BOX_W}`, `target${n}.x=${Math.round(x)}`, `target${n}.y=${Math.round(y)}`);
+  cls.forEach((c, i) => t(i + 1, c.name, typeOf(c), c.x, c.y));
+  subs.forEach((p, i) => { const pos = pkgPos(p); t(cls.length + i + 1, simplePkg(p), 'PackageTarget', pos.x, pos.y); });
   return lines.join('\n') + '\n';
 }
 async function exportZip() {
@@ -1212,9 +1317,11 @@ async function exportZip() {
   const Z = zipLib(); if (!Z) return;
   const zip = new Z(); const dir = safeFileName(S.project.name);
   const folder = zip.folder(dir);
-  for (const c of S.project.classes) folder.file(`${c.name}.java`, c.code);
+  const pdir = (p) => p ? p.replace(/\./g, '/') + '/' : '';
+  for (const c of S.project.classes) folder.file(`${pdir(c.pkg || '')}${c.name}.java`, c.code);
   for (const f of S.project.files || []) { const i = f.data.indexOf(','); folder.file(f.name, f.data.slice(i + 1), { base64: true }); }
-  folder.file('package.bluej', packageBluej());
+  folder.file('package.bluej', packageBluej(''));
+  for (const p of allPackages()) folder.file(pdir(p) + 'package.bluej', packageBluej(p));
   folder.file('README.TXT', `Projekt: ${S.project.name}\nErstellt mit der Java-Werkbank (WebBlueJ).\nDiese ZIP-Datei kann in der Java-Werkbank über „Projekt ▾ → ZIP- oder .java-Dateien importieren“ wieder geöffnet werden.\nDer Ordner lässt sich nach dem Entpacken auch in BlueJ öffnen.\n`);
   try {
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
@@ -1240,19 +1347,39 @@ async function importZip(file) {
   const dirOf = (n) => n.includes('/') ? n.slice(0, n.lastIndexOf('/') + 1) : '';
   const bluejs = entries.filter(f => /(^|\/)package\.bluej$/i.test(f.name)).sort((a, b) => a.name.length - b.name.length);
   let root = bluejs.length ? dirOf(bluejs[0].name) : null;
-  if (root === null) { const counts = {}; for (const j of javas) counts[dirOf(j.name)] = (counts[dirOf(j.name)] || 0) + 1; root = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.length - b.length)[0]; }
-  const pos = bluejs.length ? parseBluej(await bluejs[0].async('string')) : {};
-  const chosen = javas.filter(j => j.name.startsWith(root));
+  if (root === null) {
+    // ohne package.bluej: Wurzel = Ordner der Datei ohne den Paketpfad aus ihrer package-Zeile
+    const counts = {};
+    for (const j of javas) {
+      const pk = quickInfo(await j.async('string')).pkg || '', d = dirOf(j.name), tail = pk ? pk.replace(/\./g, '/') + '/' : '';
+      const r = tail && d.endsWith(tail) ? d.slice(0, d.length - tail.length) : d;
+      counts[r] = (counts[r] || 0) + 1;
+    }
+    root = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.length - b.length)[0];
+  }
+  // Unterordner sind Pakete (a/b/ → a.b); Ordner, die kein gültiger Paketname sind (z. B. +libs, doc), werden übersprungen
+  const pkgOf = (n) => { const rel = dirOf(n).slice(root.length).replace(/\/$/, ''); return rel ? rel.split('/') : []; };
+  const okPkg = (parts) => parts.every(x => /^[A-Za-z_]\w*$/.test(x));
+  const chosen = javas.filter(j => j.name.startsWith(root) && okPkg(pkgOf(j.name)));
   const skipped = javas.length - chosen.length;
-  const classes = [];
-  let i = 0;
+  const posBy = {};   // Paket -> Positionen aus seiner package.bluej
+  for (const b of bluejs) if (b.name.startsWith(root) && okPkg(pkgOf(b.name))) posBy[pkgOf(b.name).join('.')] = parseBluej(await b.async('string'));
+  const classes = [], pkgs = {};
+  const count = {};
   for (const j of chosen) {
     const code = (await j.async('string')).replace(/^\uFEFF/, '');
+    const pkg = pkgOf(j.name).join('.');
     const info = quickInfo(code); const name = info.name || j.name.split('/').pop().replace(/\.java$/i, '');
     if (classes.some(c => c.name === name)) continue;
-    const p = pos[name] || { x: 40 + (i % 4) * 200, y: 40 + Math.floor(i / 4) * 140 };
-    classes.push({ name, code, x: Math.max(0, p.x), y: Math.max(0, p.y) }); i++;
+    const i = count[pkg] = (count[pkg] || 0) + 1;
+    const p = (posBy[pkg] || {})[name] || { x: 40 + ((i - 1) % 4) * 200, y: 40 + Math.floor((i - 1) / 4) * 140 + (pkg ? 100 : 0) };
+    classes.push({ name, pkg, code, x: Math.max(0, p.x), y: Math.max(0, p.y) });
+    for (let q = pkg; q; q = q.includes('.') ? q.slice(0, q.lastIndexOf('.')) : '') {
+      const par = q.includes('.') ? q.slice(0, q.lastIndexOf('.')) : '', pp = (posBy[par] || {})[q.slice(q.lastIndexOf('.') + 1)];
+      if (!pkgs[q]) pkgs[q] = pp ? { x: Math.max(0, pp.x), y: Math.max(0, pp.y) } : {};
+    }
   }
+  for (const k of Object.keys(pkgs)) if (pkgs[k].x === undefined) delete pkgs[k];   // ohne Position: wird beim Anzeigen frei platziert
   const files = [];
   for (const e of entries.filter(f => f.name.startsWith(root) && assetKind(f.name))) {
     const nm = e.name.slice(root.length);
@@ -1262,8 +1389,8 @@ async function importZip(file) {
   const folderName = root.replace(/\/$/, '').split('/').pop();
   const name = uniqueProjectName(folderName || file.name.replace(/\.zip$/i, ''));
   syncEditor(); save();
-  loadProject({ name, classes, files });
-  toast(`Projekt „${name}“ mit ${classes.length} Klasse${classes.length === 1 ? '' : 'n'}${files.length ? ` und ${files.length} Bild-/Klangdatei${files.length === 1 ? '' : 'en'}` : ''} importiert.` + (skipped ? ` ${skipped} Datei(en) aus Unterordnern wurden übersprungen.` : ''));
+  loadProject({ name, classes, files, pkgs });
+  toast(`Projekt „${name}“ mit ${classes.length} Klasse${classes.length === 1 ? '' : 'n'}${files.length ? ` und ${files.length} Bild-/Klangdatei${files.length === 1 ? '' : 'en'}` : ''} importiert.` + (Object.keys(pkgs).length || classes.some(c => c.pkg) ? ` Pakete: ${[...new Set(classes.map(c => c.pkg).filter(Boolean))].join(', ')}.` : '') + (skipped ? ` ${skipped} Datei(en) aus anderen Ordnern wurden übersprungen.` : ''));
   if (!S.compiledOnce && classes.length) toast('Hinweis: Das Projekt enthält Fehler oder nicht unterstützte Java-Teile. Klicke auf „Übersetzen“, um sie zu sehen.', true);
 }
 
@@ -1279,7 +1406,7 @@ $('fileInput').addEventListener('change', async (ev) => {
     const info = quickInfo(code); const name = info.name || f.name.replace(/\.java$/i, '');
     const existing = classByName(name);
     if (existing) { existing.code = code; refreshInfo(existing); S.status[existing.id] = { dirty: true }; }
-    else { const p = freeSpot(); const c = { id: newId(), name, code, x: p.x, y: p.y }; S.project.classes.push(c); refreshInfo(c); S.status[c.id] = { dirty: true }; }
+    else { const p = freeSpot(); const c = { id: newId(), name, pkg: info.pkg || '', code, x: p.x, y: p.y }; S.project.classes.push(c); refreshInfo(c); S.status[c.id] = { dirty: true }; }
     added++;
   }
   if (added) { save(); compileAll({ silent: true }); renderDiagram(); toast(`${added} Datei(en) importiert.`); }
@@ -1288,6 +1415,7 @@ $('fileInput').addEventListener('change', async (ev) => {
 function helpDialog() {
   const d = document.createElement('div'); d.className = 'helpgrid';
   d.innerHTML = `<p><b>Klassendiagramm:</b> Klick auf eine Klasse öffnet ihr Menü (Objekte erzeugen, statische Methoden aufrufen). Doppelklick öffnet den Quelltext. Klassen lassen sich verschieben.</p>
+  <p><b>Pakete:</b> „Projekt ▾ → Neues Paket …“ legt ein Paket an; es erscheint als Ordner im Diagramm, ein Doppelklick öffnet es. Neue Klassen landen im gerade geöffneten Paket und bekommen die Zeile <code>package …;</code>. Klassen aus anderen Paketen brauchen <code>import paket.Klasse;</code> (oder <code>import paket.*;</code>) und müssen <code>public</code> sein. Oben links zeigt die Leiste, in welchem Paket du bist.</p>
   <p><b>Übersetzen:</b> Nach jeder Änderung neu übersetzen (Knopf oder <code>Strg+S</code> im Editor). Schraffierte Klassen sind noch nicht übersetzt. Fehler werden mit Zeile im Editor markiert.</p>
   <p><b>Editor:</b> Farbige Bereiche zeigen die Struktur (Klasse grün, Methode gelb, Schleife blau, Verzweigung rosa). Steht der Cursor an einer Klammer, wird die passende Klammer markiert. Über „Bearbeiten ▾“ oder Tastenkürzel: <code>Strg+F</code> Suchen, <code>Strg+H</code> Ersetzen, <code>Strg+G</code> Gehe zu Zeile, <code>Strg+Umschalt+F</code> automatisch einrücken, <code>Strg+#</code> ein-/auskommentieren, <code>Strg</code> + <code>+</code>/<code>−</code> Schriftgröße. Weitere Einstellungen (Beamer-Schrift, dunkles Design) unter ⚙.</p>
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>

@@ -87,6 +87,18 @@ button { cursor: pointer; }
 .cbox .badge { position: absolute; right: -8px; top: -8px; background: var(--err); color: #fff; border-radius: 10px; font-size: 11px; padding: 0 6px; line-height: 18px; }
 .legend { position: sticky; left: 8px; bottom: 8px; float: left; margin: 8px; font-size: 12px; color: var(--muted); background: color-mix(in srgb, var(--panel) 85%, transparent); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; display: flex; gap: 12px; flex-wrap: wrap; z-index: 2; }
 .legend span { display: inline-flex; align-items: center; gap: 5px; }
+.pkgbar { position: sticky; top: 0; left: 0; z-index: 3; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; padding: 6px 10px; background: color-mix(in srgb, var(--panel) 92%, transparent); border-bottom: 1px solid var(--line); font-size: 13px; }
+.pkgbar .crumb { border: 0; background: none; color: var(--obj); font: inherit; font-family: var(--mono); padding: 2px 4px; border-radius: 4px; cursor: pointer; }
+.pkgbar .crumb:hover { background: var(--line); }
+.pkgbar .crumb.cur { color: var(--ink); font-weight: 600; cursor: default; background: none; }
+.pkgbar .sep { color: var(--muted); }
+.pbox { position: absolute; width: 156px; cursor: grab; user-select: none; touch-action: none; }
+.pbox .ptab { width: 56px; height: 12px; background: var(--card); border: 1.5px solid var(--muted); border-bottom: 0; border-radius: 4px 4px 0 0; }
+.pbox .pbody { background: var(--card); border: 1.5px solid var(--muted); border-radius: 0 4px 4px 4px; box-shadow: var(--shadow); min-height: 54px; }
+.pbox .chead { color: var(--muted); padding: 3px 8px 0; font-size: 11px; letter-spacing: .04em; min-height: 6px; }
+.pbox .cname { font-family: var(--mono); font-weight: 600; padding: 6px 8px 12px; text-align: center; word-break: break-word; }
+.pbox.up .pbody { border-style: dashed; } .pbox.up .ptab { border-style: dashed; } .pbox.up .cname { color: var(--muted); font-weight: 400; }
+.pbox:focus-visible { outline: 2px solid var(--obj); outline-offset: 2px; }
 .hint-empty { position: absolute; left: 24px; top: 24px; color: var(--muted); max-width: 34ch; }
 
 /* Editor */
@@ -267,6 +279,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 
   <main class="work">
     <section class="diagram" id="diagram" aria-label="Klassendiagramm">
+      <nav class="pkgbar" id="pkgBar" aria-label="Paket" hidden></nav>
       <div class="canvas" id="canvas">
         <svg id="arrows" aria-hidden="true">
           <defs>

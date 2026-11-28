@@ -246,6 +246,7 @@ const MODS = new Set(['public', 'private', 'protected', 'static', 'final', 'abst
 const ASSIGN_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=']);
 const EXPR_STMT = new Set(['Assign', 'PreInc', 'PostInc', 'Call', 'New', 'CtorCall']);
 const BIN = [['||'], ['&&'], ['|'], ['^'], ['&'], ['==', '!='], ['<', '>', '<=', '>=', 'instanceof'], ['<<', '>>', '>>>'], ['+', '-'], ['*', '/', '%']];
+let PKG_ROOTS = new Set();   // erste Namensteile der Pakete im Projekt (für a.b.Klasse in Ausdrücken)
 const visOf = (m) => m.has('public') ? 'public' : m.has('private') ? 'private' : m.has('protected') ? 'protected' : 'package';
 
 class Parser {
@@ -282,9 +283,18 @@ class Parser {
   skipParens() { let d = 0; do { if (this.is('(')) d++; else if (this.is(')')) d--; if (this.tok.t === 'eof') this.fail("')' fehlt"); this.p++; } while (d > 0); }
 
   parseUnit() {
-    const classes = [];
-    while (this.is('package') || this.is('import')) { while (!this.is(';')) { if (this.tok.t === 'eof') this.fail("';' erwartet"); this.p++; } this.p++; }
-    while (this.tok.t !== 'eof') { if (this.accept(';')) continue; classes.push(this.parseTypeDecl()); classes.push(...this.extra.splice(0)); }
+    const classes = []; let pkgName = null, pkgLine = 0; const imports = [];
+    const qname = (star) => { const parts = [this.ident('Paketname')]; while (this.accept('.')) { if (star && this.is('*')) { this.p++; parts.push('*'); break; } parts.push(this.ident('Name')); } return parts.join('.'); };
+    while (this.is('package') || this.is('import')) {
+      const line = this.tok.line;
+      if (this.accept('package')) {
+        if (pkgName !== null || imports.length) this.fail("'package' muss ganz oben in der Datei stehen, vor allen import-Anweisungen");
+        pkgName = qname(false); pkgLine = line;
+      } else { this.p++; const st = !!this.accept('static'); const n = qname(true); imports.push({ name: n, static: st, line }); }
+      this.expect(';');
+    }
+    while (this.tok.t !== 'eof') { if (this.accept(';')) continue; if (this.is('package') || this.is('import')) this.fail(`'${this.tok.v}' muss am Anfang der Datei stehen, vor der Klasse`); classes.push(this.parseTypeDecl()); classes.push(...this.extra.splice(0)); }
+    for (const d of classes) { d.pkgName = pkgName; d.pkgLine = pkgLine; d.imports = imports; }
     return classes;
   }
   parseModifiers() {
@@ -449,14 +459,16 @@ class Parser {
   }
   parseType() {
     const t = this.tok; let name, qual = null;
+    let pre = [];
     if (t.t === 'kw' && PRIMS.has(t.v)) { name = t.v; this.p++; }
-    else if (t.t === 'id') { name = t.v; this.p++; while (this.is('.') && this.peek().t === 'id') { this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
+    else if (t.t === 'id') { name = t.v; this.p++; while (this.is('.') && this.peek().t === 'id') { pre.push(name); this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
     else this.fail('Typ erwartet');
     let args = null;
     if (this.is('<')) args = this.parseTypeArgs();
     let dims = 0; while (this.is('[') && this.isAt(1, ']')) { this.p += 2; dims++; }
     const r = { name, dims, args };
     if (qual && /^[A-Z]/.test(qual)) r.qual = qual;   // Aussen.Innen
+    pre = pre.filter(x => /^[a-z]/.test(x)); if (pre.length) r.pkgq = pre.join('.');
     return r;
   }
   parseTypeArgs() {
@@ -700,6 +712,8 @@ class Parser {
     }
     this.p = save; return null;
   }
+  // a.b.Klasse… : vollständig qualifizierter Klassenname (java.util.…, eigene Pakete)
+  pkgChainAhead() { let i = this.p; while (this.toks[i] && this.toks[i].t === 'id' && (i === this.p || /^[a-z]/.test(this.toks[i].v)) && this.toks[i + 1] && this.toks[i + 1].v === '.') i += 2; return i > this.p && this.toks[i] && this.toks[i].t === 'id' && /^[A-Z]/.test(this.toks[i].v); }
   parsePrimary() {
     const t = this.tok, line = t.line;
     switch (t.t) {
@@ -707,9 +721,10 @@ class Parser {
       case 'str': this.p++; return { k: 'Lit', v: t.v, line };
       case 'char': this.p++; return { k: 'Lit', v: new JChar(t.v.charCodeAt(0)), line };
       case 'id':
-        if ((t.v === 'java' || t.v === 'javax') && this.isAt(1, '.')) {
-          while (this.tok.t === 'id' && /^[a-z]/.test(this.tok.v) && this.isAt(1, '.') && this.peek(2).t === 'id') this.p += 2;
-          return this.parsePrimary();
+        if ((t.v === 'java' || t.v === 'javax' || PKG_ROOTS.has(t.v)) && this.isAt(1, '.') && this.pkgChainAhead()) {
+          const pre = [];
+          while (this.tok.t === 'id' && /^[a-z]/.test(this.tok.v) && this.isAt(1, '.') && this.peek(2).t === 'id') { pre.push(this.tok.v); this.p += 2; }
+          const r = this.parsePrimary(); r.pkgq = pre.join('.'); return r;
         }
         this.p++;
         if (this.is('->') && !this.noLambda) { this.p++; return this.lambdaBody([{ name: t.v, type: null }], line); }
@@ -774,7 +789,8 @@ class Parser {
     const line = this.tok.line; this.p++;
     const t = this.tok; let name, qual = null;
     if (t.t === 'kw' && PRIMS.has(t.v)) { name = t.v; this.p++; }
-    else { name = this.ident('Klassenname nach new'); while (this.is('.') && this.peek().t === 'id') { this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
+    const pre = [];
+    if (!(t.t === 'kw' && PRIMS.has(t.v))) { name = this.ident('Klassenname nach new'); while (this.is('.') && this.peek().t === 'id') { if (/^[a-z]/.test(name)) pre.push(name); this.p += 2; qual = name; name = this.toks[this.p - 1].v; } }
     let targs = null; if (this.is('<')) targs = this.parseTypeArgs();
     if (this.is('[')) {
       const dims = []; let extra = 0;
@@ -791,7 +807,7 @@ class Parser {
     if (PRIMS.has(name)) this.fail("'[' erwartet");
     if (!this.is('(')) this.fail(`'(' erwartet nach new ${name}`);
     const args = this.parseArgs();
-    const type = T(name, 0, targs); if (qual && /^[A-Z]/.test(qual)) type.qual = qual;
+    const type = T(name, 0, targs); if (qual && /^[A-Z]/.test(qual)) type.qual = qual; if (pre.length) type.pkgq = pre.join('.');
     if (this.is('{')) return { k: 'New', type, args, line, anon: this.parseAnonBody(name, line) };
     return { k: 'New', type, args, line };
   }
@@ -839,7 +855,7 @@ class ClassInfo {
     const walk = (c) => { if (!c || seen.has(c)) return false; seen.add(c); if (c === other) return true; return walk(c.superClass) || c.interfaces.some(walk); };
     return walk(this);
   }
-  get fullName() { return this.builtin && this.pkg ? this.pkg + '.' + this.name : this.name; }
+  get fullName() { return this.pkg ? this.pkg + '.' + this.name : this.name; }
 }
 
 class Env {
@@ -896,11 +912,17 @@ class Runtime {
     for (const c of this.classes.values()) { if (!c.native) { c.staticInit = 0; c.staticValues = Object.create(null); } }
     this.userClasses = [];
     const errors = [], decls = [];
+    PKG_ROOTS = new Set();
+    for (const f of files) { if (f.pkg) PKG_ROOTS.add(f.pkg.split('.')[0]); const m = /^\s*package\s+([A-Za-z_]\w*)/m.exec(f.code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')); if (m) PKG_ROOTS.add(m[1]); }
     for (const f of files) {
       try {
         const ds = new Parser(f.code).parseUnit();
         if (!ds.length) errors.push({ fileId: f.id, line: 1, message: 'Die Datei enthält keine Klasse' });
         for (const d of ds) { d.fileId = f.id; decls.push(d); }
+        if (ds.length && f.pkg !== undefined && (ds[0].pkgName || '') !== (f.pkg || '')) {
+          const d = ds[0];
+          errors.push({ fileId: f.id, line: d.pkgLine || 1, message: f.pkg ? (d.pkgName ? `Die Klasse liegt im Paket ${f.pkg}, hier steht aber 'package ${d.pkgName};' – schreibe 'package ${f.pkg};'` : `Die Klasse liegt im Paket ${f.pkg} – die erste Zeile muss 'package ${f.pkg};' lauten`) : `Die Klasse liegt in keinem Paket – entferne die Zeile 'package ${d.pkgName};'` });
+        }
       } catch (e) {
         if (e instanceof JavaError) errors.push({ fileId: f.id, line: e.line, message: e.message }); else throw e;
       }
@@ -909,6 +931,8 @@ class Runtime {
     this.qualifyNested(decls);
     try { this.buildClasses(decls, false, errors); }
     catch (e) { if (e instanceof JavaError) errors.push({ fileId: e.fileId, line: e.line, message: e.message }); else throw e; }
+    if (errors.length) return { ok: false, errors };
+    this.checkPackages(decls, errors);
     if (errors.length) return { ok: false, errors };
     for (const c of this.userClasses) if (c.nestKind !== 'local' && c.nestKind !== 'anon') new Checker(this, c, errors).run();
     if (errors.length) return { ok: false, errors };
@@ -947,14 +971,65 @@ class Runtime {
       d.name = nw;
     }
   }
+  // Pakete: Klassen aus anderen Paketen brauchen import (oder den vollen Namen) und müssen public sein
+  checkPackages(decls, errors) {
+    const seen = new Set();
+    const add = (d, line, message) => { const k = d.fileId + '|' + line + '|' + message; if (!seen.has(k)) { seen.add(k); errors.push({ fileId: d.fileId, line, message }); } };
+    const pkgs = new Map();   // Paket -> Klassen (oberste Ebene)
+    for (const c of this.userClasses) if (!c.outer) { const p = c.pkg || ''; if (!pkgs.has(p)) pkgs.set(p, new Set()); pkgs.get(p).add(c.name); }
+    const pname = (p) => p ? `im Paket ${p}` : 'im Standardpaket (ohne package)';
+    const tops = new Set();
+    for (const d of decls) {
+      if (d.$outerDecl) continue;
+      const imps = d.imports || [];
+      if (tops.has(d.fileId)) continue; tops.add(d.fileId);
+      for (const im of imps) {
+        if (im.static) continue;
+        const parts = im.name.split('.'), star = parts[parts.length - 1] === '*';
+        const pk = parts.slice(0, -1).join('.');
+        if (!PKG_ROOTS.has(parts[0])) { if (!/^(java|javax|ch|org|com|net)$/.test(parts[0])) add(d, im.line, `Es gibt kein Paket ${star ? pk : im.name.replace(/\.[A-Z]\w*$/, '')}`); continue; }   // java.…, ch.aplu.… usw.
+        if (star) { if (!pkgs.has(pk)) add(d, im.line, `Es gibt kein Paket ${pk}` + (pkgs.size > 1 ? ` (vorhanden: ${[...pkgs.keys()].filter(Boolean).join(', ')})` : '')); }
+        else if (!pkgs.has(pk)) add(d, im.line, `Es gibt kein Paket ${pk}`);
+        else if (!pkgs.get(pk).has(parts[parts.length - 1])) add(d, im.line, `Im Paket ${pk} gibt es keine Klasse ${parts[parts.length - 1]}`);
+        else if ((d.pkgName || '') === pk) add(d, im.line, `${im.name} liegt im selben Paket – dafür ist kein import nötig`);
+      }
+    }
+    for (const d of decls) {
+      const my = d.pkgName || '', imps = d.imports || [];
+      let line = d.line;
+      const use = (name, pkgq) => {
+        const c = this.classes.get(name); if (!c || c.builtin) return;
+        const top = this.topOf(c), tp = top.pkg || '';
+        if (tp === my) { if (pkgq && pkgq !== tp) add(d, line, `Die Klasse ${name} liegt ${pname(tp)}, nicht im Paket ${pkgq}`); return; }
+        if (!tp) { add(d, line, `Die Klasse ${name} liegt im Standardpaket (ohne package) und kann aus dem Paket ${my} heraus nicht benutzt werden – verschiebe sie in ein Paket`); return; }
+        if (pkgq) { if (pkgq !== tp) { add(d, line, `Die Klasse ${name} liegt im Paket ${tp}, nicht im Paket ${pkgq}`); return; } }
+        else if (!imps.some(im => !im.static && (im.name === tp + '.*' || im.name === tp + '.' + top.name))) { add(d, line, `Die Klasse ${name} liegt im Paket ${tp} – schreibe oben 'import ${tp}.${top.name};' (oder 'import ${tp}.*;')`); return; }
+        if (!top.decl.mods.has('public')) add(d, line, `Die Klasse ${top.name} ist nicht public und kann deshalb nur im Paket ${tp} benutzt werden – schreibe 'public class ${top.name}'`);
+      };
+      if (d.superName) use(d.superName, null);
+      for (const n of d.interfaces || []) use(n, null);
+      if (d.anonBase) use(d.anonBase, null);
+      const vis = new Set();
+      const walk = (x) => {
+        if (!x || typeof x !== 'object' || x instanceof Set || x instanceof Map || x instanceof ClassInfo || vis.has(x)) return;
+        vis.add(x);
+        if (Array.isArray(x)) { for (const y of x) walk(y); return; }
+        if (typeof x.line === 'number') line = x.line;
+        if (typeof x.name === 'string' && 'dims' in x) use(x.name, x.pkgq || null);
+        else if (x.k === 'Name' && /^[A-Z]/.test(x.name)) use(x.name, x.pkgq || null);
+        for (const k in x) { if (k[0] === '$') continue; const v = x[k]; if (v && typeof v === 'object') walk(v); }
+      };
+      for (const part of [d.fields, d.methods, d.ctors, d.inits, d.enumConsts, d.superArgs]) walk(part);
+    }
+  }
   buildClasses(decls, builtin, errors) {
     const made = [];
     const fail = (d, line, msg) => { const e = new JavaError(msg, line); e.fileId = d.fileId; throw e; };
     for (const d of decls) {
       const prev = this.classes.get(d.name);
       if (prev && !builtin && prev.native && prev.native.lib) this.classes.delete(d.name);
-      if (this.classes.has(d.name)) fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : `Klasse '${d.name}' gibt es doppelt`);
-      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : /^(IO|FileNotFound)Exception$/.test(d.name) ? 'java.io' : 'java.lang')) : null });
+      if (this.classes.has(d.name)) { const o = this.classes.get(d.name); fail(d, d.line, this.builtinClasses && this.builtinClasses.has(d.name) ? `Der Klassenname '${d.name}' ist schon von Java belegt – wähle einen anderen Namen` : !builtin && (o.pkg || '') !== (d.pkgName || '') ? `Eine Klasse '${d.name}' gibt es schon ${o.pkg ? 'im Paket ' + o.pkg : 'im Standardpaket'} – in der Java-Werkbank müssen Klassennamen im ganzen Projekt verschieden sein` : `Klasse '${d.name}' gibt es doppelt`); }
+      const c = new ClassInfo(d.name, d, { builtin, pkg: builtin ? (d.pkg || (UTIL_EXC.has(d.name) ? 'java.util' : /^(IO|FileNotFound)Exception$/.test(d.name) ? 'java.io' : 'java.lang')) : d.pkgName || null });
       c.fileId = d.fileId;
       if (d.nestKind) { c.nestKind = d.nestKind; c.staticNested = !!d.staticNested; }
       this.classes.set(d.name, c); made.push(c);
@@ -3491,6 +3566,16 @@ class Checker {
   userClass(t) { if (!t || t.dims || PRIMS.has(t.name)) return null; return this.rt.classes.get(t.name) || null; }
   accessCheck(member, owner, line, what) {
     if (member.vis === 'private' && owner !== this.cls && this.rt.topOf(owner) !== this.rt.topOf(this.cls)) this.err(line, `${what} '${member.name}' ist private in ${owner.name} – Zugriff nur innerhalb dieser Klasse (verwende eine get-Methode)`);
+    this.pkgAccess(member, owner, line, what);
+  }
+  // Paketsichtbarkeit: ohne Modifizierer nur im eigenen Paket, protected zusätzlich in Unterklassen
+  pkgAccess(member, owner, line, what, name) {
+    if (!owner || owner.builtin || !member || (member.vis !== 'package' && member.vis !== 'protected')) return;
+    const a = this.rt.topOf(owner).pkg || '', b = this.rt.topOf(this.cls).pkg || '';
+    if (a === b) return;
+    const n = name || member.name + (what === 'Methode' ? '()' : '');
+    if (member.vis === 'protected') { for (let c = this.cls; c; c = c.outer) if (c.isSubclassOf(owner)) return; this.err(line, `${what} ${n} ist protected in ${owner.name} – außerhalb des Pakets ${a || '(Standardpaket)'} nur in Unterklassen benutzbar`); }
+    else this.err(line, `${what} ${n} hat in ${owner.name} keinen Modifizierer und ist deshalb nur im Paket ${a || '(Standardpaket)'} sichtbar – schreibe public davor`);
   }
   visibleNames(sc) { const s = sc.allNames(); for (const f of this.rt.allFieldNames(this.cls)) s.push(f); return s; }
   expr(e, sc) {
@@ -3504,6 +3589,7 @@ class Checker {
         if (f) {
           if (!f.field.static && this.ctx.isStatic) this.err(e.line, `Das Attribut '${e.name}' gehört zu einem Objekt und kann in einer statischen Methode nicht verwendet werden`);
           if (f.owner !== this.cls && f.field.vis === 'private' && this.rt.topOf(f.owner) !== this.rt.topOf(this.cls)) this.err(e.line, `Attribut '${e.name}' ist private in ${f.owner.name} – Unterklassen können darauf nicht direkt zugreifen (protected oder get-Methode verwenden)`);
+          this.pkgAccess(f.field, f.owner, e.line, 'Attribut');
           return f.field.type;
         }
         const o = this.outerLookup(e.name, e.line);
@@ -3857,6 +3943,7 @@ class Checker {
     const top = this.rt.topOf(this.cls);
     if (!isCtor && m.vis === 'private' && m.cls !== this.cls && this.rt.topOf(m.cls) !== top) this.err(line, `Methode ${m.name}() ist private in ${m.cls.name}`);
     if (isCtor && m.vis === 'private' && owner !== this.cls && this.rt.topOf(owner) !== top) this.err(line, `Konstruktor ${owner.name}(…) ist private`);
+    if (m.cls || owner) this.pkgAccess(m, isCtor ? owner : m.cls, line, isCtor ? 'Der Konstruktor' : 'Methode', isCtor ? owner.name + '(…)' : null);
     return m;
   }
   retType(m, recvType) {
@@ -4005,12 +4092,13 @@ function quickInfo(code) {
   try { ids = new Set(lex(code).toks.filter(t => t.t === 'id').map(t => t.v)); } catch (e) { ids = new Set((code.match(/\b[A-Z]\w*/g) || [])); }
   try {
     const ds = new Parser(code).parseUnit();
-    if (ds.length) { const d = ds[0]; return { ok: true, name: d.name, kind: d.kind, abstract: d.mods.has('abstract'), superName: d.superName, interfaces: d.interfaces, ids }; }
+    if (ds.length) { const d = ds[0]; return { ok: true, pkg: d.pkgName || '', name: d.name, kind: d.kind, abstract: d.mods.has('abstract'), superName: d.superName, interfaces: d.interfaces, ids }; }
   } catch (e) { }
   const clean = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
   const m = /\b(abstract\s+)?(class|interface|enum)\s+([A-Za-z_]\w*)(?:\s*<[^>{]*>)?(?:\s+extends\s+([A-Za-z_]\w*))?(?:\s+implements\s+([\w\s,<>]+?))?\s*\{/.exec(clean);
-  if (!m) return { ok: false, name: null, ids };
-  return { ok: false, name: m[3], kind: m[2], abstract: !!m[1], superName: m[2] === 'class' ? m[4] || null : null, interfaces: (m[5] || (m[2] === 'interface' ? m[4] || '' : '')).split(',').map(s => s.trim().replace(/<.*$/, '')).filter(Boolean), ids };
+  const pm = /^\s*package\s+([\w.]+)\s*;/m.exec(clean); const pkg = pm ? pm[1] : '';
+  if (!m) return { ok: false, pkg, name: null, ids };
+  return { ok: false, pkg, name: m[3], kind: m[2], abstract: !!m[1], superName: m[2] === 'class' ? m[4] || null : null, interfaces: (m[5] || (m[2] === 'interface' ? m[4] || '' : '')).split(',').map(s => s.trim().replace(/<.*$/, '')).filter(Boolean), ids };
 }
 
 Runtime.extensions = [];

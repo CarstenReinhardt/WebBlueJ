@@ -372,4 +372,50 @@ public class Main {
     System.out.println("[" + a + "]");
   }
 }` }] },
+{ name: 'Pakete', classes: [
+{ name: 'Kreis', pkg: 'geometrie', code: `package geometrie;
+public class Kreis extends Form {
+  private double r;
+  public Kreis(double r) { this.r = r; name = "Kreis"; }
+  public double flaeche() { return Math.PI * r * r; }
+  public static final double EINS = 1.0;
+}` },
+{ name: 'Form', pkg: 'geometrie', code: `package geometrie;
+public abstract class Form {
+  protected String name;
+  int intern = 4;
+  public abstract double flaeche();
+  public String toString() { return name + " " + Math.round(flaeche()); }
+}` },
+{ name: 'Main', pkg: 'app', code: `package app;
+import geometrie.*;
+import java.util.ArrayList;
+public class Main {
+  public static void main(String[] args) {
+    ArrayList<Form> l = new ArrayList<>();
+    l.add(new Kreis(2));
+    l.add(new geometrie.Kreis(1));
+    System.out.println(l + " " + geometrie.Kreis.EINS + " " + Kreis.EINS);
+    System.out.println(new Kreis(1).getClass().getName());
+    Object o = new Kreis(3); System.out.println(o instanceof Form);
+    System.out.println(new Quadrat(2) + " " + new werkzeug.Hilfe().x);
+  }
+}` },
+{ name: 'Quadrat', pkg: 'app', code: `package app;
+import geometrie.Form;
+class Quadrat extends Form {
+  double a; Quadrat(double a) { this.a = a; name = "Quadrat"; }
+  public double flaeche() { return a * a; }
+}` },
+{ name: 'Hilfe', pkg: 'werkzeug', code: `package werkzeug;
+public class Hilfe { public int x = 7; }` }] },
+{ name: 'Pakete: Fehler', classes: [{ name: 'Kreis', pkg: 'geometrie', code: `package geometrie;
+public class Kreis { void paket() { } }` }, { name: 'Main', pkg: 'app', code: `package app;
+import geometrie.Kreis;
+public class Main { void f() { new Kreis().paket(); } }` }, { name: 'Falsch', pkg: 'app', code: `package geometrie;
+public class Falsch { }` }] },
+{ name: 'Pakete: Zugriff', classes: [{ name: 'Kreis', pkg: 'geometrie', code: `package geometrie;
+public class Kreis { void paket() { } }` }, { name: 'Main', pkg: 'app', code: `package app;
+import geometrie.Kreis;
+public class Main { void f() { new Kreis().paket(); } }` }] },
 ];

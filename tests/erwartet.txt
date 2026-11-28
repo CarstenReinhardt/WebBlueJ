@@ -833,3 +833,27 @@ OUT 0
 OUT 1
 OUT 2
 snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":false}
+=== Pakete
+compile {"ok":true,"errors":[]}
+call Main.main
+OUT [Kreis 13, Kreis 3] 1.0 1.0
+
+OUT geometrie.Kreis
+
+OUT true
+
+OUT Quadrat 4 7
+
+{"ok":true}
+snip 1 + 2 * 3 {"ok":true,"hasValue":true,"value":"7"}
+snip int q = 5; q * q {"ok":false,"message":"Keine gültige Anweisung: Der Ausdruck wird nicht verwendet (fehlt eine Zuweisung oder ein Methodenaufruf?)","kind":"compile"}
+snip "a".length() + Math.abs(-3) {"ok":true,"hasValue":true,"value":"4"}
+snip new java.util.ArrayList<String>() {"ok":true,"hasValue":true,"value":"<ArrayList>"}
+OUT 0
+OUT 1
+OUT 2
+snip for (int i = 0; i < 3; i++) System.out.print(i); {"ok":true,"hasValue":false}
+=== Pakete: Fehler
+compile {"ok":false,"errors":[{"fileId":"f2","line":1,"message":"Die Klasse liegt im Paket app, hier steht aber 'package geometrie;' – schreibe 'package app;'"}]}
+=== Pakete: Zugriff
+compile {"ok":false,"errors":[{"fileId":"f1","line":3,"message":"Methode paket() hat in Kreis keinen Modifizierer und ist deshalb nur im Paket geometrie sichtbar – schreibe public davor"}]}

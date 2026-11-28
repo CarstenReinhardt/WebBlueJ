@@ -27,7 +27,7 @@ async function runAll() {
   for (const p of progs) {
     seed = 12345;
     log.push('=== ' + p.name);
-    const res = rt.compile(p.classes.map((c, i) => ({ id: 'f' + i, code: c.code })));
+    const res = rt.compile(p.classes.map((c, i) => ({ id: 'f' + i, code: c.code, pkg: c.pkg })));
     log.push('compile ' + JSON.stringify(res));
     if (!res.ok) continue;
     const env = new R.Env(null);
