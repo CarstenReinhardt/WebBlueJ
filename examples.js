@@ -538,6 +538,97 @@ public class Rechner extends JFrame implements ActionListener {
         new Rechner();
     }
 }` },
+    { name: 'Malfeld', x: 230, y: 220, code: `import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.util.ArrayList;
+
+/**
+ * Ein Malprogramm mit Swing: Menü, Farbauswahl (JComboBox), Stiftdicke (JSlider)
+ * und einer Zeichenfläche, die in paintComponent zeichnet.
+ * Rufe main auf und male mit gedrückter Maustaste.
+ */
+public class Malfeld extends JFrame {
+    private ArrayList<int[]> linien = new ArrayList<>();   // je Linie: x1, y1, x2, y2, Farbe, Dicke
+    private Color[] farben = { Color.BLACK, Color.RED, Color.BLUE, Color.GREEN };
+    private JComboBox<String> farbwahl = new JComboBox<>(new String[] { "Schwarz", "Rot", "Blau", "Grün" });
+    private JSlider dicke = new JSlider(1, 15, 3);
+    private Flaeche flaeche = new Flaeche();
+
+    /** Die Zeichenfläche: eine eigene Unterklasse von JPanel. */
+    class Flaeche extends JPanel {
+        private int altX, altY;
+
+        Flaeche() {
+            setPreferredSize(new Dimension(420, 280));
+            setBackground(Color.WHITE);
+            MouseAdapter maus = new MouseAdapter() {
+                public void mousePressed(MouseEvent e) {
+                    altX = e.getX();
+                    altY = e.getY();
+                }
+                public void mouseDragged(MouseEvent e) {
+                    linien.add(new int[] { altX, altY, e.getX(), e.getY(), farbwahl.getSelectedIndex(), dicke.getValue() });
+                    altX = e.getX();
+                    altY = e.getY();
+                    repaint();
+                }
+            };
+            addMouseListener(maus);
+            addMouseMotionListener(maus);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g;
+            for (int[] l : linien) {
+                g2.setColor(farben[l[4]]);
+                g2.setStroke(new BasicStroke(l[5]));
+                g2.drawLine(l[0], l[1], l[2], l[3]);
+            }
+            g2.setColor(Color.GRAY);
+            g2.drawString(linien.size() + " Striche", 8, getHeight() - 8);
+        }
+    }
+
+    public Malfeld() {
+        super("Malfeld");
+        setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+
+        // Menüleiste
+        JMenuBar leiste = new JMenuBar();
+        JMenu datei = new JMenu("Datei");
+        JMenuItem neu = new JMenuItem("Neu");
+        neu.addActionListener(e -> {
+            linien.clear();
+            flaeche.repaint();
+        });
+        JMenuItem ende = new JMenuItem("Beenden");
+        ende.addActionListener(e -> dispose());
+        datei.add(neu);
+        datei.addSeparator();
+        datei.add(ende);
+        leiste.add(datei);
+        setJMenuBar(leiste);
+
+        // Werkzeuge oben
+        JPanel werkzeuge = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        werkzeuge.add(new JLabel("Farbe:"));
+        werkzeuge.add(farbwahl);
+        werkzeuge.add(new JLabel("Dicke:"));
+        werkzeuge.add(dicke);
+
+        add(werkzeuge, BorderLayout.NORTH);
+        add(flaeche, BorderLayout.CENTER);
+        pack();
+        setVisible(true);
+    }
+
+    public static void main(String[] args) {
+        new Malfeld();
+    }
+}` },
     { name: 'Zaehler', x: 380, y: 60, code: `import javax.swing.*;
 import java.awt.*;
 

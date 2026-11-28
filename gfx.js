@@ -368,7 +368,29 @@ function create(hooks) {
       closeWin(w);
     });
     el.addEventListener('pointerdown', () => { el.style.zIndex = ++z; });
-    el.addEventListener('keydown', (ev) => ev.stopPropagation());
+    const send = (ev) => { if (w.listener && !w.closed && !w.dead) { try { w.listener(ev); } catch (e) { setTimeout(() => { throw e; }); } } };
+    const key = (kind) => (ev) => {
+      ev.stopPropagation();
+      if (ev.target.closest && ev.target.closest('.gfx-head, .sw-menubar, .sw-dd')) return;
+      const t = ev.target.closest ? ev.target.closest('[data-swid]') : null;
+      const inText = /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName || '');
+      const code = JAVA_KEY[ev.keyCode] !== undefined ? JAVA_KEY[ev.keyCode] : ev.keyCode;
+      let ch = 65535;
+      if (ev.key.length === 1) ch = ev.key.charCodeAt(0);
+      else if (ev.key === 'Enter') ch = 10; else if (ev.key === 'Backspace') ch = 8; else if (ev.key === 'Tab') ch = 9; else if (ev.key === 'Escape') ch = 27; else if (ev.key === 'Delete') ch = 127;
+      if (!inText && kind === 'keydown' && (ev.key.startsWith('Arrow') || ev.key === ' ') && !(ev.target.tagName === 'BUTTON' && ev.key === ' ')) ev.preventDefault();
+      const mods = { shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey };
+      const id = t ? +t.dataset.swid : undefined;
+      send({ type: 'key', kind, id, code, ch, ...mods });
+      if (kind === 'keydown' && ch !== 65535) send({ type: 'key', kind: 'typed', id, code: 0, ch, ...mods });
+    };
+    el.addEventListener('keydown', key('keydown'));
+    el.addEventListener('keyup', key('keyup'));
+    // Menüs schließen, wenn woanders hingeklickt wird
+    document.addEventListener('pointerdown', (ev) => { if (!ev.target.closest || !ev.target.closest('.sw-dd, .sw-mtop')) swingCloseMenus(w); }, true);
+    w.ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver((entries) => {
+      for (const en of entries) { const t = en.target; const sid = +t.dataset.swid; const wd = Math.round(t.clientWidth), ht = Math.round(t.clientHeight); swingCanvasSize(t); if (t._sz !== wd + 'x' + ht) { t._sz = wd + 'x' + ht; send({ type: 'size', id: sid, w: wd, h: ht }); } }
+    }) : null;
     dragHandle(el, el.querySelector('.gfx-head'));
     ensureLayer().appendChild(el);
     wins.set(id, w);
@@ -406,11 +428,38 @@ function create(hooks) {
         break;
       }
       case 'scroll': el = document.createElement('div'); el.className = 'sw-scroll'; break;
+      case 'toggle': el = document.createElement('button'); el.type = 'button'; el.className = 'sw-btn sw-toggle'; el.addEventListener('click', () => send({ type: 'check', id: node.id, value: !node.selected })); break;
+      case 'radio': {
+        el = document.createElement('label'); el.className = 'sw-cb';
+        const box = document.createElement('input'); box.type = 'radio'; box.name = 'swg' + w.id + '_' + (node.group || 'n' + node.id); const span = document.createElement('span');
+        el.append(box, span); box.addEventListener('change', () => { if (box.checked) send({ type: 'radio', id: node.id }); });
+        break;
+      }
+      case 'combo': case 'list':
+        el = document.createElement('select'); el.className = node.kind === 'combo' ? 'sw-combo' : 'sw-list';
+        el.addEventListener('change', () => send({ type: 'select', id: node.id, index: el.selectedIndex }));
+        break;
+      case 'slider': {
+        el = document.createElement('div'); el.className = 'sw-slider';
+        const r = document.createElement('input'); r.type = 'range'; const lab = document.createElement('div'); lab.className = 'sw-slab';
+        el.append(r, lab);
+        r.addEventListener('input', () => send({ type: 'slide', id: node.id, value: +r.value }));
+        break;
+      }
+      case 'progress': el = document.createElement('div'); el.className = 'sw-prog'; el.innerHTML = '<div class="sw-pbar"><div class="sw-pfill"></div></div><span class="sw-ptext"></span>'; break;
+      case 'sep': el = document.createElement('hr'); el.className = 'sw-sep'; break;
       default: el = document.createElement('div'); el.className = 'sw-panel';
     }
+    if (node.paint) {
+      // Zeichenfläche für paintComponent
+      const cv = document.createElement('canvas'); cv.className = 'sw-cv'; el.appendChild(cv); el.classList.add('sw-paint');
+      if (w.ro) w.ro.observe(el);
+    }
+    if (node.mouse || node.motion) swingMouse(w, el, node, send);
+    if (node.key || node.focusable === true || node.paint) { if (el.tabIndex < 0) el.tabIndex = 0; el.addEventListener('pointerdown', () => { try { el.focus({ preventScroll: true }); } catch (e) { } }); }
     el.dataset.swid = node.id;
     w.els.set(node.id, { el, node });
-    if (node.children && node.children.length || node.kind === 'panel' || node.kind === 'scroll') {
+    if ((node.children && node.children.length || node.kind === 'panel' || node.kind === 'scroll') && !['combo', 'list', 'slider', 'progress'].includes(node.kind)) {
       swingLayout(el, node.layout);
       for (const c of node.children) el.appendChild(swingBuild(w, c, node.layout));
     }
@@ -434,9 +483,25 @@ function create(hooks) {
     if (n.kind === 'textfield' || n.kind === 'password') { if (el.value !== n.text) el.value = n.text; el.readOnly = !n.editable; el.size = n.cols > 0 ? n.cols : 12; if (n.cols > 0 && (!parentLayout || parentLayout.k === 'flow')) s.width = `calc(${n.cols}ch + 12px)`; s.textAlign = n.align || ''; }
     else if (n.kind === 'textarea') { if (el.value !== n.text) el.value = n.text; el.readOnly = !n.editable; if (n.rows) el.rows = n.rows; if (n.cols) el.cols = n.cols; el.wrap = n.wrap ? 'soft' : 'off'; s.whiteSpace = n.wrap ? 'pre-wrap' : 'pre'; }
     else if (n.kind === 'checkbox') { el.querySelector('span').textContent = n.text; el.querySelector('input').checked = n.selected; el.querySelector('input').disabled = !n.enabled; }
-    else if (n.kind === 'button') { el.textContent = n.text; }
+    else if (n.kind === 'button' || n.kind === 'toggle') { swingIconText(el, n); if (n.kind === 'toggle') el.classList.toggle('sw-on', !!n.selected); }
+    else if (n.kind === 'radio') { el.querySelector('span').textContent = n.text; el.querySelector('input').checked = n.selected; el.querySelector('input').disabled = !n.enabled; }
+    else if (n.kind === 'combo' || n.kind === 'list') {
+      const items = n.items || [];
+      const cur = [...el.options].map(x => x.text);
+      if (cur.length !== items.length || cur.some((t, i) => t !== items[i])) { el.innerHTML = ''; for (const it of items) { const op = document.createElement('option'); op.textContent = it; el.appendChild(op); } }
+      el.selectedIndex = n.sel;
+      if (n.kind === 'list') el.size = Math.max(2, n.rows || 8);
+    }
+    else if (n.kind === 'slider') {
+      const r = el.querySelector('input'); r.min = n.min; r.max = n.max; r.value = n.value; r.disabled = !n.enabled;
+      el.classList.toggle('sw-vert', n.orient === 1);
+      const lab = el.querySelector('.sw-slab'); lab.innerHTML = '';
+      if (n.labels && n.ticks > 0) { for (let v = n.min; v <= n.max; v += n.ticks) { const sp = document.createElement('span'); sp.textContent = v; lab.appendChild(sp); } }
+    }
+    else if (n.kind === 'progress') { const p = n.max > n.min ? (n.value - n.min) / (n.max - n.min) : 0; el.querySelector('.sw-pfill').style.width = (p * 100).toFixed(1) + '%'; const t = el.querySelector('.sw-ptext'); t.textContent = n.stringPainted ? (n.string !== null ? n.string : Math.round(p * 100) + '%') : ''; t.hidden = !n.stringPainted; }
     else if (n.kind === 'label') {
-      if (/^\s*<html>/i.test(n.text)) el.textContent = n.text.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').trim();
+      if (n.icon) swingIconText(el, n);
+      else if (/^\s*<html>/i.test(n.text)) el.textContent = n.text.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').trim();
       else el.textContent = n.text;
       s.textAlign = n.align || ''; s.justifyContent = n.align === 'center' ? 'center' : n.align === 'right' ? 'flex-end' : '';
     }
@@ -448,7 +513,15 @@ function create(hooks) {
     s.visibility = n.visible ? '' : 'hidden';
     if (!n.visible && parentLayout && parentLayout.k !== 'null') s.display = 'none'; else if (s.display === 'none') s.display = '';
     if (parentLayout && parentLayout.k === 'null' && n.bounds) { s.position = 'absolute'; s.left = n.bounds.x + 'px'; s.top = n.bounds.y + 'px'; s.width = n.bounds.w + 'px'; s.height = n.bounds.h + 'px'; s.boxSizing = 'border-box'; }
-    else if (n.pref) { s.width = n.pref.w + 'px'; s.height = n.pref.h + 'px'; s.boxSizing = 'border-box'; }
+    else if (n.pref) {
+      // Wie in Java: BorderLayout/GridLayout dehnen die Komponente; die bevorzugte Größe zählt nur als Mindestgröße bzw. in der passenden Richtung
+      const k = parentLayout && parentLayout.k, c = n.cons || 'Center';
+      s.boxSizing = 'border-box'; s.width = s.height = s.minWidth = s.minHeight = '';
+      if (k === 'border' && (c === 'North' || c === 'South')) s.height = n.pref.h + 'px';
+      else if (k === 'border' && (c === 'East' || c === 'West')) s.width = n.pref.w + 'px';
+      else if (k === 'border' || k === 'grid') { s.minWidth = n.pref.w + 'px'; s.minHeight = n.pref.h + 'px'; }
+      else { s.width = n.pref.w + 'px'; s.height = n.pref.h + 'px'; }
+    }
     const b = n.border;
     s.border = ''; s.padding = el.dataset.layout === 'flow' ? s.padding : '';
     el.querySelectorAll(':scope > .sw-legend').forEach(x => x.remove());
@@ -456,17 +529,161 @@ function create(hooks) {
     else if (b && b.k === 'line') s.border = `${b.w}px solid ${b.color}`;
     else if (b && b.k === 'titled') { s.border = '1px solid #b8b8b8'; s.borderRadius = '4px'; s.paddingTop = '18px'; s.position = s.position || 'relative'; const lg = document.createElement('span'); lg.className = 'sw-legend'; lg.textContent = b.title; el.appendChild(lg); }
   }
+  function swingIconText(el, n) {
+    el.textContent = '';
+    if (n.icon) { const im = document.createElement('img'); im.src = n.icon.url; if (n.icon.w) im.width = n.icon.w; if (n.icon.h) im.height = n.icon.h; im.alt = ''; im.className = 'sw-icon'; el.appendChild(im); }
+    if (n.text) el.appendChild(document.createTextNode(n.text));
+  }
+  function swingMouse(w, el, node, send) {
+    const pos = (ev) => { const r = el.getBoundingClientRect(); return { x: Math.round(ev.clientX - r.left), y: Math.round(ev.clientY - r.top) }; };
+    const mods = (ev) => ({ shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey });
+    const btn = (ev) => ev.button === 2 ? 3 : ev.button === 1 ? 2 : 1;
+    let down = 0;
+    const own = (ev) => ev.target === el || (ev.target.classList && ev.target.classList.contains('sw-cv')) || !ev.target.closest('[data-swid]') || ev.target.closest('[data-swid]') === el;
+    const m = (kind, ev, extra) => send({ type: 'mouse', kind, id: node.id, ...pos(ev), button: 0, clicks: 0, ...mods(ev), ...extra });
+    el.addEventListener('pointerdown', (ev) => { if (!own(ev)) return; down = btn(ev); try { el.setPointerCapture(ev.pointerId); } catch (e) { } if (node.paint) ev.preventDefault(); m('press', ev, { button: down, clicks: Math.max(1, ev.detail || 1) }); });
+    el.addEventListener('pointermove', (ev) => { if (!down && !own(ev)) return; if (node.motion) m(down ? 'drag' : 'move', ev, { button: down }); });
+    const up = (ev) => { if (!down) return; const b = down; down = 0; m('release', ev, { button: b, clicks: Math.max(1, ev.detail || 1) }); };
+    el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+    el.addEventListener('click', (ev) => { if (own(ev)) m('click', ev, { button: btn(ev), clicks: Math.max(1, ev.detail || 1) }); });
+    el.addEventListener('pointerenter', (ev) => m('enter', ev));
+    el.addEventListener('pointerleave', (ev) => m('exit', ev));
+    el.addEventListener('contextmenu', (ev) => ev.preventDefault());
+    el.style.touchAction = 'none';
+  }
+  // Zeichenbefehle aus paintComponent abspielen
+  function swingCanvasSize(el) {
+    const cv = el.querySelector(':scope > canvas.sw-cv'); if (!cv) return null;
+    const dpr = Math.min(2, global.devicePixelRatio || 1);
+    const wd = Math.max(1, el.clientWidth), ht = Math.max(1, el.clientHeight);
+    if (cv.width !== Math.round(wd * dpr) || cv.height !== Math.round(ht * dpr)) { cv.width = Math.round(wd * dpr); cv.height = Math.round(ht * dpr); if (cv._ops) swingDraw(cv, cv._ops); }
+    return cv;
+  }
+  function swingDraw(cv, ops) {
+    cv._ops = ops;
+    const dpr = Math.min(2, global.devicePixelRatio || 1);
+    const g = cv.getContext('2d'); const W = cv.width / dpr, H = cv.height / dpr;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    g.lineWidth = 1; g.lineCap = 'butt'; g.lineJoin = 'miter'; g.textBaseline = 'alphabetic';
+    let lw = 1;
+    const off = () => (lw % 2 === 1 ? 0.5 : 0);
+    const D = Math.PI / 180;
+    let waiting = false;
+    for (const op of ops) {
+      switch (op[0]) {
+        case 'c': g.fillStyle = g.strokeStyle = op[1]; break;
+        case 'f': g.font = op[1]; break;
+        case 'bg': if (op[1]) { g.save(); g.fillStyle = op[1]; g.fillRect(0, 0, W, H); g.restore(); } break;
+        case 'lw': lw = op[1]; g.lineWidth = op[1]; if (op[1] > 1) { g.lineCap = 'round'; g.lineJoin = 'round'; } else { g.lineCap = 'butt'; g.lineJoin = 'miter'; } break;
+        case 'l': g.beginPath(); g.moveTo(op[1] + off(), op[2] + off()); g.lineTo(op[3] + off(), op[4] + off()); g.stroke(); break;
+        case 'r': if (op[1]) g.fillRect(op[2], op[3], op[4], op[5]); else g.strokeRect(op[2] + off(), op[3] + off(), op[4], op[5]); break;
+        case 'clr': g.clearRect(op[1], op[2], op[3], op[4]); break;
+        case 'o': g.beginPath(); g.ellipse(op[2] + op[4] / 2, op[3] + op[5] / 2, Math.abs(op[4] / 2), Math.abs(op[5] / 2), 0, 0, 2 * Math.PI); op[1] ? g.fill() : g.stroke(); break;
+        case 'a': {
+          const [, f, x, y, aw, ah, st, ar] = op; const cx = x + aw / 2, cy = y + ah / 2;
+          g.beginPath(); if (f) g.moveTo(cx, cy);
+          g.ellipse(cx, cy, Math.abs(aw / 2), Math.abs(ah / 2), 0, -st * D, -(st + ar) * D, ar > 0);
+          if (f) { g.closePath(); g.fill(); } else g.stroke();
+          break;
+        }
+        case 'rr': {
+          const [, f, x, y, rw, rh, aw, ah] = op; const rx = Math.min(Math.abs(aw) / 2, rw / 2), ry = Math.min(Math.abs(ah) / 2, rh / 2), o2 = f ? 0 : off();
+          g.beginPath();
+          g.moveTo(x + rx + o2, y + o2); g.lineTo(x + rw - rx + o2, y + o2); g.ellipse(x + rw - rx + o2, y + ry + o2, rx, ry, 0, -Math.PI / 2, 0);
+          g.lineTo(x + rw + o2, y + rh - ry + o2); g.ellipse(x + rw - rx + o2, y + rh - ry + o2, rx, ry, 0, 0, Math.PI / 2);
+          g.lineTo(x + rx + o2, y + rh + o2); g.ellipse(x + rx + o2, y + rh - ry + o2, rx, ry, 0, Math.PI / 2, Math.PI);
+          g.lineTo(x + o2, y + ry + o2); g.ellipse(x + rx + o2, y + ry + o2, rx, ry, 0, Math.PI, 1.5 * Math.PI); g.closePath();
+          f ? g.fill() : g.stroke();
+          break;
+        }
+        case 'p': case 'pl': {
+          const xs = op[0] === 'p' ? op[2] : op[1], ys = op[0] === 'p' ? op[3] : op[2]; if (!xs.length) break;
+          const o2 = op[0] === 'p' && op[1] ? 0 : off();
+          g.beginPath(); g.moveTo(xs[0] + o2, ys[0] + o2); for (let i = 1; i < xs.length; i++) g.lineTo(xs[i] + o2, ys[i] + o2);
+          if (op[0] === 'p') { g.closePath(); op[1] ? g.fill() : g.stroke(); } else g.stroke();
+          break;
+        }
+        case 's': g.fillText(op[1], op[2], op[3]); break;
+        case 'i': {
+          const im = image(op[1]);
+          if (!im.complete || !im.naturalWidth) { if (!waiting) { waiting = true; im.addEventListener('load', () => { if (cv._ops === ops) swingDraw(cv, ops); }, { once: true }); } break; }
+          if (op[4] !== null && op[5] !== null) g.drawImage(im, op[2], op[3], op[4], op[5]); else g.drawImage(im, op[2], op[3]);
+          break;
+        }
+        case 'tr': g.translate(op[1], op[2]); break;
+        case 'rot': g.translate(op[2], op[3]); g.rotate(op[1]); g.translate(-op[2], -op[3]); break;
+        case 'sc': g.scale(op[1], op[2]); break;
+        case 'save': g.save(); break;
+        case 'restore': g.restore(); break;
+        case 'clip': g.beginPath(); g.rect(op[1], op[2], op[3], op[4]); g.clip(); break;
+      }
+    }
+  }
+  let measureCtx = null;
+  function textWidth(font, s) {
+    if (!measureCtx) { try { measureCtx = document.createElement('canvas').getContext('2d'); } catch (e) { return Math.round(s.length * 7); } }
+    measureCtx.font = font; return Math.round(measureCtx.measureText(s).width);
+  }
+  // Menüleiste (JMenuBar) mit aufklappenden Menüs
+  function swingCloseMenus(w) { if (!w.el) return; w.el.querySelectorAll('.sw-dd').forEach(d => d.remove()); w.el.querySelectorAll('.sw-mtop.open').forEach(b => b.classList.remove('open')); }
+  function swingMenuBar(w, bar, send) {
+    const el = document.createElement('div'); el.className = 'sw-menubar'; el.setAttribute('role', 'menubar');
+    w.els.set(bar.id, { el, node: bar });
+    const openDd = (menu, x, y, level) => {
+      w.el.querySelectorAll('.sw-dd').forEach(d => { if (+d.dataset.level >= level) d.remove(); });
+      const dd = document.createElement('div'); dd.className = 'sw-dd'; dd.dataset.level = level; dd.setAttribute('role', 'menu');
+      for (const it of menu.children) {
+        if (it.kind === 'sep') { dd.appendChild(document.createElement('hr')); continue; }
+        const b = document.createElement('button'); b.type = 'button'; b.className = 'sw-mi'; b.setAttribute('role', 'menuitem');
+        b.innerHTML = '<span class="sw-mchk"></span><span class="sw-mtxt"></span><span class="sw-macc"></span>';
+        swingMenuProps(b, it);
+        if (it.kind === 'menu') b.addEventListener('click', () => { const r = b.getBoundingClientRect(), wr = w.el.getBoundingClientRect(); openDd(it, r.right - wr.left - 2, r.top - wr.top - 4, level + 1); });
+        else b.addEventListener('click', () => { swingCloseMenus(w); send({ type: 'menu', id: it.id }); });
+        w.els.set(it.id, { el: b, node: it });
+        dd.appendChild(b);
+      }
+      dd.style.left = x + 'px'; dd.style.top = y + 'px';
+      w.el.appendChild(dd);
+      const f = dd.querySelector('button:not(:disabled)'); if (f) try { f.focus({ preventScroll: true }); } catch (e) { }
+      dd.addEventListener('keydown', (ev) => {
+        const bs = [...dd.querySelectorAll('button:not(:disabled)')]; const i = bs.indexOf(document.activeElement);
+        if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); const k = ev.key === 'ArrowDown' ? (i + 1) % bs.length : (i - 1 + bs.length) % bs.length; if (bs[k]) bs[k].focus(); }
+        else if (ev.key === 'Escape') { ev.stopPropagation(); swingCloseMenus(w); }
+      });
+    };
+    for (const m of bar.children) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'sw-mtop'; b.textContent = m.text; b.disabled = !m.enabled;
+      w.els.set(m.id, { el: b, node: m });
+      b.addEventListener('click', () => {
+        const was = b.classList.contains('open'); swingCloseMenus(w); if (was) return;
+        b.classList.add('open'); const r = b.getBoundingClientRect(), wr = w.el.getBoundingClientRect(); openDd(m, r.left - wr.left, r.bottom - wr.top, 1);
+      });
+      b.addEventListener('pointerenter', () => { if (w.el.querySelector('.sw-mtop.open') && !b.classList.contains('open')) b.click(); });
+      el.appendChild(b);
+    }
+    return el;
+  }
+  function swingMenuProps(b, n) {
+    if (b.classList.contains('sw-mtop')) { b.textContent = n.text; b.disabled = !n.enabled; return; }
+    b.querySelector('.sw-mtxt').textContent = n.text;
+    b.querySelector('.sw-mchk').textContent = (n.kind === 'checkmenu' && n.selected) ? '✓' : (n.kind === 'radiomenu' && n.selected) ? '•' : '';
+    b.querySelector('.sw-macc').textContent = n.kind === 'menu' ? '▸' : n.accel || '';
+    b.disabled = !n.enabled;
+  }
   function swing(id, o) {
     const w = wins.get(id); if (!w || w.closed) return;
     switch (o.t) {
       case 'tree': {
         const keep = document.activeElement && w.el.contains(document.activeElement) ? document.activeElement.dataset.swid || (document.activeElement.closest('[data-swid]') || {}).dataset?.swid : null;
-        w.els.clear(); w.body.innerHTML = '';
+        w.els.clear(); w.body.innerHTML = ''; if (w.ro) w.ro.disconnect();
+        swingCloseMenus(w); const oldBar = w.el.querySelector(':scope > .sw-menubar'); if (oldBar) oldBar.remove();
+        if (o.menu) { const send = (ev) => { if (w.listener && !w.closed && !w.dead) { try { w.listener(ev); } catch (e) { setTimeout(() => { throw e; }); } } }; w.body.before(swingMenuBar(w, o.menu, send)); }
         const root = swingBuild(w, o.root, null); root.classList.add('sw-root'); w.body.appendChild(root);
         if (keep && w.els.has(+keep)) { const x = w.els.get(+keep).el; try { (x.querySelector('input') || x).focus({ preventScroll: true }); } catch (e) { } }
         break;
       }
-      case 'prop': { const x = w.els.get(o.id); if (x) { Object.assign(x.node, o.props); const pl = x.el.parentElement && x.el.parentElement.dataset.layout ? { k: x.el.parentElement.dataset.layout } : null; swingProps(x.el, x.node, pl); } break; }
+      case 'paint': { const x = w.els.get(o.id); if (x) { const cv = swingCanvasSize(x.el); if (cv) swingDraw(cv, o.ops); } break; }
+      case 'prop': { const x = w.els.get(o.id); if (x && (x.el.classList.contains('sw-mi') || x.el.classList.contains('sw-mtop'))) { Object.assign(x.node, o.props); swingMenuProps(x.el, x.node); break; } if (x) { Object.assign(x.node, o.props); const pl = x.el.parentElement && x.el.parentElement.dataset.layout ? { k: x.el.parentElement.dataset.layout } : null; swingProps(x.el, x.node, pl); } break; }
       case 'show': if (w.el.hidden) { w.el.hidden = false; swingPlace(w); w.el.style.zIndex = ++z; const f = w.body.querySelector('input, textarea, button'); try { (f || w.el).focus({ preventScroll: true }); } catch (e) { } } break;
       case 'title': w.titleEl.textContent = o.s; w.el.setAttribute('aria-label', o.s); break;
       case 'size': swingSize(w, o); break;
@@ -497,7 +714,7 @@ function create(hooks) {
     if (Date.now() - t0 < 40 && hooks.note) hooks.note(`[${title || 'Meldung'}] ${text}\n`);
   }
   return {
-    newWindow, op, input, message, confirm: confirmBox, swingWindow, swing, closeAll, finish, cancel, busy, whenIdle,
+    newWindow, op, input, message, confirm: confirmBox, swingWindow, swing, textWidth, closeAll, finish, cancel, busy, whenIdle,
     listen, detach, image, soundPlaying, whenSoundEnds, stopSounds,
     skipping: () => fast, resetFast: () => { fast = false; },
     inputBlocked: () => blocked,
