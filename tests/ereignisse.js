@@ -68,6 +68,22 @@ public class Maus extends MouseAdapter {
   public void mousePressed(MouseEvent e) { System.out.println("Maus " + t.toTurtleX(e.getX()) + " " + e.getSource()); }
 }`], events: [{ type: 'press', x: 200, y: 50, button: 1, clicks: 1 }, { type: 'closing' }],
   expect: ['"sprite":"data:bild"', 'OP {"t":"tone","freq":440,"ms":20,"vol":1}', 'frame true', 'Maus 50.0 TurtleFrame', 'hit 50.0 50.0', 'exit', 'closing true', 'aufgewacht', '"t":"sound"', 'MAIN ok'] },
+{ name: 'Lambda und anonyme Klasse als Listener', code: [`
+import ch.aplu.turtle.*;
+import java.awt.event.*;
+public class Main {
+  public static void main(String[] args) {
+    TurtleFrame tf = new TurtleFrame("L", 300, 200);
+    Turtle t = new Turtle(tf);
+    int[] zaehler = { 0 };
+    tf.addMouseHitListener((x, y) -> { zaehler[0]++; System.out.println("hit " + x + " " + y + " #" + zaehler[0]); });
+    t.addMouseListener(new MouseAdapter() {
+      public void mousePressed(MouseEvent e) { System.out.println("anonym " + t.toTurtleX(e.getX())); }
+    });
+    t.addExitListener(() -> System.out.println("tschuess"));
+  }
+}`], events: [{ type: 'press', x: 200, y: 50, button: 1, clicks: 1 }, { type: 'closing' }],
+  expect: ['MAIN ok', 'anonym 50.0', 'hit 50.0 50.0 #1', 'tschuess', 'closing true'] },
 { name: 'Fehler: falscher Listener, Ausnahme im Ereignis', code: [`
 import ch.aplu.util.*;
 import java.awt.event.*;

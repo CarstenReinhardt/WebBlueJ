@@ -24,7 +24,8 @@ Eine Lernumgebung für Java, die komplett im Browser läuft. Keine Installation,
 
 Klassen, Vererbung, abstrakte Klassen, Interfaces, `enum`, Arrays, Strings, `ArrayList`, `HashMap`, `HashSet`, `Random`, `Math`, `StringBuilder`, Ausnahmen mit `try`/`catch`, `switch`, alle Schleifen. Ganzzahldivision, `int`-Überlauf und `long` verhalten sich wie in echtem Java.
 
-Nicht unterstützt: Lambdas, innere und anonyme Klassen (Listener deshalb als eigene Klasse oder mit `implements … ` und `this`).
+- **Verschachtelte Klassen**: statische und innere Klassen (mit Zugriff auf das äußere Objekt, auch `Aussen.this`), lokale Klassen in Methoden und anonyme Klassen (`new Runnable() { … }`, `new MouseAdapter() { … }`). Eingefangene lokale Variablen müssen wie in Java final oder effektiv final sein.
+- **Lambdas und Methodenreferenzen**: `(a, b) -> a + b`, `x -> { … }`, `String::length`, `System.out::println`, `this::methode`, `Klasse::new`. Funktionale Interfaces aus `java.util.function` (`Function`, `Consumer`, `Predicate`, `Supplier`, `BiFunction`, `UnaryOperator` …) und `Comparator` mit `comparing`, `thenComparing`, `reversed`. Listen kennen `sort`, `forEach`, `removeIf`, `replaceAll`; Maps `forEach`, `merge`, `computeIfAbsent`; `Collections.sort`, `Arrays.sort`, `TreeSet`/`TreeMap` nehmen einen Comparator.
 
 ## Starten
 

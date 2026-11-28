@@ -191,6 +191,10 @@ R.Runtime.extensions.push(function (rt) {
   function addListener(s, kind, v, line) {
     const iface = rt.cls(LISTENER[kind]);
     if (v === null || v === undefined) rt.npe('Listener ist null');
+    if (v instanceof JObject && v.lambda) {
+      if (!rt.functionalMethod(iface)) rt.rtError(`${LISTENER[kind]} hat mehrere Methoden – ein Lambda-Ausdruck geht nur bei Interfaces mit genau einer Methode; verwende eine (anonyme) Klasse`, line);
+      rt.coerce(v, R.T(LISTENER[kind]), line);
+    }
     if (!(v instanceof JObject) || !v.cls.isSubclassOf(iface)) rt.rtError(`Hier wird ein Objekt erwartet, das ${LISTENER[kind]} implementiert (z. B. „implements ${LISTENER[kind]}“ und dann „this“ übergeben)`, line);
     if (!s.L[kind].includes(v)) s.L[kind].push(v);
   }
