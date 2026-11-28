@@ -5,7 +5,7 @@ const fs = require('fs'), path = require('path'), vm = require('vm');
 const dir = path.join(__dirname, '..');
 const ctx = { console, setTimeout, clearTimeout, setImmediate, performance, Date, Promise, MessageChannel, queueMicrotask, Math };
 ctx.globalThis = ctx; ctx.window = ctx; vm.createContext(ctx);
-for (const f of ['interp.js', 'aplu.js']) vm.runInContext(fs.readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
+for (const f of ['interp.js', 'aplu.js', 'swing.js']) vm.runInContext(fs.readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
 const R = ctx.JavaRT;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -98,6 +98,42 @@ public class Main extends GPanel implements MouseListener {
   public static void main(String[] args) { new Main(); new GPanel().addKeyListener(new Main()); }
 }`], events: [{ type: 'press', x: 1, y: 1, button: 1, clicks: 1 }],
   expect: ['MAIN Hier wird ein Objekt erwartet, das KeyListener implementiert', 'EVENT-ERR mousePressed java.lang.NullPointerException'] },
+{ name: 'Swing: JFrame, JButton, JTextField, ActionListener, Lambda, JOptionPane', code: [`
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+public class Main extends JFrame implements ActionListener {
+  private JTextField eingabe = new JTextField(8);
+  private JLabel ausgabe = new JLabel("-");
+  private JButton knopf = new JButton("Quadrat");
+  public Main() {
+    super("Quadrat");
+    setSize(300, 150);
+    setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+    setLayout(new FlowLayout());
+    add(eingabe); add(knopf); add(ausgabe);
+    JButton weg = new JButton("Löschen");
+    weg.addActionListener(e -> { eingabe.setText(""); ausgabe.setText("-"); });
+    add(weg);
+    knopf.addActionListener(this);
+    eingabe.addActionListener(this);
+    setVisible(true);
+  }
+  public void actionPerformed(ActionEvent e) {
+    try {
+      int z = Integer.parseInt(eingabe.getText().trim());
+      ausgabe.setText(z + "^2 = " + z * z);
+      System.out.println("Knopf " + (e.getSource() == knopf) + " " + e.getActionCommand());
+    } catch (NumberFormatException ex) {
+      JOptionPane.showMessageDialog(this, "Bitte eine ganze Zahl eingeben");
+    }
+  }
+  public static void main(String[] args) {
+    SwingUtilities.invokeLater(() -> new Main());
+    System.out.println("Antwort " + JOptionPane.showInputDialog("Wie alt?") + " " + (JOptionPane.showConfirmDialog(null, "Sicher?") == JOptionPane.YES_OPTION));
+  }
+}`], events: [{ type: 'text', id: 3, text: '7' }, { type: 'action', id: 5 }, { type: 'text', id: 3, text: 'x' }, { type: 'action', id: 3 }, { type: 'action', id: 6 }, { type: 'closing' }],
+  expect: ['SWIN Quadrat', 'SW tree', 'SW show', 'Antwort 7 false', 'MAIN ok', 'SW prop 4 7^2 = 49', 'Knopf true Quadrat', 'MSG Bitte eine ganze Zahl eingeben', 'SW prop 3 ', 'SW prop 4 -', 'closing false'] },
 { name: 'Terminal: Scanner (Rest der Zeile wie in Java), hasNextInt, Console.readInt', input: ['3 4', 'Ada', 'abc', '12', 'x', '5', 'q'], code: [`
 import java.util.Scanner;
 import ch.aplu.util.Console;
@@ -121,7 +157,7 @@ public class Main {
   let bad = 0;
   for (const f of FAELLE) {
     const L = {}; const out = [];
-    const gfx = { n: 1, newWindow() { return this.n++; }, op(w, o) { if (o.t !== 'pose' || o.sprite) out.push('OP ' + JSON.stringify(o)); }, input() { return '7'; }, message() { }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); }, listen(w, fn) { L[w] = fn; } };
+    const gfx = { n: 1, newWindow() { return this.n++; }, op(w, o) { if (o.t !== 'pose' || o.sprite) out.push('OP ' + JSON.stringify(o)); }, input() { return '7'; }, message(t) { out.push('MSG ' + t); }, confirm() { return false; }, swingWindow(o) { out.push('SWIN ' + o.title); return this.n++; }, swing(w, o) { out.push('SW ' + o.t + (o.t === 'prop' ? ' ' + o.id + ' ' + o.props.text : '')); }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); }, listen(w, fn) { L[w] = fn; } };
     const lines = [...(f.input || [])];
     const rt = new R.Runtime({ out: (s) => out.push(s.trimEnd()), gfx,
       ...(f.input ? { readLine: () => Promise.resolve(lines.length ? lines.shift() : null), readKey: () => Promise.resolve(lines.length ? lines.shift().charCodeAt(0) : null) } : {}),

@@ -4038,7 +4038,7 @@ class Checker {
       for (let k = c; k; k = k.superClass) if (k.native && k.native.methods && k.native.methods[e.name]) found = true;
       if (!found && c.native.lib && c.native.unsupported && c.native.unsupported.test(e.name)) this.err(e.line, `${c.name}.${e.name}() wird in der Web-Version nicht unterstützt (Maus-/Tastatur-Ereignisse, Sound und Drucken fehlen)`);
       if (found && c.native.retTypes) return c.native.retTypes[e.name] || null;
-      if (!found && !['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) this.err(e.line, `Methode '${e.name}' gibt es für ${c.name} nicht (oder sie wird nicht unterstützt)` + suggest(e.name, Object.keys(c.native.methods || {})) + (e.name === 'length' && c.native.list ? ' – bei Listen heißt es size()' : ''));
+      if (!found && !['toString', 'equals', 'hashCode', 'getClass'].includes(e.name)) this.err(e.line, `Methode '${e.name}' gibt es für ${c.name} nicht (oder sie wird nicht unterstützt)` + suggest(e.name, (() => { const ks = []; for (let k = c; k; k = k.superClass) if (k.native && k.native.methods) ks.push(...Object.keys(k.native.methods)); return ks; })()) + (e.name === 'length' && c.native.list ? ' – bei Listen heißt es size()' : ''));
       return listRet(c, e.name, t);
     }
     if (c && c.isInterface && c.native) return listRet(c, e.name, t);

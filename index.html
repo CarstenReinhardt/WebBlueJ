@@ -228,6 +228,25 @@ table.insp tr.from td { color: var(--muted); font-family: var(--ui); font-size: 
 .gfx-win:focus-within { border-color: var(--accent); }
 .gfx-stage { position: relative; width: 100%; background: #fff; touch-action: none; }
 .gfx-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.sw-body { background: #eeeeee; color: #1d1d1d; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; display: grid; overflow: auto; }
+.sw-root { min-height: 100%; }
+.sw-win[hidden] { display: none; }
+.sw-panel { min-width: 0; min-height: 0; }
+.sw-btn { font: inherit; color: #1d1d1d; padding: 4px 12px; min-height: 26px; border: 1px solid #8e8f8f; border-radius: 4px; background: linear-gradient(#ffffff, #dcdcdc); cursor: pointer; white-space: nowrap; }
+.sw-btn:hover:not(:disabled) { background: linear-gradient(#ffffff, #e9eef5); border-color: #6382be; }
+.sw-btn:active:not(:disabled) { background: linear-gradient(#d4d8de, #eef0f2); }
+.sw-btn:focus-visible, .sw-tf:focus, .sw-ta:focus { outline: 2px solid #7aa7e9; outline-offset: 0; }
+.sw-btn:disabled { color: #9a9a9a; cursor: default; }
+.sw-lbl { white-space: pre; display: flex; align-items: center; min-height: 18px; }
+.sw-tf, .sw-ta { font: inherit; color: #1d1d1d; background: #fff; border: 1px solid #a5acb5; border-radius: 2px; padding: 3px 5px; min-width: 0; box-sizing: border-box; }
+.sw-tf[readonly], .sw-ta[readonly] { background: #f4f4f4; }
+.sw-ta { resize: none; font-family: ui-monospace, monospace; }
+.sw-cb { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.sw-off { opacity: .6; }
+.sw-scroll { min-height: 0; border: 1px solid #a5acb5; background: #fff; }
+.sw-scroll > * { border: 0 !important; }
+.sw-legend { position: absolute; top: 2px; left: 8px; font-size: 12px; color: #333; }
+[data-layout="border"] > .sw-ta, [data-layout="grid"] > .sw-ta, [data-layout="scroll"] > .sw-ta { width: 100%; height: 100%; }
 .gfx-status { padding: 4px 10px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); font-family: var(--mono); }
 .toast.err { background: var(--err); color: #fff; }
 textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 8px; box-sizing: border-box; white-space: pre; }
@@ -371,6 +390,7 @@ textarea.export { width: 100%; min-height: 280px; font-family: var(--mono); font
 <script src="lib/jszip.min.js"></script>
 <script src="interp.js"></script>
 <script src="aplu.js"></script>
+<script src="swing.js"></script>
 <script src="gfx.js"></script>
 <script src="examples.js"></script>
 <script src="edtools.js"></script>

@@ -483,5 +483,118 @@ public class Steuerung {
   bench: [],
 };
 
-global.WB_EXAMPLES = [bank, formen, wuerfel, turtle, interaktiv];
+const swing = {
+  name: 'Fenster mit Swing',
+  classes: [
+    { name: 'Rechner', x: 80, y: 60, code: `import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+
+/**
+ * Ein kleiner Rechner mit Swing: zwei Eingabefelder, Knöpfe und ein Protokoll.
+ * Rufe main auf. Die Knöpfe melden sich bei actionPerformed (ActionListener).
+ */
+public class Rechner extends JFrame implements ActionListener {
+    private JTextField zahl1 = new JTextField(6);
+    private JTextField zahl2 = new JTextField(6);
+    private JLabel ergebnis = new JLabel("Ergebnis: –");
+    private JButton plus = new JButton("+");
+    private JButton mal = new JButton("×");
+    private JCheckBox runden = new JCheckBox("runden");
+    private JTextArea protokoll = new JTextArea(5, 20);
+
+    public Rechner() {
+        super("Taschenrechner");
+        setSize(360, 260);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        JPanel oben = new JPanel(new GridLayout(2, 2, 5, 5));
+        oben.add(new JLabel("Zahl 1:")); oben.add(zahl1);
+        oben.add(new JLabel("Zahl 2:")); oben.add(zahl2);
+        JPanel knoepfe = new JPanel();
+        knoepfe.add(plus); knoepfe.add(mal); knoepfe.add(runden); knoepfe.add(ergebnis);
+        plus.addActionListener(this);
+        mal.addActionListener(this);
+        ergebnis.setFont(new Font("SansSerif", Font.BOLD, 14));
+        protokoll.setEditable(false);
+        add(oben, BorderLayout.NORTH);
+        add(new JScrollPane(protokoll), BorderLayout.CENTER);
+        add(knoepfe, BorderLayout.SOUTH);
+        setVisible(true);
+    }
+
+    public void actionPerformed(ActionEvent e) {
+        try {
+            double a = Double.parseDouble(zahl1.getText()), b = Double.parseDouble(zahl2.getText());
+            double r = e.getSource() == plus ? a + b : a * b;
+            if (runden.isSelected()) r = Math.round(r);
+            ergebnis.setText("Ergebnis: " + r);
+            protokoll.append(a + " " + e.getActionCommand() + " " + b + " = " + r + "\\n");
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Bitte zwei Zahlen eingeben.");
+        }
+    }
+
+    public static void main(String[] args) {
+        new Rechner();
+    }
+}` },
+    { name: 'Zaehler', x: 380, y: 60, code: `import javax.swing.*;
+import java.awt.*;
+
+/**
+ * Ein Zähler mit Knöpfen und einer Uhr (javax.swing.Timer).
+ * Die Knöpfe bekommen ihre Aktion hier als Lambda-Ausdruck.
+ * Erzeuge ein Objekt mit new Zaehler().
+ */
+public class Zaehler extends JFrame {
+    private int stand = 0;
+    private JLabel anzeige = new JLabel("0", SwingConstants.CENTER);
+    private Timer uhr;
+
+    public Zaehler() {
+        super("Zähler");
+        setSize(300, 170);
+        anzeige.setFont(new Font("SansSerif", Font.BOLD, 40));
+        add(anzeige, BorderLayout.CENTER);
+
+        JButton plus = new JButton("+1");
+        JButton zurueck = new JButton("Zurücksetzen");
+        JButton startStopp = new JButton("Start");
+        plus.addActionListener(e -> setStand(stand + 1));
+        zurueck.addActionListener(e -> setStand(0));
+
+        // Die Uhr ruft jede Sekunde actionPerformed auf
+        uhr = new Timer(1000, e -> setStand(stand + 1));
+        startStopp.addActionListener(e -> {
+            if (uhr.isRunning()) {
+                uhr.stop();
+                startStopp.setText("Start");
+            } else {
+                uhr.start();
+                startStopp.setText("Stopp");
+            }
+        });
+
+        JPanel knoepfe = new JPanel(new FlowLayout());
+        knoepfe.add(plus);
+        knoepfe.add(startStopp);
+        knoepfe.add(zurueck);
+        add(knoepfe, BorderLayout.SOUTH);
+        setVisible(true);
+    }
+
+    public void setStand(int neu) {
+        stand = neu;
+        anzeige.setText("" + stand);
+    }
+
+    public int getStand() {
+        return stand;
+    }
+}` },
+  ],
+  bench: [],
+};
+
+global.WB_EXAMPLES = [bank, formen, wuerfel, turtle, interaktiv, swing];
 })(typeof window !== 'undefined' ? window : globalThis);

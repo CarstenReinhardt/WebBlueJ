@@ -352,6 +352,134 @@ function create(hooks) {
     idle();
   }
 
+  // ---------------------------------------------------------------- Swing-Fenster (javax.swing)
+  // Das Modell liegt im Interpreter (swing.js); hier wird es als HTML dargestellt.
+  function swingWindow(o) {
+    const id = nextId++;
+    const w = { id, kind: 'swing', closed: false, els: new Map(), packed: !!o.packed };
+    const el = document.createElement('section'); el.className = 'gfx-win sw-win'; el.setAttribute('role', 'dialog'); el.setAttribute('aria-label', o.title || 'Fenster'); el.tabIndex = -1;
+    el.hidden = true;
+    el.innerHTML = `<header class="gfx-head"><span class="gfx-title"></span><button type="button" class="gfx-btn gfx-close" title="Fenster schließen" aria-label="Fenster schließen">✕</button></header><div class="sw-body"></div>`;
+    w.el = el; w.titleEl = el.querySelector('.gfx-title'); w.titleEl.textContent = o.title || '';
+    w.body = el.querySelector('.sw-body');
+    swingSize(w, o);
+    el.querySelector('.gfx-close').addEventListener('click', () => {
+      if (w.listener && !w.dead && !w.exitAsked && w.listener({ type: 'closing' }) === true) { w.exitAsked = true; return; }
+      closeWin(w);
+    });
+    el.addEventListener('pointerdown', () => { el.style.zIndex = ++z; });
+    el.addEventListener('keydown', (ev) => ev.stopPropagation());
+    dragHandle(el, el.querySelector('.gfx-head'));
+    ensureLayer().appendChild(el);
+    wins.set(id, w);
+    return id;
+  }
+  // Java zählt die Titelleiste zur Fenstergröße (setSize) – hier etwa 30 Pixel
+  function swingSize(w, o) {
+    if (o.packed || !o.w) { w.packed = true; w.el.style.setProperty('--gw', 'max-content'); w.el.style.width = 'auto'; w.el.style.maxWidth = 'calc(100vw - 24px)'; w.body.style.height = ''; w.body.style.minWidth = '120px'; }
+    else { w.packed = false; w.el.style.width = ''; w.el.style.setProperty('--gw', o.w + 'px'); w.body.style.height = Math.max(30, o.h - 30) + 'px'; w.body.style.minWidth = ''; }
+  }
+  function swingPlace(w) {
+    const n = [...wins.values()].filter(x => !x.closed && x !== w).length;
+    const vw = global.innerWidth, vh = global.innerHeight;
+    const r = w.el.getBoundingClientRect();
+    w.el.style.left = Math.max(12, Math.min(vw - r.width - 24, (vw - r.width) / 2 + n * 28)) + 'px';
+    w.el.style.top = Math.max(12, Math.min(vh - r.height - 12, 80 + n * 28)) + 'px';
+  }
+  const SW_AREA = { North: 'n', South: 's', East: 'e', West: 'w', Center: 'c' };
+  function swingBuild(w, node, parentLayout) {
+    const send = (ev) => { if (w.listener && !w.closed && !w.dead) { try { w.listener(ev); } catch (e) { setTimeout(() => { throw e; }); } } };
+    let el;
+    switch (node.kind) {
+      case 'button': el = document.createElement('button'); el.type = 'button'; el.className = 'sw-btn'; el.addEventListener('click', () => send({ type: 'action', id: node.id })); break;
+      case 'label': el = document.createElement('div'); el.className = 'sw-lbl'; break;
+      case 'textfield': case 'password':
+        el = document.createElement('input'); el.type = node.kind === 'password' ? 'password' : 'text'; el.className = 'sw-tf'; el.spellcheck = false; el.autocomplete = 'off';
+        el.addEventListener('input', () => send({ type: 'text', id: node.id, text: el.value }));
+        el.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); send({ type: 'action', id: node.id, text: el.value }); } });
+        break;
+      case 'textarea': el = document.createElement('textarea'); el.className = 'sw-ta'; el.spellcheck = false; el.addEventListener('input', () => send({ type: 'text', id: node.id, text: el.value })); break;
+      case 'checkbox': {
+        el = document.createElement('label'); el.className = 'sw-cb';
+        const box = document.createElement('input'); box.type = 'checkbox'; const span = document.createElement('span');
+        el.append(box, span); box.addEventListener('change', () => send({ type: 'check', id: node.id, value: box.checked }));
+        break;
+      }
+      case 'scroll': el = document.createElement('div'); el.className = 'sw-scroll'; break;
+      default: el = document.createElement('div'); el.className = 'sw-panel';
+    }
+    el.dataset.swid = node.id;
+    w.els.set(node.id, { el, node });
+    if (node.children && node.children.length || node.kind === 'panel' || node.kind === 'scroll') {
+      swingLayout(el, node.layout);
+      for (const c of node.children) el.appendChild(swingBuild(w, c, node.layout));
+    }
+    const area = parentLayout && parentLayout.k === 'border' ? SW_AREA[node.cons || 'Center'] : null;
+    if (area) el.style.gridArea = area;
+    swingProps(el, node, parentLayout);
+    return el;
+  }
+  function swingLayout(el, L) {
+    const s = el.style; L = L || { k: 'flow', align: 1, hgap: 5, vgap: 5 };
+    s.display = ''; s.position = '';
+    if (L.k === 'flow') { s.display = 'flex'; s.flexWrap = 'wrap'; s.alignItems = 'center'; s.alignContent = 'flex-start'; s.justifyContent = ['flex-start', 'center', 'flex-end', 'flex-start', 'flex-end'][L.align] || 'center'; s.gap = `${L.vgap}px ${L.hgap}px`; s.padding = `${L.vgap}px ${L.hgap}px`; }
+    else if (L.k === 'border') { s.display = 'grid'; s.gridTemplate = '"n n n" auto "w c e" 1fr "s s s" auto / auto 1fr auto'; s.gap = `${L.vgap}px ${L.hgap}px`; }
+    else if (L.k === 'grid') { s.display = 'grid'; const n = Math.max(1, el.childElementCount); s.gridTemplateColumns = `repeat(${L.cols || Math.ceil(n / Math.max(1, L.rows))}, minmax(0, 1fr))`; s.gridAutoRows = '1fr'; s.gap = `${L.vgap}px ${L.hgap}px`; }
+    else if (L.k === 'null') { s.position = 'relative'; }
+    else if (L.k === 'scroll') { s.display = 'grid'; s.overflow = 'auto'; }
+    el.dataset.layout = L.k;
+  }
+  function swingProps(el, n, parentLayout) {
+    const s = el.style;
+    if (n.kind === 'textfield' || n.kind === 'password') { if (el.value !== n.text) el.value = n.text; el.readOnly = !n.editable; el.size = n.cols > 0 ? n.cols : 12; if (n.cols > 0 && (!parentLayout || parentLayout.k === 'flow')) s.width = `calc(${n.cols}ch + 12px)`; s.textAlign = n.align || ''; }
+    else if (n.kind === 'textarea') { if (el.value !== n.text) el.value = n.text; el.readOnly = !n.editable; if (n.rows) el.rows = n.rows; if (n.cols) el.cols = n.cols; el.wrap = n.wrap ? 'soft' : 'off'; s.whiteSpace = n.wrap ? 'pre-wrap' : 'pre'; }
+    else if (n.kind === 'checkbox') { el.querySelector('span').textContent = n.text; el.querySelector('input').checked = n.selected; el.querySelector('input').disabled = !n.enabled; }
+    else if (n.kind === 'button') { el.textContent = n.text; }
+    else if (n.kind === 'label') {
+      if (/^\s*<html>/i.test(n.text)) el.textContent = n.text.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').trim();
+      else el.textContent = n.text;
+      s.textAlign = n.align || ''; s.justifyContent = n.align === 'center' ? 'center' : n.align === 'right' ? 'flex-end' : '';
+    }
+    if ('disabled' in el) el.disabled = !n.enabled;
+    el.classList.toggle('sw-off', !n.enabled);
+    s.color = n.fg || ''; s.font = n.font || '';
+    s.background = n.bg && (n.opaque || n.kind !== 'label') ? n.bg : '';
+    el.title = n.tip || '';
+    s.visibility = n.visible ? '' : 'hidden';
+    if (!n.visible && parentLayout && parentLayout.k !== 'null') s.display = 'none'; else if (s.display === 'none') s.display = '';
+    if (parentLayout && parentLayout.k === 'null' && n.bounds) { s.position = 'absolute'; s.left = n.bounds.x + 'px'; s.top = n.bounds.y + 'px'; s.width = n.bounds.w + 'px'; s.height = n.bounds.h + 'px'; s.boxSizing = 'border-box'; }
+    else if (n.pref) { s.width = n.pref.w + 'px'; s.height = n.pref.h + 'px'; s.boxSizing = 'border-box'; }
+    const b = n.border;
+    s.border = ''; s.padding = el.dataset.layout === 'flow' ? s.padding : '';
+    el.querySelectorAll(':scope > .sw-legend').forEach(x => x.remove());
+    if (b && b.k === 'empty') s.padding = `${b.t}px ${b.r}px ${b.b}px ${b.l}px`;
+    else if (b && b.k === 'line') s.border = `${b.w}px solid ${b.color}`;
+    else if (b && b.k === 'titled') { s.border = '1px solid #b8b8b8'; s.borderRadius = '4px'; s.paddingTop = '18px'; s.position = s.position || 'relative'; const lg = document.createElement('span'); lg.className = 'sw-legend'; lg.textContent = b.title; el.appendChild(lg); }
+  }
+  function swing(id, o) {
+    const w = wins.get(id); if (!w || w.closed) return;
+    switch (o.t) {
+      case 'tree': {
+        const keep = document.activeElement && w.el.contains(document.activeElement) ? document.activeElement.dataset.swid || (document.activeElement.closest('[data-swid]') || {}).dataset?.swid : null;
+        w.els.clear(); w.body.innerHTML = '';
+        const root = swingBuild(w, o.root, null); root.classList.add('sw-root'); w.body.appendChild(root);
+        if (keep && w.els.has(+keep)) { const x = w.els.get(+keep).el; try { (x.querySelector('input') || x).focus({ preventScroll: true }); } catch (e) { } }
+        break;
+      }
+      case 'prop': { const x = w.els.get(o.id); if (x) { Object.assign(x.node, o.props); const pl = x.el.parentElement && x.el.parentElement.dataset.layout ? { k: x.el.parentElement.dataset.layout } : null; swingProps(x.el, x.node, pl); } break; }
+      case 'show': if (w.el.hidden) { w.el.hidden = false; swingPlace(w); w.el.style.zIndex = ++z; const f = w.body.querySelector('input, textarea, button'); try { (f || w.el).focus({ preventScroll: true }); } catch (e) { } } break;
+      case 'title': w.titleEl.textContent = o.s; w.el.setAttribute('aria-label', o.s); break;
+      case 'size': swingSize(w, o); break;
+      case 'focus': { const x = w.els.get(o.id); if (x) try { (x.el.querySelector('input') || x.el).focus({ preventScroll: true }); } catch (e) { } break; }
+      case 'select': { const x = w.els.get(o.id); if (x && x.el.select) { try { x.el.focus({ preventScroll: true }); x.el.select(); } catch (e) { } } break; }
+      case 'close': closeWin(w); break;
+    }
+  }
+  function confirmBox(text, title) {
+    hooks.beforeDialog && hooks.beforeDialog(); finish();
+    try { return global.confirm(text); } catch (e) { return true; }
+  }
+
   // ---------------------------------------------------------------- Ein- und Ausgabe
   function input(promptText, title) {
     hooks.beforeDialog && hooks.beforeDialog(); finish();
@@ -369,7 +497,7 @@ function create(hooks) {
     if (Date.now() - t0 < 40 && hooks.note) hooks.note(`[${title || 'Meldung'}] ${text}\n`);
   }
   return {
-    newWindow, op, input, message, closeAll, finish, cancel, busy, whenIdle,
+    newWindow, op, input, message, confirm: confirmBox, swingWindow, swing, closeAll, finish, cancel, busy, whenIdle,
     listen, detach, image, soundPlaying, whenSoundEnds, stopSounds,
     skipping: () => fast, resetFast: () => { fast = false; },
     inputBlocked: () => blocked,

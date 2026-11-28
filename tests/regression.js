@@ -10,7 +10,7 @@ const ctx = { console, setTimeout, clearTimeout, setImmediate, performance, Date
 ctx.Math = Object.create(Math); ctx.Math.random = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x80000000; };
 ctx.globalThis = ctx; ctx.window = ctx;
 vm.createContext(ctx);
-for (const f of ['interp.js', 'aplu.js', 'examples.js']) vm.runInContext(fs.readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
+for (const f of ['interp.js', 'aplu.js', 'swing.js', 'examples.js']) vm.runInContext(fs.readFileSync(path.join(dir, f), 'utf8'), ctx, { filename: f });
 const R = ctx.JavaRT;
 const log = [];
 const gfx = { n: 1, newWindow(o) { log.push('WIN ' + JSON.stringify(o)); return this.n++; }, op(w, o) { log.push('OP ' + w + ' ' + JSON.stringify(o)); }, input() { return '7'; }, message(t) { log.push('MSG ' + t); }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); } };
