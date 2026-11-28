@@ -105,7 +105,9 @@ R.Runtime.extensions.push(function (rt) {
     return pg;
   }
   const P = (t, x, y) => ({ x: t.pg.w / 2 + x, y: t.pg.h / 2 - y });
-  const emit = (t, op) => gfx().op(t.pg.win, op);
+  // Zeichenbefehl abgeben; hängt die Grafik hinterher, pausiert das Programm bald (live statt Aufzeichnung)
+  const push = (win, op) => { const g = gfx(); g.op(win, op); if (g.busy && g.busy()) rt.yieldSoon(); };
+  const emit = (t, op) => push(t.pg.win, op);
   function pose(t) { const p = P(t, t.x, t.y); emit(t, { t: 'pose', tid: t.id, x: p.x, y: p.y, h: t.h, color: t.color, hidden: t.hidden }); }
   function turtleState(rt, a, line) {
     let pg = null, colorArg = null;
@@ -201,7 +203,7 @@ R.Runtime.extensions.push(function (rt) {
     pushState(rt, o) { const t = self(o); t.states.push({ x: t.x, y: t.y, h: t.h, pen: t.pen, penColor: t.penColor, penObj: t.penObj, width: t.width }); return ret(o); },
     popState(rt, o) { const t = self(o); const s = t.states.pop(); if (s) { Object.assign(t, s); pose(t); } return ret(o); },
     clearStates(rt, o) { self(o).states = []; return ret(o); },
-    sleep(rt, o, a) { emit(self(o), { t: 'sleep', ms: num(a[0]) }); return ret(o); },
+    sleep(rt, o, a) { return rt.sleep(num(a[0]), ret(o)); },
     setTitle(rt, o, a) { const t = self(o); emit(t, { t: 'title', s: str(a[0]) }); return ret(o); },
     setStatusText(rt, o, a) { const t = self(o); emit(t, { t: 'status', s: str(a[0]) }); return ret(o); },
     addStatusBar(rt, o) { return ret(o); }, showStatusBar(rt, o) { return ret(o); },
@@ -226,7 +228,7 @@ R.Runtime.extensions.push(function (rt) {
     ctor(rt, a, line, type) { const o = new JObject(rt.cls('Turtle')); this.initInstance(rt, o, a, line); return o; },
     initInstance(rt, o, a, line) { o.native = turtleState(rt, a, line); pose(o.native); },
     methods: tm, retTypes: tRet,
-    statics: { sleep(rt, a) { gfx().op(0, { t: 'sleep', ms: num(a[0]) }); }, setFramePosition: noop, setPlaygroundSize: noop, clear: noop },
+    statics: { sleep(rt, a) { return rt.sleep(num(a[0])); }, setFramePosition: noop, setPlaygroundSize: noop, clear: noop },
     toString(rt, o) { const t = o.native; return `Turtle(x=${+t.x.toFixed(2)}, y=${+t.y.toFixed(2)}, Richtung=${+t.h.toFixed(2)})`; },
     inspectRows(rt, o) { const t = o.native; return [
       { name: 'x', type: 'double', value: D(t.x) }, { name: 'y', type: 'double', value: D(t.y) }, { name: 'Richtung', type: 'double', value: D(t.h) },
@@ -257,7 +259,7 @@ R.Runtime.extensions.push(function (rt) {
   const gy = (g, y) => (g.ymax - num(y)) / (g.ymax - g.ymin) * (g.h - 1);
   const sx = (g, d) => Math.abs(num(d) / (g.xmax - g.xmin) * (g.w - 1));
   const sy = (g, d) => Math.abs(num(d) / (g.ymax - g.ymin) * (g.h - 1));
-  const gop = (g, op) => gfx().op(g.win, op);
+  const gop = (g, op) => push(g.win, op);
   const rectArgs = (g, a) => a.length >= 4 ? [num(a[0]), num(a[1]), num(a[2]), num(a[3])] : [g.px - num(a[0]) / 2, g.py - num(a[1]) / 2, g.px + num(a[0]) / 2, g.py + num(a[1]) / 2];
   const rect = (g, a, fill) => { const [x1, y1, x2, y2] = rectArgs(g, a); const X1 = gx(g, x1), X2 = gx(g, x2), Y1 = gy(g, y1), Y2 = gy(g, y2); gop(g, { t: 'poly', pts: [{ x: X1, y: Y1 }, { x: X2, y: Y1 }, { x: X2, y: Y2 }, { x: X1, y: Y2 }], fill, color: g.color, width: g.width }); };
   const ellipse = (g, rx, ry, fill) => gop(g, { t: 'circle', x: gx(g, g.px), y: gy(g, g.py), rx: sx(g, rx), ry: sy(g, ry), fill, color: g.color, width: g.width });
@@ -291,7 +293,7 @@ R.Runtime.extensions.push(function (rt) {
     clear(rt, o, a, line) { const g = G(o); if (a.length) g.bg = toColor(a[0], line).css; gop(g, { t: 'clear', bg: g.bg }); g.px = g.xmin; g.py = g.ymin; },
     erase(rt, o) { const g = G(o); gop(g, { t: 'clear', bg: g.bg }); },
     fill(rt, o, a, line) { const g = G(o); const c = toColor(a[a.length - 1], line).css; gop(g, { t: 'flood', x: gx(g, a[0]), y: gy(g, a[1]), color: c }); },
-    delay(rt, o, a) { gop(G(o), { t: 'sleep', ms: num(a[0]) }); },
+    delay(rt, o, a) { return rt.sleep(num(a[0])); },
     title(rt, o, a) { gop(G(o), { t: 'title', s: str(a[0]) }); }, setTitle(rt, o, a) { return gm.title(rt, o, a); },
     getPosX(rt, o) { return D(G(o).px); }, getPosY(rt, o) { return D(G(o).py); },
     toWindowX(rt, o, a) { const g = G(o); return D(g.xmin + num(a[0]) / (g.w - 1) * (g.xmax - g.xmin)); }, toWindowY(rt, o, a) { const g = G(o); return D(g.ymax - num(a[0]) / (g.h - 1) * (g.ymax - g.ymin)); },
@@ -306,7 +308,7 @@ R.Runtime.extensions.push(function (rt) {
     initInstance(rt, o, a, line) { o.native = gpState(rt, a, line); },
     methods: gm,
     retTypes: { color: T('Color'), setColor: T('Color'), lineWidth: INT, getPosX: DOUBLE, getPosY: DOUBLE, toWindowX: DOUBLE, toWindowY: DOUBLE, toPixelX: INT, toPixelY: INT, kbhit: BOOL },
-    statics: { delay(rt, a) { gfx().op(0, { t: 'sleep', ms: num(a[0]) }); } },
+    statics: { delay(rt, a) { return rt.sleep(num(a[0])); } },
     toString(rt, o) { return 'GPanel[' + o.native.title + ']'; },
     inspectRows(rt, o) { const g = o.native; return [{ name: 'x-Bereich', type: '', value: `${g.xmin} … ${g.xmax}` }, { name: 'y-Bereich', type: '', value: `${g.ymin} … ${g.ymax}` }, { name: 'Position', type: '', value: `(${+g.px.toFixed(3)}, ${+g.py.toFixed(3)})` }, { name: 'Farbe', type: '', value: g.color }]; },
     ui: [{ name: 'move', params: [p('double', 'x'), p('double', 'y')], ret: VOID }, { name: 'draw', params: [p('double', 'x'), p('double', 'y')], ret: VOID }, { name: 'line', params: [p('double', 'x1'), p('double', 'y1'), p('double', 'x2'), p('double', 'y2')], ret: VOID },
@@ -331,7 +333,9 @@ R.Runtime.extensions.push(function (rt) {
     getKeyWait() { return conRead.getKey(); },
     kbhit() { return false; },
   };
-  const conStatics = { init(rt) { return new JObject(rt.cls('Console')); }, clear() { }, end() { }, terminate() { }, delay(rt, a) { gfx().op(0, { t: 'sleep', ms: num(a[0]) }); } };
+  const conStatics = { init(rt) { return new JObject(rt.cls('Console')); }, clear() { }, end() { }, terminate() { }, delay(rt, a) { return rt.sleep(num(a[0])); } };
+  // Eingaben warten, bis die Grafik fertig abgespielt ist (das Programm pausiert so lange)
+  for (const k of Object.keys(conRead)) { if (k === 'kbhit') continue; const f = conRead[k]; conRead[k] = () => rt.afterGfx(f); }
   for (const [k, f] of Object.entries(conRead)) conStatics[k] = (rt, a) => f();
   const conMethods = { ...conPrint, clear() { }, end() { }, terminate() { }, showCursor() { }, hideCursor() { }, setTitle() { }, setPos() { } };
   for (const [k, f] of Object.entries(conRead)) conMethods[k] = (rt, o, a) => f();
@@ -343,25 +347,25 @@ R.Runtime.extensions.push(function (rt) {
   def('InputDialog', { pkg: 'ch.aplu.util',
     ctor(rt, a) { const o = new JObject(rt.cls('InputDialog')); o.native = a.length >= 2 ? { title: str(a[0]), prompt: str(a[1]) } : { title: 'Eingabe', prompt: a.length ? str(a[0]) : 'Wert eingeben:' }; return o; },
     methods: {
-      readInt(rt, o, a) { const d = dlg(o); return askInt(a.length ? str(a[0]) : d.prompt, d.title); },
-      readDouble(rt, o, a) { const d = dlg(o); return askDouble(a.length ? str(a[0]) : d.prompt, d.title); },
-      readLong(rt, o, a) { const d = dlg(o); return BigInt(askInt(a.length ? str(a[0]) : d.prompt, d.title)); },
-      readString(rt, o, a) { const d = dlg(o); return ask(a.length ? str(a[0]) : d.prompt, d.title); },
-      readBoolean(rt, o, a) { const d = dlg(o); return askBool(a.length ? str(a[0]) : d.prompt, d.title); },
-      readChar(rt, o, a) { const d = dlg(o); const s = ask(a.length ? str(a[0]) : d.prompt, d.title); return new JChar(s.length ? s.charCodeAt(0) : 32); },
+      readInt(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => askInt(a.length ? str(a[0]) : d.prompt, d.title)); },
+      readDouble(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => askDouble(a.length ? str(a[0]) : d.prompt, d.title)); },
+      readLong(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => BigInt(askInt(a.length ? str(a[0]) : d.prompt, d.title))); },
+      readString(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => ask(a.length ? str(a[0]) : d.prompt, d.title)); },
+      readBoolean(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => askBool(a.length ? str(a[0]) : d.prompt, d.title)); },
+      readChar(rt, o, a) { const d = dlg(o); return rt.afterGfx(() => { const s = ask(a.length ? str(a[0]) : d.prompt, d.title); return new JChar(s.length ? s.charCodeAt(0) : 32); }); },
       isCancelled() { return false; }, dispose() { },
     },
     retTypes: { readInt: INT, readDouble: DOUBLE, readLong: T('long'), readString: STRING, readBoolean: BOOL, readChar: T('char'), isCancelled: BOOL },
-    statics: { readInt(rt, a) { return askInt(a.length ? str(a[a.length - 1]) : 'Ganze Zahl eingeben:', 'Eingabe'); }, readDouble(rt, a) { return askDouble(a.length ? str(a[a.length - 1]) : 'Zahl eingeben:', 'Eingabe'); }, readString(rt, a) { return ask(a.length ? str(a[a.length - 1]) : 'Text eingeben:', 'Eingabe'); } },
+    statics: { readInt(rt, a) { return rt.afterGfx(() => askInt(a.length ? str(a[a.length - 1]) : 'Ganze Zahl eingeben:', 'Eingabe')); }, readDouble(rt, a) { return rt.afterGfx(() => askDouble(a.length ? str(a[a.length - 1]) : 'Zahl eingeben:', 'Eingabe')); }, readString(rt, a) { return rt.afterGfx(() => ask(a.length ? str(a[a.length - 1]) : 'Text eingeben:', 'Eingabe')); } },
     staticRet: { readInt: INT, readDouble: DOUBLE, readString: STRING },
   });
-  const showMsg = (title, text) => { gfx().message(text, title); };
+  const showMsg = (title, text) => rt.afterGfx(() => { gfx().message(text, title); });
   def('MessageDialog', { pkg: 'ch.aplu.util',
     ctor(rt, a) { const o = new JObject(rt.cls('MessageDialog')); const s = a.filter(v => typeof v === 'string'); o.native = s.length >= 2 ? { title: s[0], text: s[1] } : { title: 'Meldung', text: s.length ? s[0] : (a.length ? str(a[a.length - 1]) : '') }; return o; },
-    methods: { show(rt, o) { showMsg(o.native.title, o.native.text); }, setText(rt, o, a) { o.native.text = str(a[0]); }, setTitle(rt, o, a) { o.native.title = str(a[0]); }, close() { }, dispose() { }, showModal(rt, o) { showMsg(o.native.title, o.native.text); } },
-    statics: { show(rt, a) { showMsg('Meldung', str(a[a.length - 1])); } },
+    methods: { show(rt, o) { return showMsg(o.native.title, o.native.text); }, setText(rt, o, a) { o.native.text = str(a[0]); }, setTitle(rt, o, a) { o.native.title = str(a[0]); }, close() { }, dispose() { }, showModal(rt, o) { return showMsg(o.native.title, o.native.text); } },
+    statics: { show(rt, a) { return showMsg('Meldung', str(a[a.length - 1])); } },
   });
-  def('ModelessOptionPane', { pkg: 'ch.aplu.util', ctor(rt, a) { const s = a.filter(v => typeof v === 'string'); showMsg('Meldung', s.length ? s[s.length - 1] : ''); const o = new JObject(rt.cls('ModelessOptionPane')); o.native = {}; return o; }, methods: { setText(rt, o, a) { showMsg('Meldung', str(a[0])); }, dispose() { } } });
+  def('ModelessOptionPane', { pkg: 'ch.aplu.util', ctor(rt, a) { const s = a.filter(v => typeof v === 'string'); gfx().message(s.length ? s[s.length - 1] : '', 'Meldung'); const o = new JObject(rt.cls('ModelessOptionPane')); o.native = {}; return o; }, methods: { setText(rt, o, a) { return showMsg('Meldung', str(a[0])); }, dispose() { } } });
   def('Monitor', { pkg: 'ch.aplu.util', statics: { putSleep() { rt.rtError('Monitor.putSleep() wartet auf Ereignisse und wird in der Web-Version nicht unterstützt'); }, wakeUp() { } } });
 
   // ------------------------------------------------------------ Scanner (java.util) über Eingabedialog
@@ -387,6 +391,13 @@ R.Runtime.extensions.push(function (rt) {
     })(),
     retTypes: { nextLine: STRING, next: STRING, nextInt: INT, nextLong: T('long'), nextDouble: DOUBLE, nextBoolean: BOOL, hasNext: BOOL, hasNextLine: BOOL, hasNextInt: BOOL, hasNextDouble: BOOL, close: VOID },
   });
+  { // Scanner über System.in: Eingabe erst, wenn die Grafik fertig ist (Programm pausiert)
+    const sm = rt.cls('Scanner').native.methods;
+    for (const k of ['nextLine', 'next', 'nextInt', 'nextLong', 'nextDouble', 'nextBoolean']) {
+      const f = sm[k];
+      sm[k] = function (rt, o, a, line) { return o.native.src !== null ? f.call(this, rt, o, a, line) : rt.afterGfx(() => f.call(this, rt, o, a, line)); };
+    }
+  }
   def('InputStream', { pkg: 'java.io', lib: false });
 });
 })(typeof window !== 'undefined' ? window : globalThis);

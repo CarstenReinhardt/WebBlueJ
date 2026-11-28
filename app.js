@@ -14,7 +14,9 @@ const gfx = window.WBGfx.create({
   note: (s) => outBuf.push({ s, err: false }),
   lastLine: () => { const t = outBuf.filter(o => !o.err).map(o => o.s).join(''); return t.slice(t.lastIndexOf('\n') + 1).trim(); },
 });
-const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx });
+// Während ein Programm läuft, wird die Ausgabe zwischen den Zeitscheiben angezeigt
+let liveOut = null;
+const rt = new Runtime({ out: (s, err) => outBuf.push({ s, err }), gfx, onSlice: () => { if (liveOut) liveOut(); else flushOutput(); } });
 const S = {
   project: null,        // { name, classes: [{ id, name, code, x, y }] }
   status: {},           // id -> { dirty, error: {line, message} }
@@ -307,6 +309,7 @@ function callDialog({ kind, cls, obj, entry }) {
       if (!/^[A-Za-z_$À-ɏ][\w$À-ɏ]*$/.test(objName)) { errBox.textContent = 'Der Objektname muss ein gültiger Java-Name sein (Buchstaben, Ziffern, _; nicht mit Ziffer beginnen).'; errBox.hidden = false; nameInput.focus(); return true; }
       if (S.bench.some(b => b.name === objName)) { errBox.textContent = `Es gibt schon ein Objekt namens ${objName}.`; errBox.hidden = false; nameInput.focus(); return true; }
     }
+    if (rt.running) { busyNote(); return true; }
     const args = [];
     for (let i = 0; i < m.params.length; i++) {
       try { args.push(rt.evalArg(inputs[i].value, m.params[i].type, S.padEnv)); flushOutput(); }
@@ -315,13 +318,16 @@ function callDialog({ kind, cls, obj, entry }) {
     }
     ctl.close();
     const callText = (kind === 'method' ? obj.name + '.' : kind === 'static' ? cls + '.' : 'new ' + cls) + (kind === 'ctor' ? '' : m.name) + '(' + inputs.map(x => x.value.trim()).join(', ') + ')';
-    const r = rt.run(() => rt.callMethod(kind === 'method' ? obj.value : null, m, args));
-    flushOutput();
-    if (r.exited !== undefined) writeConsole(`[Programm mit System.exit(${r.exited}) beendet]\n`, 'note');
-    if (!r.ok) { showRuntimeError(r, callText); return; }
-    if (kind === 'ctor') { addBench(objName, r.value); return; }
-    renderBench();
-    if (m.ret && m.ret.name !== 'void' && r.value !== undefined) resultModal(callText, m.ret, r.value);
+    runProgram(() => rt.callMethodG(kind === 'method' ? obj.value : null, m, args)).then((r) => {
+      if (!r) return;
+      flushOutput();
+      if (r.stopped) { writeConsole(`[${callText} wurde beendet]\n`, 'note'); return; }
+      if (r.exited !== undefined) writeConsole(`[Programm mit System.exit(${r.exited}) beendet]\n`, 'note');
+      if (!r.ok) { showRuntimeError(r, callText); return; }
+      if (kind === 'ctor') { if (S.bench.some(b => b.name === objName)) objName = nextObjName(r.value.cls.name); addBench(objName, r.value); return; }
+      renderBench();
+      if (m.ret && m.ret.name !== 'void' && r.value !== undefined) resultModal(callText, m.ret, r.value);
+    });
   };
   form.addEventListener('submit', (e) => { e.preventDefault(); });
   form.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); const ctl = modals[modals.length - 1]; if (submit(ctl) !== true) { /* geschlossen */ } } });
@@ -400,6 +406,31 @@ function showRuntimeError(r, callText) {
   actions.push({ label: 'OK', primary: true });
   openModal({ title: isEx ? 'Ausnahme bei der Ausführung' : 'Fehler bei der Ausführung', body: wrap, actions });
 }
+// ------------------------------------------------------------ Programm ausführen (unterbrechbar)
+let runShowTimer = 0;
+function setRunning(on) {
+  clearTimeout(runShowTimer);
+  document.body.classList.toggle('running', on);
+  // Anzeige erst nach kurzer Zeit, damit kurze Aufrufe nicht flackern
+  if (on) runShowTimer = setTimeout(() => { $('runBar').hidden = false; }, 150);
+  else $('runBar').hidden = true;
+}
+function busyNote() { toast('Es läuft noch ein Programm. Beende es zuerst mit „Beenden“.', true); }
+// Führt makeGen() unterbrechbar aus; liefert das Ergebnis (wie rt.run) oder null, wenn schon etwas läuft
+async function runProgram(makeGen, opts = {}) {
+  if (rt.running) { busyNote(); return null; }
+  if (gfx.resetFast) gfx.resetFast();
+  setRunning(true);
+  liveOut = opts.liveOut || null;
+  let r;
+  try { r = opts.snippet !== undefined ? await rt.evalSnippetAsync(opts.snippet, opts.env) : await rt.runAsync(makeGen); }
+  finally { liveOut = null; setRunning(false); }
+  return r;
+}
+function stopProgram() {
+  if (!rt.running) return;
+  rt.stop(); gfx.cancel();
+}
 function runUI(fn, ok) { const r = rt.run(fn); flushOutput(); if (!r.ok) showRuntimeError(r); else ok(r.value); }
 
 // ------------------------------------------------------------ Objektleiste
@@ -428,6 +459,7 @@ function renderBench() {
 // ------------------------------------------------------------ Übersetzen
 function compileAll(opts = {}) {
   syncEditor();
+  if (rt.running) { stopProgram(); flushOutput(); writeConsole('[Laufendes Programm wurde zum Übersetzen beendet]\n', 'note'); }
   for (const c of S.project.classes) refreshInfo(c);
   const res = rt.compile(S.project.classes.map(c => ({ id: c.id, code: c.code })));
   const hadBench = S.bench.length > 0;
@@ -1055,7 +1087,8 @@ function helpDialog() {
   <p><b>Objektleiste:</b> Erzeugte Objekte erscheinen unten. Klick darauf zeigt die Methoden, „Inspizieren“ zeigt die Attributwerte.</p>
   <p><b>Direkteingabe:</b> Java-Ausdrücke direkt ausprobieren, z. B. <code>konto1.getKontostand()</code> oder <code>int x = 6 * 7;</code>. Objekte der Objektleiste stehen dort mit ihrem Namen zur Verfügung.</p>
   <p><b>Unterstützt:</b> Klassen, Vererbung, abstrakte Klassen, Interfaces, enums, Arrays, Strings, <code>ArrayList</code>, <code>HashMap</code>, <code>Random</code>, <code>Math</code>, Ausnahmen mit try/catch, switch, Schleifen. Eingaben mit <code>Scanner</code> erscheinen als Eingabedialog. Nicht unterstützt: Lambdas, innere Klassen.</p>
-  <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. Maus-, Tastatur-Ereignisse und Sound gibt es in der Web-Version nicht.</p>
+  <p><b>Grafik:</b> Mit <code>import ch.aplu.turtle.*;</code> zeichnest du mit <code>Turtle</code> (auch <code>extends Turtle</code>), mit <code>import ch.aplu.util.*;</code> stehen <code>GPanel</code>, <code>Console</code>, <code>InputDialog</code> und <code>MessageDialog</code> bereit. Die Bilder erscheinen in eigenen Fenstern; ⏩ überspringt die Animation. <code>Thread.sleep</code>, <code>delay</code> und Endlos-Animationen laufen live. Maus-, Tastatur-Ereignisse und Sound gibt es in der Web-Version nicht.</p>
+  <p><b>Laufende Programme:</b> Dauert ein Aufruf länger, erscheint oben „Programm läuft …“. Die Oberfläche bleibt bedienbar, die Ausgabe erscheint sofort. Mit <b>■ Beenden</b> brichst du das Programm ab, z. B. bei einer Endlosschleife.</p>
   <p><b>Speichern:</b> Alle Projekte werden automatisch in diesem Browser gespeichert („Projekt ▾ → Meine Projekte“). Zum Sichern, Weitergeben oder für BlueJ: „Projekt ▾ → Als ZIP herunterladen“. ZIP-Dateien (auch BlueJ-Projektordner) öffnest du mit „ZIP- oder .java-Dateien importieren“.</p>`;
   openModal({ title: 'So funktioniert die Java-Werkbank', body: d, wide: true, actions: [{ label: 'Alles klar', primary: true }] });
 }
@@ -1076,15 +1109,23 @@ function padWrite(text, cls, value) {
 $('padForm').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const inp = $('padInput'); const code = inp.value; if (!code.trim()) return;
+  if (rt.running) { busyNote(); return; }
   padHist.push(code); padPos = padHist.length; inp.value = '';
   padWrite('> ' + code, 'in');
   if (!S.compiledOnce && S.project.classes.length) padWrite('Hinweis: Das Projekt ist nicht übersetzt – eigene Klassen sind erst nach dem Übersetzen verfügbar.', 'note');
-  const r = rt.evalSnippet(code, S.padEnv);
-  const had = outBuf.length > 0;
-  if (had) { const txt = outBuf.map(o => o.s).join(''); outBuf.length = 0; padWrite(txt.replace(/\n$/, ''), null); }
+  const padOut = () => { if (outBuf.length) { const txt = outBuf.map(o => o.s).join(''); outBuf.length = 0; padWrite(txt.replace(/\n$/, ''), null); } };
+  const env = S.padEnv;
+  runProgram(null, { snippet: code, env, liveOut: padOut }).then((r) => {
+    if (!r) return;
+    padOut();
+    if (r.stopped) { padWrite('[beendet]', 'note'); return; }
+    padResult(r);
+  });
+});
+function padResult(r) {
   if (!r.ok) { padWrite((r.exception ? 'Exception: ' : 'Fehler: ') + r.message + (r.trace && r.trace.length ? `  (bei ${r.trace[0].cls}.${r.trace[0].method}, Zeile ${r.trace[0].line})` : ''), 'err'); return; }
   if (r.hasValue) padWrite(rt.isRef(r.value) ? `<${rt.typeNameOf(r.value)}-Objekt>   ${safeStr(r.value)}` : `${rt.displayValue(r.value)}   (${rt.typeNameOf(r.value)})`, 'val', r.value);
-});
+}
 function safeStr(v) { const r = rt.run(() => rt.str(v)); outBuf.length = 0; return r.ok ? r.value : ''; }
 $('padInput').addEventListener('keydown', (ev) => {
   if (ev.key === 'ArrowUp' && padPos > 0) { padPos--; ev.target.value = padHist[padPos]; ev.preventDefault(); }
@@ -1093,6 +1134,7 @@ $('padInput').addEventListener('keydown', (ev) => {
 
 // ------------------------------------------------------------ Verdrahtung
 $('btnNewClass').addEventListener('click', newClassDialog);
+$('btnStop').addEventListener('click', stopProgram);
 $('btnCompile').addEventListener('click', () => compileAll());
 $('btnProject').addEventListener('click', () => { if (!menuEl.hidden) { hideMenu(); return; } projectMenu(); });
 $('btnHelp').addEventListener('click', helpDialog);
