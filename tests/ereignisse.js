@@ -1,4 +1,4 @@
-// Test für Maus-/Tastaturereignisse, Bilder und Töne (Node.js, ohne Browser):
+// Test für Maus-/Tastaturereignisse, Bilder, Töne und Terminal-Eingaben (Node.js, ohne Browser):
 //   node tests/ereignisse.js
 // Simuliert ein Grafikfenster, schickt Ereignisse und prüft die Ausgaben der Java-Programme.
 const fs = require('fs'), path = require('path'), vm = require('vm');
@@ -82,6 +82,23 @@ public class Main extends GPanel implements MouseListener {
   public static void main(String[] args) { new Main(); new GPanel().addKeyListener(new Main()); }
 }`], events: [{ type: 'press', x: 1, y: 1, button: 1, clicks: 1 }],
   expect: ['MAIN Hier wird ein Objekt erwartet, das KeyListener implementiert', 'EVENT-ERR mousePressed java.lang.NullPointerException'] },
+{ name: 'Terminal: Scanner (Rest der Zeile wie in Java), hasNextInt, Console.readInt', input: ['3 4', 'Ada', 'abc', '12', 'x', '5', 'q'], code: [`
+import java.util.Scanner;
+import ch.aplu.util.Console;
+public class Main {
+  public static void main(String[] args) {
+    Scanner sc = new Scanner(System.in);
+    int a = sc.nextInt(); int b = sc.nextInt();
+    String rest = sc.nextLine();
+    String name = sc.nextLine();
+    System.out.println(a + b + " [" + rest + "] " + name);
+    while (!sc.hasNextInt()) { System.out.println("keine Zahl: " + sc.next()); }
+    System.out.println("Zahl " + sc.nextInt());
+    System.out.println("Console " + Console.readInt());
+    System.out.println("Taste " + Console.getKey());
+  }
+}`], events: [],
+  expect: ['7 [] Ada', 'keine Zahl: abc', 'Zahl 12', 'Bitte eine ganze Zahl eingeben.', 'Console 5', 'Taste q', 'MAIN ok'] },
 ];
 
 (async () => {
@@ -89,7 +106,9 @@ public class Main extends GPanel implements MouseListener {
   for (const f of FAELLE) {
     const L = {}; const out = [];
     const gfx = { n: 1, newWindow() { return this.n++; }, op(w, o) { if (o.t !== 'pose' || o.sprite) out.push('OP ' + JSON.stringify(o)); }, input() { return '7'; }, message() { }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); }, listen(w, fn) { L[w] = fn; } };
+    const lines = [...(f.input || [])];
     const rt = new R.Runtime({ out: (s) => out.push(s.trimEnd()), gfx,
+      ...(f.input ? { readLine: () => Promise.resolve(lines.length ? lines.shift() : null), readKey: () => Promise.resolve(lines.length ? lines.shift().charCodeAt(0) : null) } : {}),
       assets: (n) => /ball\.png$/.test(n) ? { kind: 'image', url: 'data:bild', w: 20, h: 10 } : n === 'ton.wav' ? { kind: 'audio', url: 'data:ton' } : null,
       runEvent: (g, label) => rt.runAsync(g).then(r => { if (!r.ok) out.push('EVENT-ERR ' + label + ' ' + r.message); }),
       onEvent: (r, label) => { if (!r.ok) out.push('EVENT-ERR ' + label + ' ' + r.message); } });
