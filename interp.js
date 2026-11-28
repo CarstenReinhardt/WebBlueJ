@@ -1259,6 +1259,10 @@ class Runtime {
       if (!m) return;
       gen = () => this.callMethodG(obj, m, args);
     }
+    this.fireGen(gen, label || name);
+  }
+  // Ereignis-Code (Generator) ausführen: während ein Programm läuft sofort, sonst als eigener Lauf
+  fireGen(gen, name, label) {
     const io = this.io;
     if (this.task) {
       const r = this.run(() => this.runSync(gen()));
@@ -2433,7 +2437,12 @@ class Runtime {
         for (let c = ctx.cls, o = ctx.self; c.outer;) {
           o = this.outerObj(o, c); c = c.outer;
           const oms = this.lookupMethods(c, e.name);
-          if (!oms.length) continue;
+          if (!oms.length) {
+            // geerbte eingebaute Methode der äußeren Klasse (z. B. repaint() einer JPanel-Unterklasse)
+            const nf = o && this.nativeMethod(c, e.name);
+            if (nf) { const a = (yield* this.argsG(e.args, ctx)); this.line = line; const r = nf(this, o, a, line); return r instanceof Suspend ? (r.g ? yield* r.g : yield r) : r; }
+            continue;
+          }
           const args = (yield* this.argsG(e.args, ctx));
           this.line = line;
           const m = this.selectOverload(oms, args, e.name, line);
@@ -3307,7 +3316,10 @@ class Checker {
     const st = { ch: this, cls: this.cls, static: !!this.ctx.isStatic };
     while (this.outward(st)) {
       const ms = this.rt.lookupMethods(st.cls, name);
-      if (!ms.length) continue;
+      if (!ms.length) {
+        if (this.rt.nativeMethod(st.cls, name)) { if (st.static) this.err(line, `Die Methode ${name}() von ${st.cls.name} braucht ein Objekt – hier gibt es keins (statische Klasse oder statische Methode)`); return nativeRet(this.rt, st.cls, name); }
+        continue;
+      }
       const m = this.pick(ms, at, line, `Methode ${name}`, st.cls);
       if (!m.static && st.static) this.err(line, `Die Methode ${name}() von ${st.cls.name} braucht ein Objekt – hier gibt es keins (statische Klasse oder statische Methode)`);
       return this.retType(m, null);

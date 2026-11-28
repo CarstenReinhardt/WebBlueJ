@@ -134,6 +134,79 @@ public class Main extends JFrame implements ActionListener {
   }
 }`], events: [{ type: 'text', id: 3, text: '7' }, { type: 'action', id: 5 }, { type: 'text', id: 3, text: 'x' }, { type: 'action', id: 3 }, { type: 'action', id: 6 }, { type: 'closing' }],
   expect: ['SWIN Quadrat', 'SW tree', 'SW show', 'Antwort 7 false', 'MAIN ok', 'SW prop 4 7^2 = 49', 'Knopf true Quadrat', 'MSG Bitte eine ganze Zahl eingeben', 'SW prop 3 ', 'SW prop 4 -', 'closing false'] },
+{ name: 'Swing: paintComponent, Maus, Menü, JComboBox, JSlider, JList, ButtonGroup, WindowListener', code: [`import javax.swing.*;
+import javax.swing.event.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.util.ArrayList;
+
+public class Main extends JFrame {
+  ArrayList<Point2> punkte = new ArrayList<>();
+  Zeichenflaeche flaeche = new Zeichenflaeche();
+  JComboBox<String> farbe = new JComboBox<>(new String[] { "rot", "blau" });
+  JSlider dicke = new JSlider(1, 10, 3);
+  DefaultListModel<String> modell = new DefaultListModel<>();
+  JList<String> liste = new JList<>(modell);
+  JRadioButton gross = new JRadioButton("groß", true), klein = new JRadioButton("klein");
+
+  class Zeichenflaeche extends JPanel {
+    Zeichenflaeche() {
+      setPreferredSize(new Dimension(200, 100));
+      setBackground(Color.WHITE);
+      addMouseListener(new MouseAdapter() {
+        public void mousePressed(MouseEvent e) { punkte.add(new Point2(e.getX(), e.getY())); modell.addElement(e.getX() + "," + e.getY()); repaint(); }
+      });
+    }
+    @Override
+    protected void paintComponent(Graphics g) {
+      super.paintComponent(g);
+      Graphics2D g2 = (Graphics2D) g;
+      g2.setStroke(new BasicStroke(dicke.getValue()));
+      g.setColor(farbe.getSelectedIndex() == 0 ? Color.RED : Color.BLUE);
+      for (Point2 p : punkte) g.fillOval(p.x - 5, p.y - 5, 10, 10);
+      g.drawString("Breite " + getWidth(), 5, 15);
+      int[] xs = { 1, 2, 3 }, ys = { 4, 5, 6 };
+      g.drawPolygon(xs, ys, 3);
+      FontMetrics fm = g.getFontMetrics();
+      System.out.println("paint " + punkte.size() + " w=" + getWidth() + " sw=" + (fm.stringWidth("abc") > 0));
+    }
+  }
+
+  public Main() {
+    super("Malen");
+    JMenuBar mb = new JMenuBar();
+    JMenu datei = new JMenu("Datei");
+    JMenuItem neu = new JMenuItem("Neu");
+    neu.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, InputEvent.CTRL_DOWN_MASK));
+    neu.addActionListener(e -> { punkte.clear(); modell.clear(); flaeche.repaint(); System.out.println("neu"); });
+    datei.add(neu);
+    datei.addSeparator();
+    JCheckBoxMenuItem raster = new JCheckBoxMenuItem("Raster");
+    raster.addActionListener(e -> System.out.println("raster " + raster.isSelected()));
+    datei.add(raster);
+    mb.add(datei);
+    setJMenuBar(mb);
+    ButtonGroup bg = new ButtonGroup(); bg.add(gross); bg.add(klein);
+    klein.addItemListener(e -> System.out.println("klein " + (e.getStateChange() == ItemEvent.SELECTED)));
+    farbe.addActionListener(e -> { System.out.println("farbe " + farbe.getSelectedItem()); flaeche.repaint(); });
+    dicke.addChangeListener(e -> System.out.println("dicke " + dicke.getValue()));
+    liste.addListSelectionListener(e -> System.out.println("liste " + liste.getSelectedValue()));
+    JPanel oben = new JPanel();
+    oben.add(farbe); oben.add(dicke); oben.add(gross); oben.add(klein);
+    add(oben, BorderLayout.NORTH);
+    add(flaeche, BorderLayout.CENTER);
+    add(new JScrollPane(liste), BorderLayout.EAST);
+    addWindowListener(new WindowAdapter() { public void windowClosing(WindowEvent e) { System.out.println("tschuess"); } });
+    pack();
+    setVisible(true);
+  }
+  public static void main(String[] args) { new Main(); }
+}
+`, `
+public class Point2 { int x, y; Point2(int x, int y) { this.x = x; this.y = y; } }
+`],
+  events: [{ type: 'size', id: 3, w: 200, h: 100 }, { type: 'mouse', kind: 'press', id: 3, x: 50, y: 40, button: 1, clicks: 1 }, { type: 'select', id: 4, index: 1 }, { type: 'slide', id: 5, value: 7 }, { type: 'radio', id: 8 }, { type: 'select', id: 6, index: 0 }, { type: 'menu', id: 13 }, { type: 'menu', id: 11 }, { type: 'closing' }],
+  expect: ['SW tree menu Datei:Neu[Strg+N],,Raster', 'SW show', 'MAIN ok', 'paint 0 w=200 sw=true', 'SW paint [["bg","rgb(255,255,255)"],["lw",3],["c","rgb(255,0,0)"],["s","Breite 200",5,15],["p",0,[1,2,3],[4,5,6]]]', 'paint 1 w=200', '["o",1,45,35,10,10]', 'farbe blau', '["c","rgb(0,0,255)"]', 'dicke 7', 'klein true', 'liste 50,40', 'raster true', 'neu', 'paint 0', 'tschuess', 'closing false'] },
 { name: 'Terminal: Scanner (Rest der Zeile wie in Java), hasNextInt, Console.readInt', input: ['3 4', 'Ada', 'abc', '12', 'x', '5', 'q'], code: [`
 import java.util.Scanner;
 import ch.aplu.util.Console;
@@ -157,7 +230,7 @@ public class Main {
   let bad = 0;
   for (const f of FAELLE) {
     const L = {}; const out = [];
-    const gfx = { n: 1, newWindow() { return this.n++; }, op(w, o) { if (o.t !== 'pose' || o.sprite) out.push('OP ' + JSON.stringify(o)); }, input() { return '7'; }, message(t) { out.push('MSG ' + t); }, confirm() { return false; }, swingWindow(o) { out.push('SWIN ' + o.title); return this.n++; }, swing(w, o) { out.push('SW ' + o.t + (o.t === 'prop' ? ' ' + o.id + ' ' + o.props.text : '')); }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); }, listen(w, fn) { L[w] = fn; } };
+    const gfx = { n: 1, newWindow() { return this.n++; }, op(w, o) { if (o.t !== 'pose' || o.sprite) out.push('OP ' + JSON.stringify(o)); }, input() { return '7'; }, message(t) { out.push('MSG ' + t); }, confirm() { return false; }, swingWindow(o) { out.push('SWIN ' + o.title); return this.n++; }, swing(w, o) { out.push('SW ' + o.t + (o.t === 'prop' ? ' ' + o.id + ' ' + o.props.text : o.t === 'paint' ? ' ' + JSON.stringify(o.ops.slice(2)) : o.t === 'tree' && o.menu ? ' menu ' + o.menu.children.map(m => m.text + ':' + m.children.map(i => i.text + (i.accel ? '[' + i.accel + ']' : '')).join(',')).join(';') : '')); }, lastLine() { return ''; }, busy() { return false; }, whenIdle(cb) { cb(); }, listen(w, fn) { L[w] = fn; } };
     const lines = [...(f.input || [])];
     const rt = new R.Runtime({ out: (s) => out.push(s.trimEnd()), gfx,
       ...(f.input ? { readLine: () => Promise.resolve(lines.length ? lines.shift() : null), readKey: () => Promise.resolve(lines.length ? lines.shift().charCodeAt(0) : null) } : {}),
